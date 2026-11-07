@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #include "slice_sink.h"
 
@@ -18,11 +19,18 @@ typedef struct {
     FILE *f;
     int32_t position[SLICE_AXES];
     uint32_t count;
+    uint32_t dropped;       // slices pushed between stop() and resume()
+    atomic_bool blocked;
 } sink_file_ctx_t;
 
 static sink_status_t file_push (slice_sink_t *sink, const slice_t *s)
 {
     sink_file_ctx_t *c = sink->ctx;
+
+    if(atomic_load(&c->blocked)) {
+        c->dropped++;
+        return Sink_Ok;
+    }
 
     if(fprintf(c->f, "%u,%.3f,%d,%d,%d,%d,%u\n", s->index, s->index * (SLICE_MS / 1000.0),
                 s->steps[0], s->steps[1], s->steps[2], s->steps[3], s->outputs) < 0)
@@ -42,15 +50,32 @@ static void file_get_position (slice_sink_t *sink, int32_t position[SLICE_AXES])
 
 static void file_stop (slice_sink_t *sink)
 {
-    fprintf(((sink_file_ctx_t *)sink->ctx)->f, "# stop\n");
+    sink_file_ctx_t *c = sink->ctx;
+
+    atomic_store(&c->blocked, true);
+    fprintf(c->f, "# stop\n");
+}
+
+static void file_resume (slice_sink_t *sink)
+{
+    atomic_store(&((sink_file_ctx_t *)sink->ctx)->blocked, false);
+}
+
+// A file "executes" every slice it has written: the halted position is the written total.
+static bool file_get_halted_position (slice_sink_t *sink, int32_t position[SLICE_AXES], uint32_t timeout_ms)
+{
+    (void)timeout_ms;
+    file_get_position(sink, position);
+
+    return true;
 }
 
 static void file_close (slice_sink_t *sink)
 {
     sink_file_ctx_t *c = sink->ctx;
 
-    fprintf(c->f, "# end: %u slices, total X=%d Y=%d Z=%d A=%d steps\n", c->count,
-             c->position[0], c->position[1], c->position[2], c->position[3]);
+    fprintf(c->f, "# end: %u slices, total X=%d Y=%d Z=%d A=%d steps, %u dropped after a stop\n", c->count,
+             c->position[0], c->position[1], c->position[2], c->position[3], c->dropped);
     fclose(c->f);
     free(c);
     free(sink);
@@ -73,6 +98,8 @@ slice_sink_t *sink_file_open (const char *path)
     sink->push = file_push;
     sink->get_position = file_get_position;
     sink->stop = file_stop;
+    sink->resume = file_resume;
+    sink->get_halted_position = file_get_halted_position;
     sink->close = file_close;
     sink->ctx = c;
 

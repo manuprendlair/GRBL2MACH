@@ -267,6 +267,8 @@ static control_signals_t systemGetState (void)
 
     signals.mask = gpio[CONTROL_PORT].state.value;
 	signals.limits_override = settings.control_invert.limits_override;
+    // GRBL2MACH: a failed slice sink (controller lost) is reported as a motor fault
+    signals.motor_fault = slicer_motor_fault();
 
     if(settings.control_invert.mask)
         signals.mask ^= settings.control_invert.mask;
@@ -544,6 +546,7 @@ bool driver_init ()
     hal.driver_cap.step_pulse_delay = On;
 
     hal.signals_cap.safety_door_ajar = On;
+    hal.signals_cap.motor_fault = On;   // GRBL2MACH: controller lost
     hal.driver_cap.control_pull_up = On;
     hal.driver_cap.limits_pull_up = On;
     hal.driver_cap.probe_pull_up = On;

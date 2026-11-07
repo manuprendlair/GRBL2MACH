@@ -37,8 +37,16 @@ struct slice_sink {
     // Accumulated position, in steps, of what the sink has taken over
     // (file: slices written; controller: slices executed).
     void (*get_position)(slice_sink_t *sink, int32_t position[SLICE_AXES]);
-    // Immediate stop: discards whatever has not been executed yet.
+    // Immediate stop: discards whatever has not been executed yet. Thread-safe. Slices pushed
+    // after a stop are dropped until resume() is called: a slice computed before the stop can
+    // never run after it.
     void (*stop)(slice_sink_t *sink);
+    // Accepts slices again after a stop (called by the slicer once it has dropped its own state).
+    void (*resume)(slice_sink_t *sink);
+    // After stop(): waits up to timeout_ms until the machine is known to be at rest and returns
+    // where it stopped, in steps. Returns false if that position cannot be known (link lost).
+    // Thread-safe.
+    bool (*get_halted_position)(slice_sink_t *sink, int32_t position[SLICE_AXES], uint32_t timeout_ms);
     // Finishes cleanly (drains the queue) and releases the sink.
     void (*close)(slice_sink_t *sink);
     void *ctx;

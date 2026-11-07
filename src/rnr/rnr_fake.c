@@ -101,6 +101,7 @@ static int fake_write (rnr_transport_t *t, const uint8_t b[RNR_OUT_BYTES])
     switch(op) {
 
         case RnrOp_EStop:
+            fprintf(f->log, " halted pos=%d,%d,%d,%d dropped=%d", f->live[0], f->live[1], f->live[2], f->live[3], f->count);
             f->estop = true;
             f->run_open = false;
             f->count = 0;

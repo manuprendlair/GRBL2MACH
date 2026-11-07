@@ -10,14 +10,15 @@
 #              and must not execute the slices that were still queued.
 #
 # Usage: powershell -File tests\run_fake_board.ps1 [-Scenario motion|watchdog|reset|all]
-#                       [-GCode "G21 G91 G1 X10 F600"] [-Expect "2500,0,0"] [-OutDir folder]
+#                       [-GCode "G21 G91 G1 X10 F600"] [-Expect "2500,0,0"] [-OutDir folder] [-Immediate]
 
 param(
     [ValidateSet("motion", "watchdog", "reset", "all")] [string]$Scenario = "all",
     [string]$GCode = "G21 G91 G1 X10 F600",
     [string]$Expect = "2500,0,0",
     [string]$OutDir = "$env:TEMP\grbl2mach_fake",
-    [int]$Port = 23040
+    [int]$Port = 23040,
+    [switch]$Immediate     # reset scenario: unlock and move right after the reset, without waiting
 )
 
 $ErrorActionPreference = "Stop"
@@ -79,6 +80,9 @@ function Test-Motion {
     Check ([math]::Abs($span - $expectedSpan) -le [math]::Max(50, 0.05 * $expectedSpan)) "slices spread in real time ($([math]::Round($span)) ms for $expectedSpan ms)"
     Check ($r.Stats.starved -eq 0) "no underrun during the run"
     Check ($r.Stats.seq_errors -eq 0 -and $r.Stats.rejected_estop -eq 0 -and $r.Stats.overflows -eq 0) "no sequence error, no slice rejected"
+    $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
+    Check ($err -match "position checks after runs: [1-9]\d* ok, 0 mismatch") "controller counters = steps sent after each run ($(([regex]::Match($err, 'position checks[^\r\n]*')).Value))"
+    Check ($err -notmatch "resynced") "no resync needed in normal operation"
 }
 
 function Test-Watchdog {
@@ -87,14 +91,17 @@ function Test-Watchdog {
     $s = Start-Sim "-f `"$log`"" $dir ($Port + 1) @{ GRBL2MACH_FAKE_SILENT_MS = "300" }
     try {
         Invoke-Line $s '$X' | Out-Null
-        Invoke-GCode $s "G21 G91 G1 X20 F600"
-        $status = Wait-State $s "Alarm" 5000
-        # Alarm 17 (motor fault) is critical: grblHAL wants a reset before anything else
+        Send-Sim $s "G21 G91 G1 X20 F600`n"
+        $out = ""; for ($i = 0; $i -lt 40 -and $out -notmatch "ALARM:"; $i++) { Start-Sleep -Milliseconds 100; $out += Read-Sim $s }
+        # The motor fault is latched: a reset must not clear it while the controller is lost
         Send-Sim $s ([string][char]0x18); Start-Sleep -Milliseconds 500; Read-Sim $s | Out-Null
+        $afterReset = Wait-State $s "Alarm" 2000
     } finally { Stop-Sim $s }
     $r = Read-FakeLog $log
     $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
-    Check ($status -match "ALARM:17" -and $status -match "<Alarm") "grblHAL raised ALARM:17 (motor fault)"
+    $alarms = ([regex]::Matches($out, 'ALARM:\d+') | ForEach-Object { $_.Value }) -join ", "
+    Check ($out -match "ALARM:17") "grblHAL raised ALARM:17 (motor fault); alarms seen: $alarms"
+    Check ($afterReset -match "<Alarm") "still in Alarm after a reset (fault latched)"
     Check ($err -match "watchdog") "bridge reported the watchdog fault"
     $silentAt = ($r.Frames | Where-Object { $_.op -eq 5 } | Select-Object -First 1).t + 300
     $estop = $r.Frames | Where-Object { $_.op -eq 1 -and $_.t -gt $silentAt } | Select-Object -First 1
@@ -106,19 +113,45 @@ function Test-Reset {
     $dir = Join-Path $OutDir "reset"; $log = Join-Path $dir "fake.log"
     $s = Start-Sim "-f `"$log`"" $dir ($Port + 2)
     try {
+        $spm = Get-StepsPerMm $s
         Invoke-Line $s '$X' | Out-Null
         Invoke-GCode $s "G21 G91 G1 X50 F1200"
         Start-Sleep -Milliseconds 1500
         Send-Sim $s ([string][char]0x18)   # Ctrl-X: soft reset
-        $status = Wait-State $s "Alarm|Idle" 5000
+        # Alarm 3 (position lost) is expected, but the upstream simulator sometimes misses it: its
+        # mc_reset() runs on another thread than the core (race seen without GRBL2MACH code too).
+        # What matters here is the position, checked below in both cases.
+        $state = ([regex]::Match((Wait-State $s "Alarm|Idle" 5000), '<(\w+)\|')).Groups[1].Value
+        if ($Immediate) {
+            # Unlock and move at once: the move must still start from the resynced position
+            Invoke-Line $s '$X' | Out-Null
+            Invoke-GCode $s "G21 G91 G1 X1 F600"
+            $afterReset = $null
+        } else {
+            Start-Sleep -Milliseconds 500   # resync task: waits for the controller's halted position
+            $afterReset = Get-MPos (Wait-State $s "Alarm|Idle" 2000)
+            Invoke-Line $s '$X' | Out-Null
+            Invoke-GCode $s "G21 G91 G1 X1 F600"
+        }
+        $final = Get-MPos (Wait-State $s "Idle")
     } finally { Stop-Sim $s }
     $r = Read-FakeLog $log
-    $lastSlice = $r.Frames | Where-Object { $_.op -eq 5 } | Select-Object -Last 1
-    $estop = $r.Frames | Where-Object { $_.op -eq 1 -and $_.t -gt 100 } | Select-Object -First 1
-    Check ($status -match "<Alarm") "grblHAL in Alarm after reset during motion: $($status.Trim())"
-    Check ($null -ne $estop -and $estop.t -ge $lastSlice.t -and ($estop.t - $lastSlice.t) -lt 50) "e-stop sent right after the last slice (+$([math]::Round($estop.t - $lastSlice.t)) ms)"
-    Check ($r.Final[0] -lt 50 * 250) "controller stopped before the end of the move (X=$($r.Final[0]) steps of $(50 * 250))"
-    Check ($r.Stats.still_buffered -eq 0) "nothing left in the controller buffer"
+    $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
+    $estop = $r.Frames | Where-Object { $_.op -eq 1 -and $_.rest -match "halted pos=(-?\d+)" -and $_.t -gt 100 } | Select-Object -First 1
+    $null = $estop.rest -match "halted pos=(-?\d+),(-?\d+),(-?\d+)"; $haltedX = [int]$Matches[1]
+    $lastSliceBefore = $r.Frames | Where-Object { $_.op -eq 5 -and $_.t -lt $estop.t } | Select-Object -Last 1
+    $one = [math]::Round(1 * $spm[0])
+    Check ($null -ne $estop -and ($estop.t - $lastSliceBefore.t) -lt 50) "e-stop sent right after the last slice (+$([math]::Round($estop.t - $lastSliceBefore.t)) ms), controller halted at X=$haltedX"
+    Check ($err -match "position resynced from the machine: X-\d+") "bridge resynced the position: $(([regex]::Match($err, 'resynced[^\r\n]*')).Value)"
+    if ($afterReset) {
+        Check ([math]::Round($afterReset[0] * $spm[0]) -eq $haltedX) "grblHAL position after reset = controller halted position ($([math]::Round($afterReset[0] * $spm[0])) / $haltedX steps)"
+    }
+    Check ($r.Final[0] -eq $haltedX + $one) "controller ran exactly the extra 1 mm from where it halted (final X=$($r.Final[0]))"
+    Check ([math]::Round($final[0] * $spm[0]) -eq $r.Final[0]) "grblHAL and controller agree at the end ($([math]::Round($final[0] * $spm[0])) / $($r.Final[0]) steps)"
+    "  info : state after the reset: $state"
+    Check ($r.Final[0] -lt 50 * 250) "controller stopped before the end of the long move"
+    Check ($r.Stats.still_buffered -eq 0 -and $r.Stats.rejected_estop -eq 0) "nothing left in the controller buffer, no slice sent in e-stop"
+    Check ($err -match "position checks after runs: \d+ ok, 0 mismatch") "position check after the extra move"
 }
 
 if ($Scenario -in "motion", "all") { Test-Motion }

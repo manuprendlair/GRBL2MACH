@@ -48,6 +48,10 @@ typedef struct {
     int qhead, qcount;
     rnr_status_t status;
     bool quit, stop_request, fault, run_open_shared;
+    bool link_lost;             // no status any more: the machine position is unknown
+    bool blocked;               // between stop() and resume(): pushed slices are dropped
+    bool halted;                // the controller has taken the stop and reported its position since
+    int32_t halted_pos[RNR_AXES];
     char fault_msg[160];
 
     // I/O thread only
@@ -59,6 +63,13 @@ typedef struct {
     uint16_t last_slice_seq;
     uint8_t outputs;
     uint32_t slices_sent;
+    bool awaiting_halt;         // EStop sent, waiting for a status report that covers it
+    uint16_t halt_seq;
+    // Position check after each run: controller counters must equal start + steps sent
+    int32_t run_start[RNR_AXES], run_sent[RNR_AXES];
+    bool check_pending;
+    uint16_t check_seq;
+    uint32_t checks_ok, checks_bad;
 } rnr_sink_t;
 
 static int send_frame (rnr_sink_t *s, uint8_t buf[RNR_OUT_BYTES])
@@ -87,9 +98,11 @@ static int send_configure (rnr_sink_t *s)
     return send_frame(s, buf);
 }
 
-static void set_fault (rnr_sink_t *s, const char *msg)
+static void set_fault (rnr_sink_t *s, const char *msg, bool link_lost)
 {
     rnr_mutex_lock(&s->lock);
+    if(link_lost)
+        s->link_lost = true;
     if(!s->fault) {
         s->fault = true;
         snprintf(s->fault_msg, sizeof(s->fault_msg), "%s", msg);
@@ -103,9 +116,31 @@ static void set_fault (rnr_sink_t *s, const char *msg)
 static void halt (rnr_sink_t *s)
 {
     send_short(s, RnrOp_EStop, false, 0, 0);
+    s->halt_seq = s->seq;
+    s->awaiting_halt = true;
     s->armed = false;
     s->run_open = false;
+    s->check_pending = false;
     s->busy_until = 0;
+}
+
+// Compares the controller's counters with the steps sent during the run that just ended.
+static void check_run_position (rnr_sink_t *s, const rnr_status_t *st)
+{
+    bool ok = true;
+
+    for(int a = 0; a < RNR_AXES; a++)
+        ok = ok && st->live_steps[a] == s->run_start[a] + s->run_sent[a];
+
+    if(ok)
+        s->checks_ok++;
+    else {
+        s->checks_bad++;
+        fprintf(stderr, "[rnr] POSITION MISMATCH after run: controller X=%d Y=%d Z=%d A=%d, expected X=%d Y=%d Z=%d A=%d\n",
+                 st->live_steps[0], st->live_steps[1], st->live_steps[2], st->live_steps[3],
+                 s->run_start[0] + s->run_sent[0], s->run_start[1] + s->run_sent[1],
+                 s->run_start[2] + s->run_sent[2], s->run_start[3] + s->run_sent[3]);
+    }
 }
 
 static bool arm (rnr_sink_t *s)
@@ -141,19 +176,29 @@ static void io_thread (void *arg)
             s->last_status = now;
             rnr_mutex_lock(&s->lock);
             s->status = st;
+            // First report that covers the EStop: this is where the machine stopped
+            if(s->awaiting_halt && (int16_t)(st.ack_seq - s->halt_seq) >= 0) {
+                s->awaiting_halt = false;
+                s->halted = true;
+                memcpy(s->halted_pos, st.live_steps, sizeof(s->halted_pos));
+            }
             rnr_mutex_unlock(&s->lock);
             // Faults reported by the controller count once it has taken the arming frame
             if(s->armed && (int16_t)(st.ack_seq - s->arm_seq) >= 0) {
                 if(st.fault_flags & RNR_FAULT_ESTOP)
-                    set_fault(s, "controller reports e-stop");
+                    set_fault(s, "controller reports e-stop", false);
                 else if(st.fault_flags & RNR_FAULT_LIMIT)
-                    set_fault(s, "controller reports a limit switch");
+                    set_fault(s, "controller reports a limit switch", false);
+            }
+            if(s->check_pending && (int16_t)(st.ack_seq - s->check_seq) >= 0 && st.motion_state == 0) {
+                s->check_pending = false;
+                check_run_position(s, &st);
             }
         } else if(r == RNR_IO_DISCONNECTED)
-            set_fault(s, "USB connection to the controller lost");
+            set_fault(s, "USB connection to the controller lost", true);
 
         if(now - s->last_status > (uint64_t)WATCHDOG_MS * 1000u)
-            set_fault(s, "controller stopped reporting status (watchdog)");
+            set_fault(s, "controller stopped reporting status (watchdog)", true);
 
         rnr_mutex_lock(&s->lock);
         bool quit = s->quit, fault = s->fault, stop = s->stop_request;
@@ -194,23 +239,28 @@ static void io_thread (void *arg)
                 break;
 
             if(!s->armed && !arm(s)) {
-                set_fault(s, "cannot arm the controller");
+                set_fault(s, "cannot arm the controller", false);
                 break;
             }
             if(!s->run_open) {
                 if(send_short(s, RnrOp_StartJog, false, 0, 0) != RNR_IO_OK) {
-                    set_fault(s, "cannot start a motion run");
+                    set_fault(s, "cannot start a motion run", false);
                     break;
                 }
                 s->run_open = true;
+                // The controller is at rest between runs: its counters are the run's start point
+                memcpy(s->run_start, st.live_steps, sizeof(s->run_start));
+                memset(s->run_sent, 0, sizeof(s->run_sent));
             }
 
             uint8_t buf[RNR_OUT_BYTES];
             rnr_build_slice(buf, RnrOp_JogSlice, 0, false, slice.steps, slice.outputs);
             if(send_frame(s, buf) != RNR_IO_OK) {
-                set_fault(s, "slice write failed");
+                set_fault(s, "slice write failed", false);
                 break;
             }
+            for(int a = 0; a < RNR_AXES; a++)
+                s->run_sent[a] += slice.steps[a];
             s->last_slice_seq = s->seq;
             s->outputs = slice.outputs;
             s->slices_sent++;
@@ -225,6 +275,8 @@ static void io_thread (void *arg)
             have_status && (int16_t)(st.ack_seq - s->last_slice_seq) >= 0) {
             send_short(s, RnrOp_EndOfMotion, false, s->outputs, 0);
             s->run_open = false;
+            s->check_pending = true;
+            s->check_seq = s->seq;
         }
 
         rnr_mutex_lock(&s->lock);
@@ -239,7 +291,9 @@ static sink_status_t rnr_push (slice_sink_t *sink, const slice_t *slice)
     sink_status_t status = Sink_Ok;
 
     rnr_mutex_lock(&s->lock);
-    if(s->fault)
+    if(s->blocked)
+        status = Sink_Ok;   // stopped: the slice is dropped
+    else if(s->fault)
         status = Sink_Error;
     else if(s->qcount == RNR_QUEUE)
         status = Sink_Full;
@@ -268,8 +322,41 @@ static void rnr_stop (slice_sink_t *sink)
 
     rnr_mutex_lock(&s->lock);
     s->stop_request = true;
+    s->blocked = true;
+    s->halted = false;
     s->qcount = 0;
     rnr_mutex_unlock(&s->lock);
+}
+
+static void rnr_resume (slice_sink_t *sink)
+{
+    rnr_sink_t *s = sink->ctx;
+
+    rnr_mutex_lock(&s->lock);
+    s->blocked = false;
+    rnr_mutex_unlock(&s->lock);
+}
+
+static bool rnr_get_halted_position (slice_sink_t *sink, int32_t position[SLICE_AXES], uint32_t timeout_ms)
+{
+    rnr_sink_t *s = sink->ctx;
+    uint64_t deadline = rnr_now_us() + (uint64_t)timeout_ms * 1000u;
+    bool halted = false, lost = false;
+
+    while(true) {
+        rnr_mutex_lock(&s->lock);
+        halted = s->halted;
+        lost = s->link_lost;
+        if(halted)
+            for(int a = 0; a < SLICE_AXES; a++)
+                position[a] = a < RNR_AXES ? s->halted_pos[a] : 0;
+        rnr_mutex_unlock(&s->lock);
+        if(halted || lost || rnr_now_us() >= deadline)
+            break;
+        rnr_sleep_ms(1);
+    }
+
+    return halted;
 }
 
 static void rnr_close (slice_sink_t *sink)
@@ -285,7 +372,7 @@ static void rnr_close (slice_sink_t *sink)
             break;
         rnr_sleep_ms(10);
     }
-    rnr_sleep_ms(3 * READ_TIMEOUT_MS);  // let the I/O thread publish its last state
+    rnr_sleep_ms(30);   // let the I/O thread run the last position check
 
     rnr_mutex_lock(&s->lock);
     s->quit = true;
@@ -294,7 +381,8 @@ static void rnr_close (slice_sink_t *sink)
 
     // Leave the controller disarmed
     send_short(s, RnrOp_EStop, false, 0, 0);
-    fprintf(stderr, "[rnr] closed: %u slices sent\n", s->slices_sent);
+    fprintf(stderr, "[rnr] closed: %u slices sent, position checks after runs: %u ok, %u mismatch\n",
+             s->slices_sent, s->checks_ok, s->checks_bad);
 
     s->t->close(s->t);
     rnr_mutex_destroy(&s->lock);
@@ -347,6 +435,8 @@ slice_sink_t *sink_rnr_open (rnr_transport_t *t)
     sink->push = rnr_push;
     sink->get_position = rnr_get_position;
     sink->stop = rnr_stop;
+    sink->resume = rnr_resume;
+    sink->get_halted_position = rnr_get_halted_position;
     sink->close = rnr_close;
     sink->ctx = s;
 

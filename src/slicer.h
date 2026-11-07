@@ -18,5 +18,6 @@ void slicer_step (uint32_t step_bits, uint32_t dir_bits); // one pulse (bit i = 
 void slicer_poll (void);                          // on every simulated tick: closes expired slices
 void slicer_close (void);                         // sends the current slice and closes the sink
 void slicer_attach_core (void);                   // hooks the core's reset event (call once the core is initialised)
+bool slicer_motor_fault (void);                   // true while the sink has failed (reported as the motor fault signal)
 
 #endif

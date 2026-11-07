@@ -55,8 +55,12 @@ The vendor plugin itself is proprietary and is **not** distributed here.
 - **RNR sink**: a dedicated I/O thread reads status reports continuously and sends slices paced by
   the PC clock, at most 3 slices (75 ms) ahead. The board acknowledges a slice as soon as it has
   buffered it, so pacing on acknowledgements alone would let the machine run seconds behind.
-  A 500 ms status watchdog, USB loss or a board fault raises grblHAL ALARM:17; every grblHAL reset
-  (Ctrl-X, alarm) sends an e-stop to the board at once.
+  A 500 ms status watchdog, USB loss or a board fault is reported to grblHAL as a motor fault
+  (ALARM:17); every grblHAL reset (Ctrl-X, alarm) sends an e-stop to the board at once. After each
+  run, the board's step counters are checked against the steps sent.
+- **Position resync**: the simulator runs a little ahead of the machine (queued slices). After a
+  reset, grblHAL's position is set back to where the board actually stopped (its step counters plus
+  the offset between grblHAL and the counted steps, sampled at rest), before any new command runs.
 
 ## Building
 
@@ -132,7 +136,9 @@ With the default settings (`$100=250` steps/mm), `G1 X10 F600` produces 2500 ste
   pacing (board buffer depth at most 4 slices, no underrun), no protocol error;
 - `watchdog`: the fake controller goes silent during a move: grblHAL must raise ALARM:17 and the
   bridge must send an e-stop;
-- `reset`: Ctrl-X during a long move: the board must get an e-stop at once and stop.
+- `reset`: Ctrl-X during a long move: the board must get an e-stop at once and stop, and grblHAL's
+  position must be resynced to where the board actually stopped (`-Immediate`: unlock and move
+  right after the reset, the move must start from the resynced position).
 
 ```
 powershell -File tests\run_fake_board.ps1 -Scenario all
@@ -140,10 +146,14 @@ powershell -File tests\run_fake_board.ps1 -Scenario all
 
 ## Known limitations
 
-- After a stop during motion, grblHAL is up to about 225 ms of motion ahead of the machine. grblHAL
-  then flags the position as lost (alarm 3); resynchronising it from the board's step counters is
-  still to do, and is required before homing and probing.
 - With `-u` / `-f`, G4 dwells run 5% short (simulation at 1.05 x real time).
+- Once the controller is lost (watchdog, USB unplugged), the bridge must be restarted: there is no
+  reconnection yet, and ALARM:17 stays latched until then.
+- The position resync after a reset has only been tested against the fake controller, and not yet
+  with homing (which overwrites the core's position).
+- The upstream simulator sometimes misses alarm 3 (position lost) after a reset during motion:
+  its `mc_reset()` runs on another thread than the core. With the resync the position is right
+  anyway.
 - The frame sequence (StartJog, jog slices, EndOfMotion) follows what BreakoutCNC bench-tested; it
   is still to be compared with USB captures of the vendor Mach3 plugin.
 
