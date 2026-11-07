@@ -82,6 +82,8 @@ add_executable(grblHAL_sim
     src/serial.c
     src/grbl_interface.c
 	src/fs_posix.c
+    src/slicer.c
+    src/sink_file.c
     ${platform_SRC}
 )
 

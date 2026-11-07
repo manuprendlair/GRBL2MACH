@@ -48,6 +48,7 @@
 #include "grbl_eeprom_extensions.h"
 #include "grbl_interface.h"
 #include "platform.h"
+#include "slicer.h"
 
 #include "grbl/hal.h"
 
@@ -178,6 +179,7 @@ static void stepperPulseStart (stepper_t *stepper)
 
     if(stepper->step_out.bits) {
         set_step_outputs(stepper->step_out);
+        slicer_step(stepper->step_out.bits, stepper->dir_out.bits);
     }
 }
 
@@ -192,6 +194,7 @@ static void stepperPulseStartDelayed (stepper_t *stepper)
     }
 
     if(stepper->step_out.bits) {
+        slicer_step(stepper->step_out.bits, stepper->dir_out.bits);
 //        next_step_out = stepper->step_out; // Store out_bits
 //        PULSE_TIMER->CTL |= TIMER_A_CTL_CLR|TIMER_A_CTL_MC1;
     }

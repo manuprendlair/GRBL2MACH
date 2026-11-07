@@ -44,6 +44,7 @@
 #include "grbl_interface.h"
 #include "build_info.h"
 #include "fs_posix.h"
+#include "slicer.h"
 
 #include "grbl/grbllib.h"
 
@@ -75,6 +76,7 @@ void print_usage(const char* badarg)
       "    -s <step file>     : file to report each step executed.  default = stderr\n"
       "    -e <EEPROM file>   : file containing grblHAL settings.  default = EEPROM.DAT\n"
       "    -p <port>          : port to open raw telnet communication.\n"
+      "    -o <slice file>    : GRBL2MACH: write 25 ms step slices (CSV) to file.\n"
 	  "    -d <directory>     : directory to mount as local filing system.\n"
       "    -c<comment_char>   : character to print before each line from grbl.  default = '#'\n"
       "    -n                 : no comments before grbl response lines.\n"
@@ -316,6 +318,19 @@ int main(int argc, char *argv[])
                 case 'p':  // Raw telnet port
                     argv++; argc--;
                     args.port = atoi(*argv);
+                    break;
+
+                case 'o':  // GRBL2MACH: slice file
+                    argv++; argc--;
+                    {
+                        slice_sink_t *sink = sink_file_open(*argv);
+                        if (!sink) {
+                            perror("fopen");
+                            printf("Error opening : %s\n",*argv);
+                            return EXIT_FAILURE;
+                        }
+                        slicer_init(sink);
+                    }
                     break;
 
                 case 'v':

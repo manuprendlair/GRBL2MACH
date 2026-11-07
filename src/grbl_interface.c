@@ -27,6 +27,7 @@
 #include "mcu.h"
 #include "driver.h"
 #include "simulator.h"
+#include "slicer.h"
 
 #include "grbl/hal.h"
 #include "grbl/protocol.h"
@@ -61,6 +62,9 @@ void grbl_per_tick (void)
 {
     //maybe print the position every tick
     print_steps(0);
+
+    //GRBL2MACH: close expired step slices
+    slicer_poll();
 
     //TODO:
     //  set limit pins based on position,
@@ -170,6 +174,9 @@ void grbl_app_exit (void)
 {
     //force final position print
     print_steps(1);
+
+    //GRBL2MACH: send the last slice and close the sink
+    slicer_close();
 }
 
 //show current position in steps
