@@ -28,6 +28,7 @@
 #include <stdatomic.h>
 
 #include "slicer.h"
+#include "irq_lock.h"
 #include "simulator.h"
 #include "mcu.h"
 #include "driver.h"
@@ -113,13 +114,16 @@ static void on_driver_reset (void)
         stop_machine();
 
         // mc_reset() may not have stopped the simulated steppers (see on_core_reset): stop the
-        // stepper timer like the core does from its thread, then wait until the simulator thread
-        // has gone round its loop twice, so that no stepper interrupt is still updating
-        // sys.position. Nothing else runs on the core thread meanwhile.
+        // stepper timer like the core does from its thread. With the interrupt lock (irq_lock.h)
+        // no stepper interrupt can be running while this core code runs. Without it, wait until
+        // the simulator thread has gone round its loop twice, so that no stepper interrupt is
+        // still updating sys.position. Nothing else runs on the core thread meanwhile.
         hal.stepper.go_idle(false);
-        beat = atomic_load(&sim_heartbeat);
-        for(int i = 0; i < HALT_TIMEOUT_MS && (timer[STEPPER_TIMER].enable || atomic_load(&sim_heartbeat) - beat < 2); i++)
-            platform_sleep(1000);
+        if(!irq_lock_enabled()) {
+            beat = atomic_load(&sim_heartbeat);
+            for(int i = 0; i < HALT_TIMEOUT_MS && (timer[STEPPER_TIMER].enable || atomic_load(&sim_heartbeat) - beat < 2); i++)
+                platform_sleep(1000);
+        }
 
         if(sink->get_halted_position(sink, machine, HALT_TIMEOUT_MS)) {
             resync_position(machine);

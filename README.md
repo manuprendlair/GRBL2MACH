@@ -61,6 +61,13 @@ The vendor plugin itself is proprietary and is **not** distributed here.
 - **Position resync**: the simulator runs a little ahead of the machine (queued slices). After a
   reset, grblHAL's position is set back to where the board actually stopped (its step counters plus
   the offset between grblHAL and the counted steps, sampled at rest), before any new command runs.
+- **Interrupt lock** (`src/irq_lock.c`): the upstream simulator runs its simulated interrupt
+  handlers on its own thread, concurrently with the core thread, while the core assumes (as on a
+  microcontroller) that it is suspended during a handler. A recursive lock restores that: the core
+  thread holds it and releases it only at its yield points (main loop pass, delays, clock polling
+  while a handler waits); the simulator thread takes it around every handler. If the core thread
+  ever keeps it 250 ms while a handler waits, the lock disables itself and says so.
+  `--no-irq-lock` restores the upstream behaviour. See grblHAL/Simulator issue #28.
 
 ## Building
 
@@ -97,6 +104,7 @@ grblHAL_sim -o <slice file>    write 25 ms step slices (CSV) to a file
 grblHAL_sim -u                 drive the RNR Eco Motion USB controller
 grblHAL_sim -f <log file>      drive a fake RNR controller (tests), logging every frame
 grblHAL_sim -l <address>       address to listen on with -p (default 127.0.0.1)
+grblHAL_sim --no-irq-lock      let simulated interrupts run concurrently with the core (upstream)
 ```
 
 `-o`, `-u` and `-f` are mutually exclusive. With `-u` or `-f`, the simulation runs at 1.05 x real
@@ -151,11 +159,14 @@ powershell -File tests\run_fake_board.ps1 -Scenario all
   reconnection yet, and ALARM:17 stays latched until then.
 - The position resync after a reset has only been tested against the fake controller, and not yet
   with homing (which overwrites the core's position).
-- The upstream simulator sometimes misses alarm 3 (position lost) after a reset during motion:
-  its `mc_reset()` runs on another thread than the core and can return early, without stopping
-  the steppers or calling `grbl.on_reset`. The bridge therefore stops the board and resyncs the
-  position from `hal.driver_reset`, which the core always calls on its own thread; the position is
-  right in both cases.
+- Without the interrupt lock (`--no-irq-lock`), the upstream simulator often misses alarm 3
+  (position lost) after a reset during motion: its `mc_reset()` can return early, without stopping
+  the steppers or calling `grbl.on_reset`. The bridge stops the board and resyncs the position from
+  `hal.driver_reset`, which the core always calls on its own thread, so the position is right
+  either way. With the lock, alarm 3 is raised every time.
+- After a feed hold, `Hold:1` sometimes lasts 10, 20 or 30 s before `Hold:0` (the last steps of the
+  deceleration come seconds apart). Seen in the upstream simulator without any GRBL2MACH code,
+  with or without the lock; resuming works. Not investigated yet.
 - The frame sequence (StartJog, jog slices, EndOfMotion) follows what BreakoutCNC bench-tested; it
   is still to be compared with USB captures of the vendor Mach3 plugin.
 

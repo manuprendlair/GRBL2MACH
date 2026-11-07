@@ -49,6 +49,7 @@
 #include "grbl_interface.h"
 #include "platform.h"
 #include "slicer.h"
+#include "irq_lock.h"
 
 #include "grbl/hal.h"
 
@@ -85,7 +86,7 @@ static void driver_delay_ms (uint32_t ms, void (*callback)(void))
         systick_timer.enable = 1;
         if(!(delay.callback = callback))
             while(delay.ms)
-                sim_yield(); // hand the host CPU to the simulator thread while waiting; delay.ms is decremented by SysTick on the sim thread
+                irq_lock_core_yield(true); // GRBL2MACH: release the interrupt lock and the CPU; delay.ms is decremented by SysTick on the sim thread
     } else if(callback)
         callback();
 }
@@ -449,12 +450,17 @@ void sim_process_realtime (uint_fast16_t state)
 
     grbl_print_recent_block(); // on this (grbl) thread, which owns the planner
 
-    sim_yield(); // yield to the simulator thread instead of spinning grbl's main loop at full host speed
+    irq_lock_core_yield(true); // GRBL2MACH: let pending interrupts run and yield to the simulator thread instead of spinning grbl's main loop at full host speed
     on_execute_realtime(state);
 }
 
 uint32_t millis (void)
 {
+    // GRBL2MACH: the core polls the clock in its waiting loops (task_execute(), stream TX
+    // blocking, ...). If an interrupt is waiting for the lock, let it run here, otherwise
+    // a loop waiting for an interrupt would never end. No-op on other threads.
+    irq_lock_core_yield(false);
+
     return ticks;
 }
 

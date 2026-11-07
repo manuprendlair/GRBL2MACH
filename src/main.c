@@ -47,6 +47,7 @@
 #include "fs_posix.h"
 #include "slicer.h"
 #include "rnr/sink_rnr.h"
+#include "irq_lock.h"
 
 #include "grbl/grbllib.h"
 
@@ -69,6 +70,7 @@ static const char *slice_file = NULL;           // -o
 static const char *fake_log = NULL;             // -f
 static bool use_usb = false;                    // -u
 static bool speedup_given = false;
+static bool irq_lock_on = true;                 // --no-irq-lock
 
 void print_usage(const char* badarg)
 {
@@ -89,6 +91,7 @@ void print_usage(const char* badarg)
       "    -o <slice file>    : GRBL2MACH: write 25 ms step slices (CSV) to file.\n"
       "    -u                 : GRBL2MACH: drive the RNR Eco Motion USB controller.\n"
       "    -f <log file>      : GRBL2MACH: drive a fake RNR controller (tests), logging every frame.\n"
+      "    --no-irq-lock      : GRBL2MACH: let simulated interrupts run concurrently with the core (upstream behaviour).\n"
 	  "    -d <directory>     : directory to mount as local filing system.\n"
       "    -c<comment_char>   : character to print before each line from grbl.  default = '#'\n"
       "    -n                 : no comments before grbl response lines.\n"
@@ -120,6 +123,7 @@ void print_version(void)
 //wrapper for thread interface
 PLAT_THREAD_FUNC(grbl_main_thread, exit)
 {
+    irq_lock_core_start();  // GRBL2MACH: the core thread holds the interrupt lock while it runs
     grbl_enter();
 
     return 0; //NULL;
@@ -270,6 +274,11 @@ int main(int argc, char *argv[])
             if (!strcmp(argv[0], "--version")) {
                 print_version();
                 return EXIT_SUCCESS;
+            }
+
+            if (!strcmp(argv[0], "--no-irq-lock")) {
+                irq_lock_on = false;
+                continue;
             }
 
             switch(argv[0][1]){
@@ -554,7 +563,8 @@ int main(int argc, char *argv[])
     }
 
     //launch a thread with the original grbl code.
-    plat_thread_t *th = platform_start_thread(grbl_main_thread); 
+    irq_lock_init(irq_lock_on);
+    plat_thread_t *th = platform_start_thread(grbl_main_thread);
     if (!th){
         printf("Fatal: Unable to start hardware thread.\n");
         exit(-5);

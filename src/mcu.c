@@ -26,10 +26,20 @@
 #include "mcu.h"
 #include "simulator.h"
 #include "grbl/hal.h"
+#include "irq_lock.h"
 
 static volatile bool irq_enable = false;
 static volatile bool booted = false;
 static interrupt_handler isr[IRQ_N_HANDLERS];
+
+// GRBL2MACH: every handler runs under the interrupt lock, exclusive with the core thread
+// (see irq_lock.h), as on a microcontroller where the main program is suspended meanwhile.
+static inline void run_isr (irq_num_t irq)
+{
+    bool locked = irq_lock_isr_enter();
+    isr[irq]();
+    irq_lock_isr_leave(locked);
+}
 
 // Per-idle-tick fast-path gates (see mcu_master_clock):
 //  - timer_enabled_mask: bit i set while timer[i] is enabled. Lets an idle tick
@@ -137,7 +147,7 @@ void mcu_master_clock (void)
                     timer[i].value = timer[i].load;
                 else if(--timer[i].value == 0) {
                     if(timer[i].irq_enable && irq_enable)
-                        isr[Timer0_IRQ + i]();
+                        run_isr(Timer0_IRQ + i);
                     timer[i].value = timer[i].load;
                 }
             }
@@ -151,7 +161,7 @@ void mcu_master_clock (void)
         gpio_irq_pending = false;
         for(i = 0; i < MCU_N_GPIO; i++) {
             if(gpio[i].irq_state.value & gpio[i].irq_mask.value)
-                isr[GPIO0_IRQ + i]();
+                run_isr(GPIO0_IRQ + i);
         }
     }
 
@@ -160,7 +170,7 @@ void mcu_master_clock (void)
             systick_timer.value = systick_timer.load;
         else if(--systick_timer.value == 0) {
             if(systick_timer.irq_enable && irq_enable)
-                isr[Systick_IRQ]();
+                run_isr(Systick_IRQ);
             systick_timer.value = systick_timer.load;
         }
     }
@@ -286,7 +296,7 @@ void simulate_serial (void)
     }
 
     if((uart.tx_irq = uart.tx_irq_enable))
-        isr[UART_IRQ]();
+        run_isr(UART_IRQ);
 
     // Deliver at most one byte per grbl main-loop pass (see sim_process_realtime):
     // a pulse of 0 means the grbl thread is still booting and would flush the input,
@@ -300,7 +310,7 @@ void simulate_serial (void)
             pulse_seen = sim.grbl_pulse;
             uart.rx_data = char_in;
             uart.rx_irq = 1;
-            isr[UART_IRQ]();
+            run_isr(UART_IRQ);
         }
     }
 }

@@ -84,6 +84,7 @@ add_executable(grblHAL_sim
     src/grbl_interface.c
 	src/fs_posix.c
     src/slicer.c
+    src/irq_lock.c
     src/sink_file.c
     src/rnr/rnr_protocol.c
     src/rnr/rnr_os.c
