@@ -388,6 +388,9 @@ void settings_changed (settings_t *settings, settings_changed_flags_t changed)
 
 bool driver_setup (settings_t *settings)
 {
+    // GRBL2MACH: stop the slice sink on every core reset
+    slicer_attach_core();
+
     timer[STEPPER_TIMER].prescaler = 0;
     timer[STEPPER_TIMER].irq_enable = 1;
     mcu_register_irq_handler(Stepper_IRQHandler, Timer0_IRQ);

@@ -37,6 +37,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <arpa/inet.h>
 #endif
 
 #include "simulator.h"
@@ -45,6 +46,7 @@
 #include "build_info.h"
 #include "fs_posix.h"
 #include "slicer.h"
+#include "rnr/sink_rnr.h"
 
 #include "grbl/grbllib.h"
 
@@ -61,6 +63,13 @@ static int socket_fd = 0;
 static fd_set rfds;
 static char *fsdir;
 
+// GRBL2MACH options
+static const char *listen_addr = "127.0.0.1";   // TCP listens on this machine only unless -l is given
+static const char *slice_file = NULL;           // -o
+static const char *fake_log = NULL;             // -f
+static bool use_usb = false;                    // -u
+static bool speedup_given = false;
+
 void print_usage(const char* badarg)
 {
     if (badarg)
@@ -76,7 +85,10 @@ void print_usage(const char* badarg)
       "    -s <step file>     : file to report each step executed.  default = stderr\n"
       "    -e <EEPROM file>   : file containing grblHAL settings.  default = EEPROM.DAT\n"
       "    -p <port>          : port to open raw telnet communication.\n"
+      "    -l <address>       : GRBL2MACH: address to listen on with -p. Default=127.0.0.1 (this machine only).\n"
       "    -o <slice file>    : GRBL2MACH: write 25 ms step slices (CSV) to file.\n"
+      "    -u                 : GRBL2MACH: drive the RNR Eco Motion USB controller.\n"
+      "    -f <log file>      : GRBL2MACH: drive a fake RNR controller (tests), logging every frame.\n"
 	  "    -d <directory>     : directory to mount as local filing system.\n"
       "    -c<comment_char>   : character to print before each line from grbl.  default = '#'\n"
       "    -n                 : no comments before grbl response lines.\n"
@@ -273,6 +285,7 @@ int main(int argc, char *argv[])
                 case 't': //Tick rate
                     argv++; argc--;
                     args.speedup = atof(*argv);
+                    speedup_given = true;
                     break;
 
                 case 'b': //Block file
@@ -322,15 +335,21 @@ int main(int argc, char *argv[])
 
                 case 'o':  // GRBL2MACH: slice file
                     argv++; argc--;
-                    {
-                        slice_sink_t *sink = sink_file_open(*argv);
-                        if (!sink) {
-                            perror("fopen");
-                            printf("Error opening : %s\n",*argv);
-                            return EXIT_FAILURE;
-                        }
-                        slicer_init(sink);
-                    }
+                    slice_file = *argv;
+                    break;
+
+                case 'f':  // GRBL2MACH: fake RNR controller
+                    argv++; argc--;
+                    fake_log = *argv;
+                    break;
+
+                case 'u':  // GRBL2MACH: RNR USB controller
+                    use_usb = true;
+                    break;
+
+                case 'l':  // GRBL2MACH: listen address
+                    argv++; argc--;
+                    listen_addr = *argv;
                     break;
 
                 case 'v':
@@ -377,6 +396,43 @@ int main(int argc, char *argv[])
         }
     }
 
+    // GRBL2MACH: select the slice sink (at most one)
+    if ((slice_file != NULL) + (fake_log != NULL) + use_usb > 1) {
+        printf("Options -o, -f and -u are mutually exclusive.\n");
+        return EXIT_FAILURE;
+    }
+    if (slice_file) {
+        slice_sink_t *sink = sink_file_open(slice_file);
+        if (!sink) {
+            perror("fopen");
+            printf("Error opening : %s\n", slice_file);
+            return EXIT_FAILURE;
+        }
+        slicer_init(sink);
+    }
+    if (fake_log || use_usb) {
+        char info[256] = "";
+        rnr_transport_t *t = use_usb ? rnr_hid_open(info, sizeof(info)) : rnr_fake_open(fake_log);
+        if (!t) {
+            printf(use_usb ? "No RNR Eco Motion controller found (VID 0x%04X, PID 0x%04X).\n" : "Cannot open fake controller log.\n", RNR_VID, RNR_PID);
+            return EXIT_FAILURE;
+        }
+        if (use_usb) {
+            printf("RNR controller: %s\n", info);
+            fflush(stdout);
+        }
+        slice_sink_t *sink = sink_rnr_open(t);
+        if (!sink) {
+            printf("The RNR controller does not answer.\n");
+            return EXIT_FAILURE;
+        }
+        slicer_init(sink);
+        // Run the simulation slightly faster than real time: slice back-pressure then locks it to
+        // the machine, and the controller never starves. TODO: dwells (G4) run 5% short this way.
+        if (!speedup_given)
+            args.speedup = 1.05f;
+    }
+
     // Make sure the output streams are flushed immediately.
     // This is important when using the simulator inside another application in parallel
     // to the real grbl.
@@ -412,7 +468,7 @@ int main(int argc, char *argv[])
             exit(-5);
         }
 
-        if (getaddrinfo(NULL, itoa(args.port, port, 10), &hints, &result) != 0) {
+        if (getaddrinfo(listen_addr, itoa(args.port, port, 10), &hints, &result) != 0) {
             WSACleanup();
             printf("Fatal: Unable to create socket.\n");
             exit(-5);
@@ -453,7 +509,7 @@ int main(int argc, char *argv[])
         }
 
         server_addr.sin_family = AF_INET;
-        server_addr.sin_addr.s_addr = INADDR_ANY;
+        server_addr.sin_addr.s_addr = inet_addr(listen_addr);
         server_addr.sin_port = htons(args.port);
 
         if (bind(socket_fd, (struct sockaddr *) &server_addr, addrlen) < 0) {
@@ -483,6 +539,12 @@ int main(int argc, char *argv[])
         setsockopt(sim.socket_fd, SOL_SOCKET, SO_RCVTIMEO, &t, sizeof(t));
 */
 #endif
+        printf("Listening on %s:%u\n", listen_addr, args.port);
+        if (strcmp(listen_addr, "127.0.0.1") && strcmp(listen_addr, "localhost"))
+            printf("WARNING: this port is reachable from the network. GRBL has no authentication:\n"
+                   "         anyone who can reach it can move the machine.\n");
+        fflush(stdout);
+
         sim.getchar = sim_socket_in;
         sim.putchar = sim_socket_out;
 

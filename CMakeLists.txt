@@ -49,6 +49,7 @@ if (WIN32)
     set(platform_LIB
         ws2_32
         winmm  # timeBeginPeriod/timeEndPeriod (1 ms Sleep granularity)
+        hid setupapi  # GRBL2MACH: RNR USB HID controller
     )
 endif(WIN32)
 
@@ -84,6 +85,11 @@ add_executable(grblHAL_sim
 	src/fs_posix.c
     src/slicer.c
     src/sink_file.c
+    src/rnr/rnr_protocol.c
+    src/rnr/rnr_os.c
+    src/rnr/rnr_hid_win.c
+    src/rnr/rnr_fake.c
+    src/rnr/sink_rnr.c
     ${platform_SRC}
 )
 

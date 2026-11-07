@@ -42,7 +42,7 @@ The vendor plugin itself is proprietary and is **not** distributed here.
                                                slicer: counts step pulses per 25 ms slice
                                                           |
                                                           v
-                                               slice sink: file (now) / RNR USB controller (next)
+                                               slice sink: file, RNR USB controller or fake controller
 ```
 
 - **Slicer** (`src/slicer.c`): step pulses are counted where the simulated driver emits them
@@ -50,8 +50,13 @@ The vendor plugin itself is proprietary and is **not** distributed here.
   runs, every slice is emitted (even empty ones) so the controller keeps the simulator's timeline.
 - **Slice sink** (`src/slice_sink.h`): one interface for every consumer of slices. When a sink is
   full, the simulator waits (back-pressure), so simulated time never runs ahead of the machine.
-  Implementations: **file** (`src/sink_file.c`, CSV, available now), **RNR USB controller** (next),
-  dummy sink for automated tests (planned).
+  Implementations: **file** (`src/sink_file.c`, CSV) and **RNR controller** (`src/rnr/sink_rnr.c`), which
+  talks either to the real board over USB HID or to a **fake controller** used by the tests.
+- **RNR sink**: a dedicated I/O thread reads status reports continuously and sends slices paced by
+  the PC clock, at most 3 slices (75 ms) ahead. The board acknowledges a slice as soon as it has
+  buffered it, so pacing on acknowledgements alone would let the machine run seconds behind.
+  A 500 ms status watchdog, USB loss or a board fault raises grblHAL ALARM:17; every grblHAL reset
+  (Ctrl-X, alarm) sends an e-stop to the board at once.
 
 ## Building
 
@@ -85,7 +90,13 @@ GRBL2MACH adds one option to the simulator (all other options are described in
 
 ```
 grblHAL_sim -o <slice file>    write 25 ms step slices (CSV) to a file
+grblHAL_sim -u                 drive the RNR Eco Motion USB controller
+grblHAL_sim -f <log file>      drive a fake RNR controller (tests), logging every frame
+grblHAL_sim -l <address>       address to listen on with -p (default 127.0.0.1)
 ```
+
+`-o`, `-u` and `-f` are mutually exclusive. With `-u` or `-f`, the simulation runs at 1.05 x real
+time unless `-t` is given; slice back-pressure then locks it to the machine.
 
 Example: listen on TCP port 23023 and write slices to `slices.csv`:
 
@@ -95,6 +106,9 @@ grblHAL_sim -n -p 23023 -o slices.csv
 
 Each CSV line is `index,t_s,dx,dy,dz,da,out` (slice number, start time in seconds, signed steps
 per axis, outputs bitmask). The last line gives the totals.
+
+> `-u` has **not been tested on real hardware yet**. The controller's limit, home, probe and e-stop
+> inputs are not configured yet (all disabled in the configuration frame).
 
 On Windows the console input only reads the keyboard: type commands in the console window, or
 connect over TCP (`-p`). Piping commands into stdin does not work.
@@ -112,11 +126,33 @@ powershell -File tests\run_slices.ps1 -GCode "G21 G91 G1 X10 F600" -Expect "2500
 With the default settings (`$100=250` steps/mm), `G1 X10 F600` produces 2500 steps over 83 slices
 (2.08 s, triangular velocity profile at 10 mm/s²).
 
+`tests/run_fake_board.ps1` runs the RNR sink against the fake controller:
+
+- `motion`: frame sequence (connect, arm, run, end of run, disarm), every step executed, real-time
+  pacing (board buffer depth at most 4 slices, no underrun), no protocol error;
+- `watchdog`: the fake controller goes silent during a move: grblHAL must raise ALARM:17 and the
+  bridge must send an e-stop;
+- `reset`: Ctrl-X during a long move: the board must get an e-stop at once and stop.
+
+```
+powershell -File tests\run_fake_board.ps1 -Scenario all
+```
+
+## Known limitations
+
+- After a stop during motion, grblHAL is up to about 225 ms of motion ahead of the machine. grblHAL
+  then flags the position as lost (alarm 3); resynchronising it from the board's step counters is
+  still to do, and is required before homing and probing.
+- With `-u` / `-f`, G4 dwells run 5% short (simulation at 1.05 x real time).
+- The frame sequence (StartJog, jog slices, EndOfMotion) follows what BreakoutCNC bench-tested; it
+  is still to be compared with USB captures of the vendor Mach3 plugin.
+
 ## Roadmap
 
 1. Validate the controller with BreakoutCNC's diagnostic tool (connection, reset, status).
 2. ~~Build the simulator on Windows; slice sink interface with the file implementation.~~ Done.
-3. Minimal RNR USB sink: jog and small moves, no tool fitted, far from the limits.
+3. RNR USB sink: written and tested against the fake controller. Next: first hardware tests (drivers
+   off, then small moves without a tool, far from the limits).
 4. Compare with USB captures of Mach3 driving the same machine.
 5. Homing and probing using the controller's hardware latches.
 6. Mach3 XML profile importer, spindle and outputs.
@@ -125,10 +161,12 @@ With the default settings (`$100=250` steps/mm), `G1 X10 F600` produces 2500 ste
 
 - This software is a **second layer** only. Use a hardwired emergency stop that cuts power to the
   stepper drivers.
-- On USB link loss or status silence the bridge must stop immediately (watchdog, planned).
-- The TCP port of the bridge will listen on `127.0.0.1` only by default: GRBL has no
-  authentication, so anyone reaching the port can move the machine. Opening it to the network will
-  require an explicit option. Never allow it on "Public" networks in your firewall.
+- On USB link loss, a board fault or 500 ms without a status report, the bridge sends an e-stop and
+  grblHAL raises ALARM:17. Thanks to real-time pacing the board never holds more than about 100 ms
+  of motion.
+- The TCP port listens on `127.0.0.1` only by default: GRBL has no authentication, so anyone
+  reaching the port can move the machine. `-l <address>` opens it to the network and prints a
+  warning. Never allow it on "Public" networks in your firewall.
 - First tests with drivers powered off, then without a tool, with small moves in the middle of the
   travel.
 
