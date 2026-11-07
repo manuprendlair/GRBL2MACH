@@ -152,8 +152,10 @@ powershell -File tests\run_fake_board.ps1 -Scenario all
 - The position resync after a reset has only been tested against the fake controller, and not yet
   with homing (which overwrites the core's position).
 - The upstream simulator sometimes misses alarm 3 (position lost) after a reset during motion:
-  its `mc_reset()` runs on another thread than the core. With the resync the position is right
-  anyway.
+  its `mc_reset()` runs on another thread than the core and can return early, without stopping
+  the steppers or calling `grbl.on_reset`. The bridge therefore stops the board and resyncs the
+  position from `hal.driver_reset`, which the core always calls on its own thread; the position is
+  right in both cases.
 - The frame sequence (StartJog, jog slices, EndOfMotion) follows what BreakoutCNC bench-tested; it
   is still to be compared with USB captures of the vendor Mach3 plugin.
 

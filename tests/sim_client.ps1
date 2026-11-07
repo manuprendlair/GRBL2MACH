@@ -4,7 +4,8 @@
 # session object. Invoke-GCode sends lines and waits for "ok"; Wait-Idle polls the status report;
 # Stop-Sim shuts the simulator down cleanly (Ctrl-F) and waits for it to exit.
 
-$script:SimExe = Join-Path $PSScriptRoot "..\build\grblHAL_sim.exe"
+# GRBL2MACH_SIM may point to another build of the simulator (for example an instrumented one)
+$script:SimExe = if ($env:GRBL2MACH_SIM) { $env:GRBL2MACH_SIM } else { Join-Path $PSScriptRoot "..\build\grblHAL_sim.exe" }
 
 function Start-Sim([string]$SimArgs, [string]$OutDir, [int]$Port, [hashtable]$Env = @{}) {
     New-Item -ItemType Directory -Force $OutDir | Out-Null
