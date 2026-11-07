@@ -12,6 +12,12 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(-fno-strict-aliasing)
 endif()
 
+if(MINGW)
+    # GRBL2MACH: MinGW's <string.h> declares the legacy strset(char *, int), which clashes
+    # with the core's strset() (grbl/strutils.h). See cmake/mingw_strset_fix.h.
+    add_compile_options(-include ${CMAKE_CURRENT_LIST_DIR}/cmake/mingw_strset_fix.h)
+endif()
+
 add_compile_definitions(F_CPU=16000000)
 #add_compile_definitions(SQUARING_ENABLED=1)
 
