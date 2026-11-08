@@ -80,14 +80,23 @@ typedef struct {
     uint16_t mpg;                       // rx[46..47] >> 2
 } rnr_status_t;
 
+// Controller inputs, as Mach3 declares them (Ports & Pins > Input Signals, port 3 pin n = INn)
+typedef struct {
+    uint8_t pin;        // 1..15 = IN1..IN15, 0 = not used
+    bool active_low;
+} rnr_input_t;
+
+typedef struct {
+    rnr_input_t limit_pos[RNR_AXES], limit_neg[RNR_AXES], home[RNR_AXES];
+    rnr_input_t probe, estop;
+} rnr_inputs_t;
+
 typedef struct {
     uint8_t pulse_khz;          // 1..100 (Mach3: <RnRMotion><PulseRates>)
     uint8_t slice_ms;           // 5, as Mach3 configures it
     uint8_t step_dir_invert;    // bits 0-3: step active low X..A, bits 4-7: dir active low X..A
-    // buf[5..14], input pins as Mach3 encodes them: one (limit, home) byte pair per axis, then
-    // probe; low nibble = input number, other bits to be decoded. Example (reference machine,
-    // homes on IN3 active low, probe on IN2): 00 73 00 73 00 73 00 70 12 00. The controller stops
-    // on its e-stop input (IN1) by itself only with pins declared here.
+    // buf[5..14], input pins (see rnr_encode_pins). The controller stops by itself on its e-stop
+    // input only if it is declared here.
     uint8_t pins[RNR_PIN_BYTES];
 } rnr_config_t;
 
@@ -96,6 +105,8 @@ void rnr_build_slice (uint8_t buf[RNR_OUT_BYTES], rnr_opcode_t op, uint16_t seq,
 void rnr_build_positions (uint8_t buf[RNR_OUT_BYTES], uint16_t seq, const int32_t steps[RNR_AXES], uint8_t axis_mask);
 void rnr_build_configure (uint8_t buf[RNR_OUT_BYTES], uint16_t seq, const rnr_config_t *cfg);
 void rnr_build_pwm (uint8_t buf[RNR_OUT_BYTES], uint16_t seq, uint16_t duty);  // SpindlePwm: duty in 1/RNR_PWM_PERIOD
+// Configure bytes 5..14 from the inputs, as Mach3's plugin encodes them (decoded from captures)
+void rnr_encode_pins (uint8_t pins[RNR_PIN_BYTES], const rnr_inputs_t *in);
 bool rnr_parse_status (const uint8_t *rx, int len, rnr_status_t *status);
 
 // Helpers shared with the fake controller

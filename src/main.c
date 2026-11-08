@@ -71,7 +71,54 @@ static const char *fake_log = NULL;             // -f
 static bool use_usb = false;                    // -u
 static bool speedup_given = false;
 static bool irq_lock_on = true;                 // --no-irq-lock
-static rnr_options_t rnr_opt = { .spindle_out = 1, .estop_in = 1 };  // --rnr-invert, --rnr-out, --rnr-estop-in
+// --rnr-invert, --rnr-out, --rnr-in, --rnr-estop-in, --rnr-pins. Default: spindle on OUT1, e-stop
+// on IN1 active high (Mach3's EStop on port 3 pin 1), declared to the controller so that it stops
+// by itself.
+static rnr_options_t rnr_opt = { .spindle_out = 1, .inputs.estop = { .pin = 1 } };
+
+// "<n>" or "<n>low": input number (0 = not used, 1..15) and polarity
+static bool parse_rnr_input (const char *s, rnr_input_t *in)
+{
+    char *end;
+    unsigned long n = strtoul(s, &end, 10);
+
+    if(end == s || n > 15 || (*end && strcmp(end, "low")))
+        return false;
+    in->pin = (uint8_t)n;
+    in->active_low = *end != 0;
+
+    return true;
+}
+
+// --rnr-in xhome=3low,yhome=3low,zhome=3low,probe=2,x+=4low,x-=5low,estop=1
+static bool parse_rnr_inputs (const char *arg)
+{
+    static const char axes[] = "xyza";
+    char buf[256], *save = NULL;
+
+    snprintf(buf, sizeof(buf), "%s", arg);
+    for(char *item = strtok_r(buf, ",", &save); item; item = strtok_r(NULL, ",", &save)) {
+        char *eq = strchr(item, '=');
+        rnr_input_t *in = NULL;
+        if(!eq)
+            return false;
+        *eq = 0;
+        if(!strcmp(item, "probe"))
+            in = &rnr_opt.inputs.probe;
+        else if(!strcmp(item, "estop"))
+            in = &rnr_opt.inputs.estop;
+        else if(item[0] && strchr(axes, item[0])) {
+            int a = (int)(strchr(axes, item[0]) - axes);
+            if(!strcmp(item + 1, "home")) in = &rnr_opt.inputs.home[a];
+            else if(!strcmp(item + 1, "+")) in = &rnr_opt.inputs.limit_pos[a];
+            else if(!strcmp(item + 1, "-")) in = &rnr_opt.inputs.limit_neg[a];
+        }
+        if(!in || !parse_rnr_input(eq + 1, in))
+            return false;
+    }
+
+    return true;
+}
 
 // --rnr-out spindle=1,ccw=0,flood=2,mist=0
 static bool parse_rnr_outputs (const char *arg)
@@ -120,10 +167,14 @@ void print_usage(const char* badarg)
       "    --rnr-out <function>=<n>[,...] : GRBL2MACH: controller output OUT<n> (1-4, 0 = none) driven by\n"
       "                         spindle (M3/M4), ccw (M4, when apart from spindle), flood (M8), mist (M7).\n"
       "                         Default spindle=1 (Mach3 Spindle CW on OUT1), coolant on no output.\n"
-      "    --rnr-pins <20 hex digits> : GRBL2MACH: controller input pins (configuration frame bytes 5-14), as\n"
-      "                         Mach3 sends them, e.g. 00730073007300701200. Default all 0 (no pins).\n"
-      "    --rnr-estop-in <n>[low] : GRBL2MACH: controller input IN<n> watched as e-stop (0 = none; \"low\":\n"
-      "                         active low, e.g. 1low). Default 1 (active high, as Mach3's EStop on port 3 pin 1).\n"
+      "    --rnr-in <input>=<n>[low][,...] : GRBL2MACH: controller inputs IN<n> (0 = not used, \"low\": active\n"
+      "                         low), as in Mach3's Input Signals page (port 3 pin n): x+ x- xhome, y+ y- yhome,\n"
+      "                         z+ z- zhome, a+ a- ahome, probe, estop. Example: xhome=3low,yhome=3low,zhome=3low,probe=2\n"
+      "    --rnr-estop-in <n>[low] : GRBL2MACH: same as --rnr-in estop=<n>[low]. The e-stop input is declared to\n"
+      "                         the controller (it stops by itself) and watched by the bridge. Default 1 (active\n"
+      "                         high, as Mach3's EStop on port 3 pin 1); 0 = none.\n"
+      "    --rnr-pins <20 hex digits> : GRBL2MACH: configuration frame bytes 5-14 copied as is from a Mach3\n"
+      "                         capture (replaces the bytes computed from --rnr-in), e.g. 00730073007300701200.\n"
 	  "    -d <directory>     : directory to mount as local filing system.\n"
       "    -c<comment_char>   : character to print before each line from grbl.  default = '#'\n"
       "    -n                 : no comments before grbl response lines.\n"
@@ -326,19 +377,25 @@ int main(int argc, char *argv[])
                     print_usage(*argv);
                     exit(-1);
                 }
+                rnr_opt.pins_raw = true;
+                continue;
+            }
+
+            if (!strcmp(argv[0], "--rnr-in") && argc > 1) {
+                argv++; argc--;
+                if (!parse_rnr_inputs(*argv)) {
+                    print_usage(*argv);
+                    exit(-1);
+                }
                 continue;
             }
 
             if (!strcmp(argv[0], "--rnr-estop-in") && argc > 1) {
                 argv++; argc--;
-                char *end;
-                unsigned long n = strtoul(*argv, &end, 10);
-                if (end == *argv || n > 16 || (*end && strcmp(end, "low"))) {
+                if (!parse_rnr_input(*argv, &rnr_opt.inputs.estop)) {
                     print_usage(*argv);
                     exit(-1);
                 }
-                rnr_opt.estop_in = (uint8_t)n;
-                rnr_opt.estop_in_active_low = *end != 0;
                 continue;
             }
 

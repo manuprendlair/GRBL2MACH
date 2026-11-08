@@ -17,12 +17,13 @@ typedef struct {
     // Controller output (1..4 = OUT1..OUT4, 0 = none) driven by: spindle on, spindle on in
     // counter-clockwise (0: same output as spindle_out), flood coolant, mist coolant
     uint8_t spindle_out, spindle_ccw_out, flood_out, mist_out;
-    // E-stop input watched by the bridge (1..16 = IN1..IN16, 0 = none), and its polarity. The
-    // controller stops on it by itself only with input pins in its configuration frame.
-    uint8_t estop_in;
-    bool estop_in_active_low;
-    // Configure frame bytes 5..14 (input pins), copied from Mach3's frame (--rnr-pins)
-    uint8_t pins[10];
+    // Inputs declared to the controller (--rnr-in, --rnr-estop-in). The e-stop input is also
+    // watched by the bridge itself. The controller stops on it by itself once declared.
+    rnr_inputs_t inputs;
+    // Configure bytes 5..14 given as is (--rnr-pins, copied from a Mach3 capture): replace the
+    // bytes encoded from inputs
+    bool pins_raw;
+    uint8_t pins[RNR_PIN_BYTES];
 } rnr_options_t;
 
 // Takes ownership of the transport (closed on failure or by sink->close).

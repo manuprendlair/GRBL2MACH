@@ -12,12 +12,13 @@
 #              to where the controller stopped and re-arm it for the next move after a reset.
 #   outputs  : M3 / M8 / M5 M9 around two moves: spindle PWM and outputs switched in step with the
 #              motion (before the first slice, between the runs, after the last one), slices carry them.
+#   pins     : configuration frame input bytes computed from --rnr-in, compared with Mach3's frames.
 #
-# Usage: powershell -File tests\run_fake_board.ps1 [-Scenario motion|watchdog|reset|estop|outputs|all]
+# Usage: powershell -File tests\run_fake_board.ps1 [-Scenario motion|watchdog|reset|estop|outputs|pins|all]
 #                       [-GCode "G21 G91 G1 X10 F600"] [-Expect "2500,0,0"] [-OutDir folder] [-Immediate]
 
 param(
-    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "all")] [string]$Scenario = "all",
+    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "all")] [string]$Scenario = "all",
     [string]$GCode = "G21 G91 G1 X10 F600",
     [string]$Expect = "2500,0,0",
     [string]$OutDir = "$env:TEMP\grbl2mach_fake",
@@ -163,11 +164,11 @@ function Test-Reset {
 }
 
 function Test-EStop([bool]$Self) {
-    $mode = if ($Self) { "the controller stops by itself (Mach3 pin configuration)" } else { "the controller only reports the input (seen on the real board)" }
+    $mode = if ($Self) { "e-stop declared in the configuration frame (default): the controller stops by itself" } else { "no input pins declared (--rnr-pins 0...): the controller only reports the input, the bridge stops it" }
     "=== estop: the e-stop input (IN1) is pressed 500 ms into a move, released 1 s later; $mode"
     $dir = Join-Path $OutDir $(if ($Self) { "estop_self" } else { "estop" }); $log = Join-Path $dir "fake.log"
-    $fakeEnv = @{ GRBL2MACH_FAKE_ESTOP_MS = "500,1500" }; if ($Self) { $fakeEnv.GRBL2MACH_FAKE_ESTOP_SELF = "1" }
-    $s = Start-Sim "-f `"$log`"" $dir ($Port + $(if ($Self) { 5 } else { 3 })) $fakeEnv
+    $simArgs = if ($Self) { "" } else { "--rnr-pins 00000000000000000000" }
+    $s = Start-Sim "-f `"$log`" $simArgs" $dir ($Port + $(if ($Self) { 5 } else { 3 })) @{ GRBL2MACH_FAKE_ESTOP_MS = "500,1500" }
     try {
         $spm = Get-StepsPerMm $s
         Invoke-Line $s '$X' | Out-Null
@@ -246,10 +247,44 @@ function Test-Outputs {
     Check ($err -match "position checks after runs: 2 ok, 0 mismatch") "position check after each of the two runs"
 }
 
+function Test-Pins {
+    "=== pins: configuration frame input bytes computed from --rnr-in = Mach3's frames (USB captures 80, 81, 82)"
+    # Reference machine as Mach3 declares it: limits not used but ticked active low, homes X/Y/Z on
+    # IN3 active low, home A not used, probe on IN2, e-stop on IN1
+    $ref = "x+=0low,x-=0low,xhome=3low,y+=0low,y-=0low,yhome=3low,z+=0low,z-=0low,zhome=3low,a+=0low,a-=0low,ahome=0low,probe=2"
+    $cases = @(
+        @("default (e-stop on IN1 only)", "", "00000000000000001000"),
+        @("reference profile", "--rnr-in $ref", "00730073007300701200"),
+        @("probe active low", "--rnr-in $ref,probe=2low", "00730073007300701210"),
+        @("X home active high", "--rnr-in $ref,xhome=3", "00330073007300701200"),
+        @("X home on IN4", "--rnr-in $ref,xhome=4low", "00740073007300701200"),
+        @("A home on IN3", "--rnr-in $ref,ahome=3low", "00730073007300731200"),
+        @("X++ on IN4", "--rnr-in $ref,x+=4low", "04730073007300701200"),
+        @("X-- on IN4", "--rnr-in $ref,x-=4low", "40730073007300701200"),
+        @("X++ and X-- on IN4", "--rnr-in $ref,x+=4low,x-=4low", "44730073007300701200"),
+        @("e-stop on IN4", "--rnr-in $ref,estop=4", "00730073007300704200"),
+        @("X++ active high", "--rnr-in $ref,x+=0", "00630073007300701200"),
+        @("e-stop active low", "--rnr-in $ref --rnr-estop-in 1low", "00730073007300701220"),
+        @("Y home active high", "--rnr-in $ref,yhome=3", "00730033007300701200"),
+        @("Z home active high", "--rnr-in $ref,zhome=3", "00730073003300701200"),
+        @("X-- active high", "--rnr-in $ref,x-=0", "00530073007300701200"),
+        @("raw bytes", "--rnr-pins 0123456789ABCDEF0011", "0123456789ABCDEF0011"))
+    $i = 0
+    foreach ($c in $cases) {
+        $dir = Join-Path $OutDir "pins$i"; $log = Join-Path $dir "fake.log"
+        $s = Start-Sim "-f `"$log`" $($c[1])" $dir ($Port + 6)
+        try { Invoke-Line $s '$I' | Out-Null } finally { Stop-Sim $s }
+        $got = ([regex]::Match((Get-Content $log -Raw), "op=0x0F .*pins=([0-9A-F]{20})")).Groups[1].Value
+        Check ($got -eq $c[2]) "$($c[0]): $got (expected $($c[2]))"
+        $i++
+    }
+}
+
 if ($Scenario -in "motion", "all") { Test-Motion }
 if ($Scenario -in "watchdog", "all") { Test-Watchdog }
 if ($Scenario -in "reset", "all") { Test-Reset }
 if ($Scenario -in "estop", "all") { Test-EStop $false; Test-EStop $true }
 if ($Scenario -in "outputs", "all") { Test-Outputs }
+if ($Scenario -in "pins", "all") { Test-Pins }
 
 if ($script:failures -eq 0) { "RESULT: PASS"; exit 0 } else { "RESULT: FAIL ($script:failures)"; exit 1 }

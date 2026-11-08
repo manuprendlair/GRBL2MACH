@@ -169,7 +169,10 @@ static int send_configure (rnr_sink_t *s)
 {
     uint8_t buf[RNR_OUT_BYTES];
     rnr_config_t cfg = { .pulse_khz = 100, .slice_ms = SLICE_MS, .step_dir_invert = s->opt.step_dir_invert };
-    memcpy(cfg.pins, s->opt.pins, RNR_PIN_BYTES);
+    if(s->opt.pins_raw)
+        memcpy(cfg.pins, s->opt.pins, RNR_PIN_BYTES);
+    else
+        rnr_encode_pins(cfg.pins, &s->opt.inputs);
 
     rnr_build_configure(buf, 0, &cfg);
 
@@ -254,8 +257,8 @@ static void on_status (rnr_sink_t *s, const rnr_status_t *st, uint64_t now)
     // E-stop input, read by the bridge itself in the raw inputs: the controller stops on its own
     // only when its configuration frame declares input pins (as Mach3's does). Without that it
     // just reports the input, and Mach3 is what stops it (EStop frame), so the bridge does too.
-    bool input_pressed = s->opt.estop_in &&
-                          !!(st->inputs & (1u << (s->opt.estop_in - 1))) != s->opt.estop_in_active_low;
+    const rnr_input_t *e = &s->opt.inputs.estop;
+    bool input_pressed = e->pin && !!(st->inputs & (1u << (e->pin - 1))) != e->active_low;
     bool estop_input = (st->fault_flags & RNR_FAULT_ESTOP) != 0 || input_pressed;
     bool armed_seen = s->armed && (int16_t)(st->ack_seq - s->arm_seq) >= 0;
 

@@ -22,9 +22,8 @@
   Environment (times in ms after the first slice):
     GRBL2MACH_FAKE_SILENT_MS=<n>         stop reporting (watchdog test)
     GRBL2MACH_FAKE_ESTOP_MS=<on>,<off>   press the e-stop input at <on>, release at <off>
-    GRBL2MACH_FAKE_ESTOP_SELF=1          the controller stops by itself on the e-stop input (as it
-                                         does with Mach3's pin configuration); by default it only
-                                         reports the input (IN1), as with no input pins configured
+  The e-stop input is IN1, active high. As the real board, the fake one stops by itself on it only
+  when the configuration frame declares it (byte 13, high nibble = 1); otherwise it only reports it.
 
   Part of GRBL2MACH. GPL-3.0-or-later.
 */
@@ -62,7 +61,7 @@ typedef struct {
     int idle_in_run;    // empty periods since the last executed slice of the open run
     uint64_t first_slice_us;
     int64_t silent_ms, estop_on_ms, estop_off_ms;
-    bool estop_self;    // stops by itself on the e-stop input (else only reports it)
+    bool estop_self;    // e-stop input declared in Configure: stops by itself on it (else only reports it)
 } fake_t;
 
 static double ms (fake_t *f, uint64_t t)
@@ -222,6 +221,7 @@ static int fake_write (rnr_transport_t *t, const uint8_t b[RNR_OUT_BYTES])
                 fprintf(f->log, "%02X", b[i]);
             if(b[17])
                 f->slice_us = b[17] * 1000u;
+            f->estop_self = (b[13] >> 4) == 1 && !(b[14] & 0x20);    // e-stop declared on IN1, active high
             break;
 
         case RnrOp_GcodeSlice:
@@ -331,9 +331,6 @@ static void parse_estop_env (fake_t *f)
 {
     const char *e = getenv("GRBL2MACH_FAKE_ESTOP_MS");
     long long on, off;
-
-    const char *self = getenv("GRBL2MACH_FAKE_ESTOP_SELF");
-    f->estop_self = self && *self == '1';
     f->estop_on_ms = f->estop_off_ms = -1;
     if(e && sscanf(e, "%lld,%lld", &on, &off) == 2 && on >= 0 && off > on) {
         f->estop_on_ms = on;

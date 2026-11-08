@@ -102,3 +102,26 @@ void rnr_build_pwm (uint8_t buf[RNR_OUT_BYTES], uint16_t seq, uint16_t duty)
     rnr_put_le16(&buf[5], duty);
     rnr_put_le16(&buf[7], RNR_PWM_PERIOD);
 }
+
+/*
+  Configure buf[5..14], decoded from USB captures of Mach3 changing one input at a time:
+    buf[5 + 2a] (a = X, Y, Z, A): limit -- pin << 4 | limit ++ pin
+    buf[6 + 2a]                 : 0x40 home active low | 0x20 limit -- active low
+                                  | 0x10 limit ++ active low | home pin
+    buf[13]                     : e-stop pin << 4 | probe pin
+    buf[14]                     : 0x20 e-stop active low | 0x10 probe active low
+  Pin 0 = input not used. Mach3 also sends the polarity of inputs it does not use. Every bit was
+  seen changing in the captures (80, 81, 82); the "pins" test checks 15 of those frames.
+*/
+void rnr_encode_pins (uint8_t pins[RNR_PIN_BYTES], const rnr_inputs_t *in)
+{
+    memset(pins, 0, RNR_PIN_BYTES);
+
+    for(int a = 0; a < RNR_AXES; a++) {
+        pins[2 * a] = (uint8_t)((in->limit_neg[a].pin & 0x0F) << 4 | (in->limit_pos[a].pin & 0x0F));
+        pins[2 * a + 1] = (uint8_t)((in->home[a].active_low ? 0x40 : 0) | (in->limit_neg[a].active_low ? 0x20 : 0) |
+                                     (in->limit_pos[a].active_low ? 0x10 : 0) | (in->home[a].pin & 0x0F));
+    }
+    pins[8] = (uint8_t)((in->estop.pin & 0x0F) << 4 | (in->probe.pin & 0x0F));
+    pins[9] = (uint8_t)((in->estop.active_low ? 0x20 : 0) | (in->probe.active_low ? 0x10 : 0));
+}

@@ -63,13 +63,14 @@ proprietary and is **not** distributed here.
     checked against the steps sent.
   - Every grblHAL reset (Ctrl-X, alarm) sends a cancel at once, like Mach3's Stop button: the
     board stops and drops its buffer, but stays armed.
-  - E-stop input (IN1 by default, `--rnr-estop-in`): the bridge watches it in the board's raw
-    inputs and sends the board's e-stop frame at once, like Mach3. The board stops on this input by
-    itself, without the PC, only when its configuration frame declares input pins (`--rnr-pins`,
-    as Mach3 does): tested on the real board, with no pins declared it only reported the input and
-    kept moving; with Mach3's pins it stopped before the bridge's e-stop frame. grblHAL raises
-    ALARM:10; the board is re-armed before the next move, once the input is released and grblHAL
-    reset.
+  - Inputs: the board's configuration frame declares its e-stop, probe, home and limit inputs, in
+    the encoding of Mach3's plugin (decoded from USB captures, `rnr_encode_pins()`). The e-stop
+    input (IN1 by default, `--rnr-estop-in`) is declared, so the board stops on it by itself,
+    without the PC; tested on the real board: with no e-stop declared it only reported the input and
+    kept moving. The bridge also watches it in the raw inputs and sends the board's e-stop frame at
+    once, like Mach3. grblHAL raises ALARM:10; the board is re-armed before the next move, once the
+    input is released and grblHAL reset. Home, probe and limit inputs are declared but not used yet
+    (homing and probing through the board come with roadmap step 5).
   - A 500 ms status watchdog or USB loss is reported as a motor fault (ALARM:17) and disarms the
     board.
   - Spindle and coolant: grblHAL's spindle (M3/M4, S) and coolant (M7/M8) drive the board's PWM
@@ -126,8 +127,9 @@ grblHAL_sim -l <address>       address to listen on with -p (default 127.0.0.1)
 grblHAL_sim --no-irq-lock      let simulated interrupts run concurrently with the core (upstream)
 grblHAL_sim --rnr-invert <hex> step/direction inversion sent to the controller (default 0)
 grblHAL_sim --rnr-out spindle=1,ccw=0,flood=0,mist=0   controller outputs (default: spindle on OUT1)
-grblHAL_sim --rnr-pins <20 hex digits>                 controller input pins, as Mach3 sends them
-grblHAL_sim --rnr-estop-in <n>[low]                    e-stop input watched by the bridge (default 1)
+grblHAL_sim --rnr-in xhome=3low,...,probe=2            controller inputs (as Mach3's Input Signals page)
+grblHAL_sim --rnr-estop-in <n>[low]                    e-stop input (default 1: IN1 active high)
+grblHAL_sim --rnr-pins <20 hex digits>                 input bytes copied from a Mach3 capture instead
 ```
 
 `--rnr-invert` takes the same values as Mach3's *Ports & Pins > Motor Outputs* page: bits 0-3 make
@@ -154,18 +156,28 @@ per axis, outputs bitmask: 1 spindle, 2 counter-clockwise, 4 flood, 8 mist; spin
 
 > `-u` has had **two short hardware tests** (connection, small moves, reset, e-stop input): frames
 > identical to Mach3's (short reports go out as 9-byte transfers), step counts exact, e-stop input
-> stopping the board by itself with `--rnr-pins`. Homing and probing do not use the board's inputs
-> yet.
+> stopping the board by itself once declared in the configuration frame. Homing and probing do not
+> use the board's inputs yet.
 
-`--rnr-pins <20 hex digits>` sets bytes 5 to 14 of the configuration frame (input pins) exactly as
-Mach3 sends them; read them from a USB capture of Mach3 (frame `0x0F`). The reference machine (homes
-on IN3 active low, probe on IN2): `--rnr-pins 00730073007300701200`. Default: all 0, and then **the
-board does not stop by itself on its e-stop input**: only the bridge stops it, through the PC. The
-Mach3 profile importer will compute these bytes.
+`--rnr-in` declares the board's inputs as Mach3's *Ports & Pins > Input Signals* page does (port 3
+pin n = IN n): `x+`, `x-`, `xhome` (same for `y`, `z`, `a`), `probe` and `estop`, each `=<n>` (0 = not
+used) followed by `low` when *Active Low* is ticked. The reference machine (homes X/Y/Z on IN3
+active low, probe on IN2, e-stop on IN1):
 
-`--rnr-estop-in <n>[low]` sets the e-stop input watched by the bridge: `1` (default) for IN1 active
-high, as Mach3's *EStop* on port 3 pin 1; `1low` for a normally-closed button wired active low; `0`
-to disable it.
+```
+--rnr-in xhome=3low,yhome=3low,zhome=3low,probe=2
+```
+
+`--rnr-estop-in <n>[low]` is the same as `--rnr-in estop=...`: `1` (default) for IN1 active high,
+as Mach3's *EStop* on port 3 pin 1; `1low` for a normally-closed button wired active low; `0` for no
+e-stop input (**then the board does not stop by itself**). The e-stop input is both declared to the
+board and watched by the bridge.
+
+`--rnr-pins <20 hex digits>` replaces the computed input bytes (configuration frame bytes 5 to 14)
+with bytes copied from a USB capture of Mach3 (frame `0x0F`), e.g. `00730073007300701200`.
+
+The encoding was decoded from captures of Mach3 changing one input at a time (every bit seen
+changing); the `pins` test checks it against 15 of those frames.
 
 On Windows the console input only reads the keyboard: type commands in the console window, or
 connect over TCP (`-p`). Piping commands into stdin does not work.
@@ -195,13 +207,16 @@ The fake controller behaves like the real board as seen in the Mach3 captures (s
 - `reset`: Ctrl-X during a long move: the board must get a cancel at once, stop and stay armed, and
   grblHAL's position must be resynced to where the board actually stopped (`-Immediate`: unlock and
   move right after the reset, the move must start from the resynced position);
-- `estop` (run twice: board that only reports the input, as seen on the real board, and board that
-  stops by itself, `GRBL2MACH_FAKE_ESTOP_SELF=1`): the e-stop input is pressed during a move: the
-  bridge must send the e-stop frame within 120 ms, grblHAL must raise ALARM:10, resync to where the
-  board stopped, and re-arm it for the next move once released and reset.
+- `estop` (run twice: e-stop declared in the configuration frame, the fake board stops by itself
+  like the real one; no input declared, it only reports the input, as seen on the real board): the
+  e-stop input is pressed during a move: the bridge must send the e-stop frame within 120 ms,
+  grblHAL must raise ALARM:10, resync to where the board stopped, and re-arm it for the next move
+  once released and reset.
 - `outputs`: M3 S12000, a move, M8, a move, M5 M9: spindle PWM and outputs must switch before the
   first slice, between the two runs once the first move has run, and after the last one; every
   slice must carry the outputs.
+- `pins`: the configuration frame's input bytes computed from `--rnr-in` must equal the frames Mach3
+  sent for the same settings (15 variants captured on the real board).
 
 ```
 powershell -File tests\run_fake_board.ps1 -Scenario all
@@ -251,10 +266,11 @@ powershell -File tests\run_fake_board.ps1 -Scenario all
 - On USB link loss or 500 ms without a status report, the bridge sends an e-stop and grblHAL
   raises ALARM:17. Thanks to real-time pacing the board never holds more than about 100 ms of
   motion. The board has no watchdog of its own: if the PC freezes, it runs what it holds.
-- The board's e-stop input (IN1) stops it by itself, without the PC, **only with `--rnr-pins`** set
-  from your Mach3 capture; the bridge also stops it (in about 30 ms) as a second layer. Without
-  `--rnr-pins`, IN1 goes through the PC: if the PC or the bridge freezes, it does nothing. Only a
-  hardwired e-stop that cuts the drivers' power protects in every case.
+- The board's e-stop input (IN1 by default) stops it by itself, without the PC, because the bridge
+  declares it in the board's configuration; the bridge also stops it (in about 30 ms) as a second
+  layer. Set `--rnr-estop-in` to where your e-stop button is actually wired: an e-stop input that is
+  not declared goes through the PC only. Only a hardwired e-stop that cuts the drivers' power
+  protects in every case.
 - The TCP port listens on `127.0.0.1` only by default: GRBL has no authentication, so anyone
   reaching the port can move the machine. `-l <address>` opens it to the network and prints a
   warning. Never allow it on "Public" networks in your firewall.

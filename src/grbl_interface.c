@@ -186,8 +186,9 @@ static void print_steps (bool force)
 
     //Allow exit when idle. Prevents aborting before all streamed commands have run
     //(kept first - order matters: this must run every tick regardless of -r).
-    //GRBL2MACH: with the controller lost (motor fault) the core never gets idle: nothing to wait for
-    if (sim.exit == exit_REQ && slicer_motor_fault())
+    //GRBL2MACH: with the controller lost (motor fault) or in e-stop, the core never gets idle and
+    //the machine is stopped: nothing to wait for
+    if (sim.exit == exit_REQ && (slicer_motor_fault() || slicer_estop()))
         sim.exit = exit_OK;
     else if (sim.exit == exit_REQ && grbl_is_idle()) {
         //The grbl thread runs on wall time and may only look idle for a moment,
