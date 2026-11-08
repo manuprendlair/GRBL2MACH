@@ -17,22 +17,42 @@ GRBL2MACH replaces the simulated hardware with the USB controller.
 - Use gSender (or Candle, UGS, ...) with a controller that was sold for Mach3 only.
 - **Never write to the controller's firmware**: Mach3 keeps working with the same board at any time.
 - Probing (G38.x, workpiece and tool length) is a hard requirement.
-- Import the machine configuration from an existing Mach3 XML profile (planned).
+- Import the machine configuration from an existing Mach3 XML profile.
 
 ## Target hardware
 
 | Item | Value |
 |---|---|
 | USB IDs | VID `0xA720`, PID `0xF803` ("RobotAndRobot.com", "RNR ECO MOTION 2.0") |
+| Reference board | red board marked "USB MACH3 3-AXIS": TB6560 drivers for X, Y, Z on board, step/direction terminal for A, inputs IN1-IN4, outputs OUT1-OUT4 |
 | Interface | USB HID, report IDs 2 (8 bytes) and 3 (26 bytes) out, 1 (48 bytes) in; status about every 50 ms |
 | Axes | X, Y, Z, A, up to 100 kHz step rate |
 | Principle | the PC plans, the controller executes: every 5 ms the PC sends a "slice" of signed steps per axis; outputs OUT1..OUT4 ride in the slices during motion and in separate frames at rest; spindle speed is a PWM frame |
 
-Protocol information comes from static analysis of the vendor's Mach3 plugin, from the
-specification published by [BreakoutCNC](https://github.com/rolanddd-hu/BreakoutCNC), and from USB
-captures of Mach3 driving a real machine (start-up, homing, jogs, MDI moves, feed hold, stop,
-e-stop, probing). The bridge drives the board the way Mach3 does. The vendor plugin itself is
-proprietary and is **not** distributed here.
+<p align="center"><img src="docs/images/reference_board.png" width="420" alt="Reference board: red USB MACH3 3-AXIS controller with TB6560 drivers"><br>
+<em>The board GRBL2MACH was developed on ("USB MACH3 3-AXIS", RNR Eco Motion 2.0 controller).</em></p>
+
+These boards are sold under many names with no common reference: what identifies them is the USB
+ID above (Device Manager > the device > Details > Hardware IDs: `VID_A720&PID_F803`) and the
+Mach3 plugin they come with. GRBL2MACH was developed against this plugin, which is **not**
+distributed here (proprietary). Compare yours with its SHA-256 (PowerShell:
+`Get-FileHash RnRMotion.dll`):
+
+| Mach3 plugin | |
+|---|---|
+| File | `RnRMotion.dll` (Mach3 `PlugIns` folder), 275 968 bytes |
+| Version | 3.5.0.0, "BS Control Mach3 Plugins" (product "BSMotion", original name `BSMotionMini`); configuration dialog "Bitsensor Motion Controller Configuration", version 3.50 |
+| SHA-256 | `7551e4221db28706fb48955c15cfbca83a2eac298ed43e586859eb1f07726f07` |
+
+A different plugin with the same USB IDs probably speaks the same protocol; a USB capture of
+Mach3 (start-up and Reset) shows it quickly.
+
+**The protocol is documented in [docs/PROTOCOL.md](docs/PROTOCOL.md)**: frames, configuration
+encoding, status report, states and sequences (arming, runs, jog, stop, e-stop, homing, probing,
+outputs). It comes from USB captures of Mach3 driving the reference machine (about 40 captures,
+plus 15 variants of the input settings), cross-checked with the notes published by
+[BreakoutCNC](https://github.com/rolanddd-hu/BreakoutCNC) and static analysis of the plugin. The
+bridge drives the board the way Mach3 does.
 
 ## How it works
 
