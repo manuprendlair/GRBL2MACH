@@ -18,7 +18,7 @@
 #                       [-GCode "G21 G91 G1 X10 F600"] [-Expect "2500,0,0"] [-OutDir folder] [-Immediate]
 
 param(
-    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "home", "probe", "mach3", "all")] [string]$Scenario = "all",
+    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "home", "probe", "mach3", "pace", "jogs", "long", "all")] [string]$Scenario = "all",
     [string]$GCode = "G21 G91 G1 X10 F600",
     [string]$Expect = "2500,0,0",
     [string]$OutDir = "$env:TEMP\grbl2mach_fake",
@@ -403,6 +403,74 @@ function Test-Mach3 {
     Check ($p.ExitCode -ne 0 -and $msg -match "no Mach3 profile") "missing profile: refused ($(($msg -replace '\s+', ' ').Trim()))"
 }
 
+function Test-Pace {
+    "=== pace: controller 1 % slower than its nominal 5 ms per slice (the real one: 0.4 %), 10 s move"
+    $dir = Join-Path $OutDir "pace"; $log = Join-Path $dir "fake.log"
+    $s = Start-Sim "-f `"$log`"" $dir ($Port + 10) @{ GRBL2MACH_FAKE_SLICE_US = "5050" }
+    try {
+        $spm = Get-StepsPerMm $s
+        Invoke-Line $s '$X' | Out-Null
+        Invoke-GCode $s "G21 G91 G1 X100 F600"
+        $mpos = Get-MPos (Wait-State $s "Idle" 60000)
+    } finally { Stop-Sim $s }
+    $r = Read-FakeLog $log
+    $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
+    $steps = [math]::Round(100 * $spm[0])
+    "  stats: " + (($r.Stats.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join " ")
+    Check ($r.Stats.max_depth -le 20) "controller buffer kept at the bridge's lead: at most $($r.Stats.max_depth) slices (open loop: ~35 after 10 s)"
+    Check ($r.Stats.starved -eq 0) "no underrun"
+    Check ($r.Final[0] -eq $steps -and [math]::Round($mpos[0] * $spm[0]) -eq $steps) "every step run, grblHAL and controller agree ($($r.Final[0]) steps)"
+    Check ($err -match "position checks after runs: [1-9]\d* ok, 0 mismatch") "position check after the run"
+}
+
+function Test-Long {
+    "=== long: one 6-minute run (more than 65536 frames: the 16-bit sequence numbers wrap), controller 0.4 % slow"
+    $dir = Join-Path $OutDir "long"; $log = Join-Path $dir "fake.log"
+    $s = Start-Sim "-f `"$log`"" $dir ($Port + 12) @{ GRBL2MACH_FAKE_SLICE_US = "5020" }
+    try {
+        $spm = Get-StepsPerMm $s
+        Invoke-Line $s '$X' | Out-Null
+        Invoke-GCode $s "G21 G91 G1 F600"
+        for ($i = 0; $i -lt 18; $i++) {
+            Invoke-GCode $s "X100"
+            Invoke-GCode $s "X-100"
+        }
+        $mpos = Get-MPos (Wait-State $s "Idle" 450000)
+    } finally { Stop-Sim $s }
+    $r = Read-FakeLog $log
+    $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
+    "  stats: " + (($r.Stats.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join " ")
+    Check ($r.Stats.frames -gt 66000) "the run went past a sequence wrap ($($r.Stats.frames) frames)"
+    Check ($r.Stats.max_depth -le 20) "controller buffer kept at the bridge's lead all along: at most $($r.Stats.max_depth) slices"
+    Check ($r.Stats.starved -eq 0) "no underrun"
+    Check ($r.Final[0] -eq 0 -and [math]::Round($mpos[0] * $spm[0]) -eq 0) "back to the start, grblHAL and controller agree ($($r.Final[0]) steps)"
+    Check ($err -match "position checks after runs: [1-9]\d* ok, 0 mismatch") "position check after the run"
+}
+
+function Test-Jogs {
+    "=== jogs: short Z moves one after the other (step jogs), each new run starting while the last one ends"
+    $dir = Join-Path $OutDir "jogs"; $log = Join-Path $dir "fake.log"
+    $s = Start-Sim "-f `"$log`"" $dir ($Port + 11)
+    try {
+        $spm = Get-StepsPerMm $s
+        Invoke-Line $s '$X' | Out-Null
+        $gaps = @(0, 20, 40, 60, 80, 100, 130, 160, 200, 250)
+        foreach ($g in $gaps) {
+            Invoke-GCode $s "G21 G91 G1 Z-0.5 F600"
+            Wait-State $s "Idle" | Out-Null
+            Start-Sleep -Milliseconds $g
+        }
+        $mpos = Get-MPos (Wait-State $s "Idle")
+    } finally { Stop-Sim $s }
+    $r = Read-FakeLog $log
+    $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
+    $expect = -[math]::Round(0.5 * $gaps.Count * $spm[2])
+    "  stats: " + (($r.Stats.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join " ")
+    Check ($r.Stats.rejected -eq 0) "no slice rejected (a new run is opened only once the controller is ready again)"
+    Check ($r.Final[2] -eq $expect -and [math]::Round($mpos[2] * $spm[2]) -eq $expect) "every jog run: controller Z = grblHAL Z = $expect steps (controller: $($r.Final[2]))"
+    Check ($err -notmatch "POSITION MISMATCH") "no position mismatch ($(([regex]::Match($err, 'position checks[^;\r\n]*')).Value))"
+}
+
 if ($Scenario -in "motion", "all") { Test-Motion }
 if ($Scenario -in "watchdog", "all") { Test-Watchdog }
 if ($Scenario -in "reset", "all") { Test-Reset }
@@ -412,5 +480,8 @@ if ($Scenario -in "pins", "all") { Test-Pins }
 if ($Scenario -in "home", "all") { Test-Home }
 if ($Scenario -in "probe", "all") { Test-Probe }
 if ($Scenario -in "mach3", "all") { Test-Mach3 }
+if ($Scenario -in "pace", "all") { Test-Pace }
+if ($Scenario -in "jogs", "all") { Test-Jogs }
+if ($Scenario -eq "long") { Test-Long }     # 6 minutes: not part of "all"
 
 if ($script:failures -eq 0) { "RESULT: PASS"; exit 0 } else { "RESULT: FAIL ($script:failures)"; exit 1 }

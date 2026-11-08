@@ -156,14 +156,21 @@ void slicer_set_phase (slice_kind_t kind, int axis)
 // wait until it has run it all, else a switch with some hysteresis still reads engaged.
 static home_signals_t homing_get_state (void)
 {
-    if((atomic_load(&phase) & 0xFF) == Slice_HomeJog && !timer[STEPPER_TIMER].enable && sink && sink->wait_idle) {
+    bool pulloff = (atomic_load(&phase) & 0xFF) == Slice_HomeJog, moving = timer[STEPPER_TIMER].enable;
+
+    if(pulloff && !moving && sink && sink->wait_idle) {
         for(int i = 0; i < 100 && open; i++)   // the last slice of the move must reach the sink first
             platform_sleep(1000);
         if(!sink->wait_idle(sink, 2000))
             fprintf(stderr, "[slicer] machine not at rest after a homing pull-off: switch state may be stale\n");
     }
 
-    return prev_homing_get_state();
+    home_signals_t state = prev_homing_get_state();
+    if(pulloff && state.a.mask)
+        fprintf(stderr, "[slicer] end of a homing pull-off: switch still engaged (mask 0x%02X%s)\n",
+                 state.a.mask, moving ? ", read while the pull-off was still running" : "");
+
+    return state;
 }
 
 // Homing phase starting: seek and locate move towards the switch, pull-off away from it. With one
@@ -183,6 +190,16 @@ static void on_homing_rate_set (axes_signals_t axes, coord_data_t *feedrate, hom
     if(hal.homing.get_state && hal.homing.get_state != homing_get_state) {
         prev_homing_get_state = hal.homing.get_state;
         hal.homing.get_state = homing_get_state;
+    }
+
+    // No motion runs between two phases (the core has stopped the steppers): a cycle-complete
+    // still pending belongs to the previous phase. That happens when the machine stops on its
+    // switch: the bridge drops the rest of the seek, the core's simulated seek then runs to its end
+    // at once and may flag cycle complete just as the core leaves the seek loop. The pull-off loop
+    // would take the stale flag for its own end and check the switch before any pull-off: ALARM:8.
+    if(sys.rt_exec_state & EXEC_CYCLE_COMPLETE) {
+        system_clear_exec_state_flag(EXEC_CYCLE_COMPLETE);
+        fprintf(stderr, "[slicer] homing: stale cycle-complete from the previous phase cleared\n");
     }
 
     if(n == 1)

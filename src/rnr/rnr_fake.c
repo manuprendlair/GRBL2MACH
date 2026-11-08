@@ -6,6 +6,8 @@
   - state machine reported in rx[1]: 0 e-stop, 1 ready, 2 jog, 6 program, 7 ending;
   - starts in e-stop; PreReset + ClearEStop arm it; EStop disarms it and drops the buffer;
   - a GcodeSlice opens a program run, StartJog a jog run; one buffered slice is executed
+  - slices received while ending (after EndOfMotion, buffer not yet empty) are rejected:
+    assumed for the real board, as Mach3 always waits for ready before a new run;
     every slice period (Configure byte 17, 5 ms); EndOfMotion lets the buffer run out,
     then back to ready;
   - Cancel stops at once and drops the buffer, the controller stays armed; StopJog drops
@@ -31,6 +33,8 @@
                                          configuration frame declares
     GRBL2MACH_FAKE_HOME_HYST=<n>         home switch hysteresis: once triggered, released only
                                          <n> steps below its trigger position (default 0)
+    GRBL2MACH_FAKE_SLICE_US=<us>         time the controller really takes to run a slice (the real
+                                         board: about 5020 us for 5 ms)
     GRBL2MACH_FAKE_PROBE_Z=<z>           probe triggered at live Z <= <z> steps
   The e-stop input is IN1, active high. As the real board, the fake one stops by itself on it only
   when the configuration frame declares it (byte 13, high nibble = 1); otherwise it only reports it.
@@ -78,6 +82,7 @@ typedef struct {
     bool has_home[RNR_AXES], has_probe;
     int32_t home_pos[RNR_AXES], probe_z;
     int32_t home_hyst;              // a triggered switch releases only that far below its trigger point
+    uint32_t slice_us_forced;       // GRBL2MACH_FAKE_SLICE_US: real time to run a slice (0 = Configure's)
     bool home_on[RNR_AXES];
     int home_axis;                  // axis of the homing run
     int32_t latched[RNR_AXES];      // positions at the last probe contact
@@ -322,6 +327,8 @@ static int fake_write (rnr_transport_t *t, const uint8_t b[RNR_OUT_BYTES])
                 fprintf(f->log, "%02X", b[i]);
             if(b[17])
                 f->slice_us = b[17] * 1000u;
+            if(f->slice_us_forced)
+                f->slice_us = f->slice_us_forced;   // a controller slower than its nominal period
             f->estop_self = (b[13] >> 4) == 1 && !(b[14] & 0x20);    // e-stop declared on IN1, active high
             for(int a = 0; a < RNR_AXES; a++) {
                 f->home_pin[a] = b[6 + 2 * a] & 0x0F;
@@ -342,14 +349,17 @@ static int fake_write (rnr_transport_t *t, const uint8_t b[RNR_OUT_BYTES])
                 fprintf(f->log, " out=0x%02X", s.outputs);
             if(!f->first_slice_us)
                 f->first_slice_us = now;
-            if(op == RnrOp_GcodeSlice && (f->state == RnrState_Ready || f->state == RnrState_Ending)) {
-                if(f->state == RnrState_Ready) {
-                    f->next_exec = now + f->slice_us;
-                    f->idle_in_run = 0;
-                }
+            if(op == RnrOp_GcodeSlice && f->state == RnrState_Ready) {
+                f->next_exec = now + f->slice_us;
+                f->idle_in_run = 0;
                 f->state = RnrState_Program;
             }
-            if(op == RnrOp_JogSlice && f->state == RnrState_Ready) {
+            if(f->state == RnrState_Ending) {
+                // A run that has been ended (EndOfMotion) takes no more slices until it is over.
+                // Assumed for the real board: Mach3 always waits for ready before a new run.
+                f->rejected++;
+                fprintf(f->log, " REJECTED (ending)");
+            } else if(op == RnrOp_JogSlice && f->state == RnrState_Ready) {
                 f->ignored++;       // as the real board after a home switch or probe contact
                 fprintf(f->log, " IGNORED (ready)");
             } else if(!running(f)) {
@@ -479,6 +489,9 @@ rnr_transport_t *rnr_fake_open (const char *log_path)
             f->has_home[a] = true;
         }
     }
+    const char *sus = getenv("GRBL2MACH_FAKE_SLICE_US");
+    if(sus)
+        f->slice_us_forced = (uint32_t)atol(sus);
     const char *hy = getenv("GRBL2MACH_FAKE_HOME_HYST");
     if(hy)
         f->home_hyst = (int32_t)atol(hy);

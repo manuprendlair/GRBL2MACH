@@ -12,6 +12,13 @@
   time, at most RNR_LEAD_MS ahead of the PC clock; the acknowledgement count
   is only a safety limit.
 
+  The controller runs a slice in slightly more than its nominal period (about
+  5.02 ms for 5 ms on the reference board), so pacing on the PC clock alone
+  lets its buffer grow during long moves (seen: +7 ms of lag per second of
+  jog). Each status report gives the controller's step counters: the bridge
+  finds which slice of the run they correspond to and keeps the number of
+  slices ahead of it at RNR_LEAD, whatever the controller's real pace.
+
   Frame sequence, as Mach3 drives the controller (USB captures):
     connect : Configure, EStop, SpindlePwm(0), SetOutputs(0), SetPositions(0)
     arm     : PreReset, ClearEStop, SetPositions(current), Configure
@@ -54,6 +61,7 @@
 #define READ_TIMEOUT_MS  2
 #define CONNECT_WAIT_MS  1000
 #define SLICE_US         ((uint64_t)SLICE_MS * 1000u)
+#define TRACK            1024   // slices of the open run remembered to locate the controller in it
 
 typedef struct {
     rnr_transport_t *t;
@@ -86,8 +94,18 @@ typedef struct {
     // I/O thread only
     uint16_t seq;
     uint16_t arm_seq;           // sequence number of the Configure that ends the arming sequence
+    bool arm_seen;              // the controller has taken it (sticky: the 16-bit sequence wraps)
     bool armed, run_open;
     uint64_t busy_until;        // PC time at which the controller will have run every slice sent
+    // Where the controller is in the open run: cumulative steps after each slice sent (index 1..),
+    // and the last estimate of the number of slices it has run, at the time of a status report
+    int32_t track_cum[TRACK][RNR_AXES];
+    uint32_t run_slices;        // slices sent in the open run
+    double run_done;            // estimate: slices of the run the controller has run (integrated in time)
+    uint64_t run_done_time;     // PC time of that estimate
+    uint32_t track_fixes, track_ambiguous;  // status reports used / skipped to locate the controller
+    uint64_t run_t0;            // PC time the run's first slice was sent
+    bool run_done_valid;
     uint64_t first_queued;      // PC time at which slices were first seen queued with no run open (0: none)
     uint64_t last_status;
     uint16_t last_slice_seq;
@@ -97,6 +115,7 @@ typedef struct {
     bool kind_change;           // the run must close: the next slice is for another kind of move
     uint8_t run_kind, run_axis; // slice_kind_t and axis of the open run
     uint16_t run_arm_seq;       // sequence number of the frame that opened the run
+    bool run_armed;             // the controller has taken that frame (sticky: the 16-bit sequence wraps in a long run)
     uint32_t slices_sent, estops_seen, dropped_after_cut;
     bool awaiting_halt;         // stop handled, waiting for a status report that covers it
     uint16_t halt_seq;
@@ -104,6 +123,9 @@ typedef struct {
     int32_t run_start[RNR_AXES], run_sent[RNR_AXES];
     bool check_pending;
     uint16_t check_seq;
+    int32_t check_expected[RNR_AXES];   // where the controller must be once the closed run is over
+    uint8_t check_kind;
+    uint32_t check_slices;
     uint32_t checks_ok, checks_bad;
 } rnr_sink_t;
 
@@ -238,17 +260,19 @@ static void check_run_position (rnr_sink_t *s, const rnr_status_t *st)
 {
     bool ok = true;
 
+    // values stored when the run was closed: a new run may have opened since
     for(int a = 0; a < RNR_AXES; a++)
-        ok = ok && st->live_steps[a] == s->run_start[a] + s->run_sent[a];
+        ok = ok && st->live_steps[a] == s->check_expected[a];
 
     if(ok)
         s->checks_ok++;
     else {
         s->checks_bad++;
-        fprintf(stderr, "[rnr] POSITION MISMATCH after run: controller X=%d Y=%d Z=%d A=%d, expected X=%d Y=%d Z=%d A=%d\n",
+        static const char *kinds[] = { "program", "homing seek", "homing pull-off", "probing" };
+        fprintf(stderr, "[rnr] POSITION MISMATCH after a %s run of %u slices: controller X=%d Y=%d Z=%d A=%d, expected X=%d Y=%d Z=%d A=%d (state %u)\n",
+                 s->check_kind < 4 ? kinds[s->check_kind] : "?", s->check_slices,
                  st->live_steps[0], st->live_steps[1], st->live_steps[2], st->live_steps[3],
-                 s->run_start[0] + s->run_sent[0], s->run_start[1] + s->run_sent[1],
-                 s->run_start[2] + s->run_sent[2], s->run_start[3] + s->run_sent[3]);
+                 s->check_expected[0], s->check_expected[1], s->check_expected[2], s->check_expected[3], st->state);
     }
 }
 
@@ -263,6 +287,7 @@ static bool arm (rnr_sink_t *s, const rnr_status_t *st)
         return false;
     s->arm_seq = s->seq;
     s->armed = true;
+    s->arm_seen = false;
 
     return true;
 }
@@ -273,15 +298,106 @@ static bool input_on (const rnr_input_t *in, uint16_t raw)
     return in->pin && !!(raw & (1u << (in->pin - 1))) != in->active_low;
 }
 
+// Estimate of the slices of the open run the controller has run: one per slice period since the
+// last estimate, never more than sent (the controller waits when it runs out of slices).
+static double controller_done (rnr_sink_t *s, uint64_t now)
+{
+    if(s->run_done_valid) {
+        s->run_done += (double)(now - s->run_done_time) / SLICE_US;
+        s->run_done_time = now;
+        if(s->run_done > s->run_slices)
+            s->run_done = s->run_slices;
+    }
+
+    return s->run_done;
+}
+
+// Puts the estimate back where the controller's step counters say it is: the slice of the run whose
+// cumulative steps match them. Only when that match is unambiguous: a toolpath can pass several
+// times by the same point, the start of a move or a dwell repeat the same counters. Otherwise the
+// estimate goes on with time (the controller drifts by a few ms per second only).
+#define TRACK_BACK 400
+static void track_controller (rnr_sink_t *s, const rnr_status_t *st, uint64_t now)
+{
+    if(!s->run_open || !s->run_slices || !s->run_armed)
+        return;
+
+    if(!s->run_done_valid) {     // first report of the run: time since its first slice
+        s->run_done = (double)(now - s->run_t0) / SLICE_US;
+        s->run_done_time = now;
+        s->run_done_valid = true;
+    }
+    double done = controller_done(s, now);
+
+    int32_t rel[RNR_AXES];
+    for(int a = 0; a < RNR_AXES; a++)
+        rel[a] = st->live_steps[a] - s->run_start[a];
+
+    uint32_t hi = s->run_slices;
+    uint32_t lo = done > TRACK_BACK ? (uint32_t)done - TRACK_BACK : 0;
+    if(hi - lo >= TRACK)
+        lo = hi - TRACK + 1;
+
+    int64_t d[TRACK_BACK + TRACK];
+    uint32_t n = 0, best = lo;
+    int64_t best_d = INT64_MAX;
+    for(uint32_t k = lo; k <= hi && n < sizeof(d) / sizeof(d[0]); k++, n++) {
+        d[n] = 0;
+        for(int a = 0; a < RNR_AXES; a++) {
+            int64_t c = k ? s->track_cum[k % TRACK][a] : 0;
+            d[n] += c > rel[a] ? c - rel[a] : rel[a] - c;
+        }
+        if(d[n] < best_d) {
+            best_d = d[n];
+            best = k;
+        }
+    }
+
+    // tolerance: the counters may be read in the middle of a slice
+    int64_t tol = 2;
+    if(best) {
+        int64_t step = 0;
+        for(int a = 0; a < RNR_AXES; a++) {
+            int64_t c1 = s->track_cum[best % TRACK][a], c0 = best > 1 ? s->track_cum[(best - 1) % TRACK][a] : 0;
+            step += c1 > c0 ? c1 - c0 : c0 - c1;
+        }
+        if(step > tol)
+            tol = step;
+    }
+    if(best_d > tol) {          // nothing matches (should not happen): leave the estimate alone
+        s->track_ambiguous++;
+        return;
+    }
+    for(uint32_t i = 0; i < n; i++) {
+        uint32_t k = lo + i;
+        if(d[i] <= best_d + tol && (k + 3 < best || k > best + 3)) {
+            s->track_ambiguous++;
+            return;             // another part of the run matches as well
+        }
+    }
+
+    s->run_done = best;
+    s->run_done_time = now;
+    s->track_fixes++;
+    // the controller will have run every slice sent then
+    s->busy_until = now + (uint64_t)(s->run_slices - best) * SLICE_US;
+}
+
 static void on_status (rnr_sink_t *s, const rnr_status_t *st, uint64_t now)
 {
+    // sequence numbers wrap every 65536 frames (5.5 min of slices): compare once, then remember
+    if(s->run_open && !s->run_armed && (int16_t)(st->ack_seq - s->run_arm_seq) >= 0)
+        s->run_armed = true;
+    track_controller(s, st, now);
     bool covered = (int16_t)(st->ack_seq - s->seq) >= 0;    // every frame sent so far taken over
     // E-stop input, also read by the bridge itself in the raw inputs: the controller stops on its
     // own only when its configuration frame declares it; otherwise it just reports the input. As
     // Mach3, the bridge sends an EStop frame either way.
     bool input_pressed = input_on(&s->opt.inputs.estop, st->inputs);
     bool estop_input = (st->fault_flags & RNR_FAULT_ESTOP) != 0 || input_pressed;
-    bool armed_seen = s->armed && (int16_t)(st->ack_seq - s->arm_seq) >= 0;
+    if(s->armed && !s->arm_seen && (int16_t)(st->ack_seq - s->arm_seq) >= 0)
+        s->arm_seen = true;
+    bool armed_seen = s->armed && s->arm_seen;
 
     // E-stop: stop the controller at once (it drops its buffer) and re-arm it before the next
     // motion. A press shorter than a status period may show only as the controller's disarm.
@@ -314,7 +430,7 @@ static void on_status (rnr_sink_t *s, const rnr_status_t *st, uint64_t now)
     // Homing or probing move: the controller has stopped by itself on the switch / the contact
     // (back to ready while the run is open). The slices still to come for this move are dropped.
     if(s->run_open && (s->run_kind == Slice_HomeSeek || s->run_kind == Slice_Probe) &&
-        (int16_t)(st->ack_seq - s->run_arm_seq) >= 0 && st->state == RnrState_Ready) {
+        s->run_armed && st->state == RnrState_Ready) {
         bool probe = s->run_kind == Slice_Probe;
         fprintf(stderr, "[rnr] %s%c: controller stopped at X=%d Y=%d Z=%d A=%d\n",
                  probe ? "probe contact" : "home switch ", probe ? ' ' : "XYZA"[s->run_axis & 3],
@@ -419,8 +535,13 @@ static void io_thread (void *arg)
         while(true) {
             if(!may_send)
                 break;
-            if(s->busy_until > now + RNR_LEAD * SLICE_US - SLICE_US / 2)
-                break;  // far enough ahead of real time
+            if(s->run_open && s->run_done_valid) {
+                // closed loop: slices ahead of where the controller is now (estimated)
+                double done = controller_done(s, now);
+                if((double)s->run_slices - done >= RNR_LEAD)
+                    break;
+            } else if(s->busy_until > now + RNR_LEAD * SLICE_US - SLICE_US / 2)
+                break;  // far enough ahead of real time (start of a run: no status yet)
             if((int16_t)(s->seq - st.ack_seq) > RNR_MAX_UNACKED)
                 break;  // safety limit on unacknowledged frames
 
@@ -478,9 +599,8 @@ static void io_thread (void *arg)
                 set_fault(s, "cannot arm the controller", false);
                 break;
             }
-            if(!s->run_open && slice.kind != Slice_Program &&
-                !(st.state == RnrState_Ready && (int16_t)(st.ack_seq - s->seq) >= 0))
-                break;  // the controller takes ArmHome / StartJog / ArmProbe only when ready
+            if(!s->run_open && !(st.state == RnrState_Ready && (int16_t)(st.ack_seq - s->seq) >= 0))
+                break;  // a new run only once the controller is ready (the previous run over), as Mach3
             if(!s->run_open && (apply_outputs(s, slice.out) != RNR_IO_OK)) {
                 set_fault(s, "output write failed", false);
                 break;
@@ -509,6 +629,10 @@ static void io_thread (void *arg)
                 memcpy(s->run_start, st.live_steps, sizeof(s->run_start));
                 memset(s->run_sent, 0, sizeof(s->run_sent));
                 s->run_kind = slice.kind;
+                s->run_slices = 0;
+                s->run_done = 0;
+                s->run_done_valid = false;
+                s->run_t0 = now;
                 s->run_axis = slice.axis;
                 rnr_opcode_t op = slice.kind == Slice_HomeSeek ? RnrOp_ArmHome :
                                   slice.kind == Slice_HomeJog ? RnrOp_StartJog :
@@ -518,6 +642,7 @@ static void io_thread (void *arg)
                     break;
                 }
                 s->run_arm_seq = s->seq;
+                s->run_armed = false;
             }
 
             uint8_t buf[RNR_OUT_BYTES];
@@ -528,6 +653,8 @@ static void io_thread (void *arg)
             }
             for(int a = 0; a < RNR_AXES; a++)
                 s->run_sent[a] += slice.steps[a];
+            s->run_slices++;
+            memcpy(s->track_cum[s->run_slices % TRACK], s->run_sent, sizeof(s->run_sent));
             s->last_slice_seq = s->seq;
             s->slices_sent++;
             s->busy_until = (s->busy_until > now ? s->busy_until : now) + SLICE_US;
@@ -547,6 +674,10 @@ static void io_thread (void *arg)
             s->outputs_change = false;
             s->check_pending = true;
             s->check_seq = s->seq;
+            for(int a = 0; a < RNR_AXES; a++)
+                s->check_expected[a] = s->run_start[a] + s->run_sent[a];
+            s->check_kind = s->run_kind;
+            s->check_slices = s->run_slices;
         }
 
         // Outputs at rest (M3 without motion, M5 at the end of a program): applied once the
@@ -583,6 +714,10 @@ static sink_status_t rnr_push (slice_sink_t *sink, const slice_t *slice)
     else {
         s->queue[(s->qhead + s->qcount) % RNR_QUEUE] = *slice;
         s->qcount++;
+        // Not at rest any more, at once: the I/O thread only recomputes this flag once per loop,
+        // and the core may queue a whole move then ask at once (homing pull-off: wait_idle, then
+        // the switch is read; a stale "at rest" read the switch before the pull-off had run).
+        s->idle_shared = false;
     }
     rnr_mutex_unlock(&s->lock);
 
@@ -781,8 +916,8 @@ static void rnr_close (slice_sink_t *sink)
     // Leave the controller disarmed, spindle and outputs off
     send_short(s, RnrOp_EStop, 0);
     outputs_off(s);
-    fprintf(stderr, "[rnr] closed: %u slices sent, %u controller e-stops, %u slices dropped after a switch or contact, position checks after runs: %u ok, %u mismatch\n",
-             s->slices_sent, s->estops_seen, s->dropped_after_cut, s->checks_ok, s->checks_bad);
+    fprintf(stderr, "[rnr] closed: %u slices sent, %u controller e-stops, %u slices dropped after a switch or contact, position checks after runs: %u ok, %u mismatch; controller located %u times (%u reports ambiguous)\n",
+             s->slices_sent, s->estops_seen, s->dropped_after_cut, s->checks_ok, s->checks_bad, s->track_fixes, s->track_ambiguous);
 
     s->t->close(s->t);
     rnr_mutex_destroy(&s->lock);

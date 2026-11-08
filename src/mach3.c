@@ -481,7 +481,8 @@ static int collect_patches (patch_t *p)
             n = patch_num(p, n, "M%dMin", a, (setting_id_t)(Setting_AxisMaxTravel + a), prof.travel[a], num("M%dMax", a, 0.0) - v / u);
         if(get_setting((setting_id_t)(Setting_AxisHomingSeekRate + a), &v) && prof.rate[a] > 0.0 &&
             !matches_setting((setting_id_t)(Setting_AxisHomingSeekRate + a), prof.rate[a] * inum("RefSpeed%d", a, 20) / 100.0))
-            n = patch_int(p, n, "RefSpeed%d", a, (int)lround(v * 100.0 / prof.rate[a]));
+            // Mach3's homing speed is a % of the max rate (1-100): grblHAL caps a faster seek rate
+            n = patch_int(p, n, "RefSpeed%d", a, (int)fmax(1.0, fmin(100.0, round(v * 100.0 / prof.rate[a]))));
     }
     if(get_setting(Setting_StepInvertMask, &v))
         for(int a = 0; a < AXES && a < N_AXIS; a++)
