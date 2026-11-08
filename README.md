@@ -9,8 +9,13 @@ side it speaks the controller's USB HID protocol. Its core is the
 (G-code parser, look-ahead planner, homing, probing, `$` settings) as a desktop program.
 GRBL2MACH replaces the simulated hardware with the USB controller.
 
-> **Status: early development. Nothing has been tested on real hardware yet.**
-> Do not connect this to a machine you care about. See [Safety](#safety).
+**Edit your Mach3 profile online, without Mach3:
+[Mach3 profile editor](https://manuprendlair.github.io/GRBL2MACH/tools/mach3_editor.html)**
+(runs in your browser; the file never leaves your computer).
+
+> **Status: early development.** Tested on one machine (moves, reset, e-stop, homing, probing),
+> not yet in a full session driven by gSender. Use a hardwired e-stop and try it first without a
+> tool. See [Safety](#safety).
 
 ## Goals
 
@@ -274,7 +279,9 @@ commands and per-axis rates on (`515`, other bits kept); on the first start, hom
 ### Editing the profile without Mach3
 
 [`tools/mach3_editor.html`](tools/mach3_editor.html) edits a Mach3 profile in any web browser, with
-no Mach3 and nothing to install: open the page (double-click it), open the `.xml`, edit, save as
+no Mach3 and nothing to install. **Online:
+<https://manuprendlair.github.io/GRBL2MACH/tools/mach3_editor.html>**, or open the file from a copy
+of this repository (double-click it). Open the `.xml`, edit, save as
 `MACH3.xml`. The file is read and written in the browser only.
 
 - Tabs follow Mach3's pages: motors, homing and soft limits, inputs, outputs and spindle, the
