@@ -286,7 +286,7 @@ int main(int argc, char *argv[])
 
             if (!strcmp(argv[0], "--rnr-invert") && argc > 1) {
                 argv++; argc--;
-                rnr_opt.step_dir_invert = (uint8_t)strtoul(*argv, NULL, 0);
+                rnr_opt.step_dir_invert = (uint8_t)strtoul(*argv, NULL, 16);
                 continue;
             }
 
