@@ -24,13 +24,15 @@ GRBL2MACH replaces the simulated hardware with the USB controller.
 | Item | Value |
 |---|---|
 | USB IDs | VID `0xA720`, PID `0xF803` ("RobotAndRobot.com", "RNR ECO MOTION 2.0") |
-| Interface | USB HID, 27-byte output reports, 49-byte input reports, no report ID |
+| Interface | USB HID, report IDs 2 (8 bytes) and 3 (26 bytes) out, 1 (48 bytes) in; status about every 50 ms |
 | Axes | X, Y, Z, A, up to 100 kHz step rate |
-| Principle | the PC plans, the controller executes: every 25 ms the PC sends a "slice" of signed steps per axis plus the OUT1..OUT4 states |
+| Principle | the PC plans, the controller executes: every 5 ms the PC sends a "slice" of signed steps per axis; outputs OUT1..OUT4 are set by separate frames |
 
-Protocol information comes from static analysis of the vendor's Mach3 plugin and from the
-specification published by [BreakoutCNC](https://github.com/rolanddd-hu/BreakoutCNC), which agree.
-The vendor plugin itself is proprietary and is **not** distributed here.
+Protocol information comes from static analysis of the vendor's Mach3 plugin, from the
+specification published by [BreakoutCNC](https://github.com/rolanddd-hu/BreakoutCNC), and from USB
+captures of Mach3 driving a real machine (start-up, homing, jogs, MDI moves, feed hold, stop,
+e-stop, probing). The bridge drives the board the way Mach3 does. The vendor plugin itself is
+proprietary and is **not** distributed here.
 
 ## How it works
 
@@ -39,25 +41,33 @@ The vendor plugin itself is proprietary and is **not** distributed here.
                                                           |  parser, planner, homing, probing,
                                                           |  status reports, $ settings
                                                           v
-                                               slicer: counts step pulses per 25 ms slice
+                                               slicer: counts step pulses per 5 ms slice
                                                           |
                                                           v
                                                slice sink: file, RNR USB controller or fake controller
 ```
 
 - **Slicer** (`src/slicer.c`): step pulses are counted where the simulated driver emits them
-  (`src/driver.c`) and stored in the 25 ms slice matching their simulated time. While the stepper
+  (`src/driver.c`) and stored in the 5 ms slice matching their simulated time. While the stepper
   runs, every slice is emitted (even empty ones) so the controller keeps the simulator's timeline.
 - **Slice sink** (`src/slice_sink.h`): one interface for every consumer of slices. When a sink is
   full, the simulator waits (back-pressure), so simulated time never runs ahead of the machine.
   Implementations: **file** (`src/sink_file.c`, CSV) and **RNR controller** (`src/rnr/sink_rnr.c`), which
   talks either to the real board over USB HID or to a **fake controller** used by the tests.
 - **RNR sink**: a dedicated I/O thread reads status reports continuously and sends slices paced by
-  the PC clock, at most 3 slices (75 ms) ahead. The board acknowledges a slice as soon as it has
-  buffered it, so pacing on acknowledgements alone would let the machine run seconds behind.
-  A 500 ms status watchdog, USB loss or a board fault is reported to grblHAL as a motor fault
-  (ALARM:17); every grblHAL reset (Ctrl-X, alarm) sends an e-stop to the board at once. After each
-  run, the board's step counters are checked against the steps sent.
+  the PC clock, at most 75 ms ahead (Mach3 keeps about 0.5 s ahead). A run starts once 40 ms of
+  motion is queued. The board acknowledges a slice as soon as it has buffered it, so pacing on
+  acknowledgements alone would let the machine run far behind.
+  - Program runs use the same frames as Mach3: arming (pre-reset, clear e-stop, set positions,
+    configure), "G-code" slices, then end of motion. After each run, the board's step counters are
+    checked against the steps sent.
+  - Every grblHAL reset (Ctrl-X, alarm) sends a cancel at once, like Mach3's Stop button: the
+    board stops and drops its buffer, but stays armed.
+  - The board's own e-stop input (IN1) stops it by itself; the bridge reports it to grblHAL as an
+    e-stop (ALARM:10) and re-arms the board before the next move, once the input is released and
+    grblHAL reset.
+  - A 500 ms status watchdog or USB loss is reported as a motor fault (ALARM:17) and disarms the
+    board.
 - **Position resync**: the simulator runs a little ahead of the machine (queued slices). After a
   reset, grblHAL's position is set back to where the board actually stopped (its step counters plus
   the offset between grblHAL and the counted steps, sampled at rest), before any new command runs.
@@ -96,16 +106,22 @@ cmake --build build
 
 ## Usage
 
-GRBL2MACH adds one option to the simulator (all other options are described in
+GRBL2MACH adds these options to the simulator (all other options are described in
 [README.simulator.md](README.simulator.md)):
 
 ```
-grblHAL_sim -o <slice file>    write 25 ms step slices (CSV) to a file
+grblHAL_sim -o <slice file>    write 5 ms step slices (CSV) to a file
 grblHAL_sim -u                 drive the RNR Eco Motion USB controller
 grblHAL_sim -f <log file>      drive a fake RNR controller (tests), logging every frame
 grblHAL_sim -l <address>       address to listen on with -p (default 127.0.0.1)
 grblHAL_sim --no-irq-lock      let simulated interrupts run concurrently with the core (upstream)
+grblHAL_sim --rnr-invert <hex> step/direction inversion sent to the controller (default 0)
 ```
+
+`--rnr-invert` takes the same values as Mach3's *Ports & Pins > Motor Outputs* page: bits 0-3 make
+the step pulse active low on X, Y, Z, A ("Step Low Active"), bits 4-7 invert the direction of X, Y,
+Z, A ("Dir LowActive"). Example: step low active on all four axes, A direction inverted: `0x8F`.
+**Use the same values as your Mach3 profile**: a wrong step polarity can lose steps.
 
 `-o`, `-u` and `-f` are mutually exclusive. With `-u` or `-f`, the simulation runs at 1.05 x real
 time unless `-t` is given; slice back-pressure then locks it to the machine.
@@ -119,8 +135,9 @@ grblHAL_sim -n -p 23023 -o slices.csv
 Each CSV line is `index,t_s,dx,dy,dz,da,out` (slice number, start time in seconds, signed steps
 per axis, outputs bitmask). The last line gives the totals.
 
-> `-u` has **not been tested on real hardware yet**. The controller's limit, home, probe and e-stop
-> inputs are not configured yet (all disabled in the configuration frame).
+> `-u` has **not been tested on real hardware yet**. The controller's limit, home and probe inputs
+> are not configured yet (all disabled in the configuration frame); its e-stop input (IN1) works
+> without configuration.
 
 On Windows the console input only reads the keyboard: type commands in the console window, or
 connect over TCP (`-p`). Piping commands into stdin does not work.
@@ -132,21 +149,26 @@ for idle, shuts down cleanly and checks the slice file: total steps per axis mus
 expected value and the final position reported by grblHAL, with no missing slice during motion.
 
 ```
-powershell -File tests\run_slices.ps1 -GCode "G21 G91 G1 X10 F600" -Expect "2500,0,0" -MaxStepsPerSlice 63
+powershell -File tests\run_slices.ps1 -GCode "G21 G91 G1 X10 F600" -Expect "2500,0,0" -MaxStepsPerSlice 13
 ```
 
-With the default settings (`$100=250` steps/mm), `G1 X10 F600` produces 2500 steps over 82 slices
-(2.05 s, triangular velocity profile at 10 mm/s²).
+With the default settings (`$100=250` steps/mm), `G1 X10 F600` produces 2500 steps over 407 slices
+(2.04 s, triangular velocity profile at 10 mm/s²).
 
 `tests/run_fake_board.ps1` runs the RNR sink against the fake controller:
 
+The fake controller behaves like the real board as seen in the Mach3 captures (state machine,
+5 ms slices, status every 50 ms, cancel, e-stop input).
+
 - `motion`: frame sequence (connect, arm, run, end of run, disarm), every step executed, real-time
-  pacing (board buffer depth at most 4 slices, no underrun), no protocol error;
+  pacing (board buffer depth at most 20 slices, no underrun), no protocol error;
 - `watchdog`: the fake controller goes silent during a move: grblHAL must raise ALARM:17 and the
   bridge must send an e-stop;
-- `reset`: Ctrl-X during a long move: the board must get an e-stop at once and stop, and grblHAL's
-  position must be resynced to where the board actually stopped (`-Immediate`: unlock and move
-  right after the reset, the move must start from the resynced position).
+- `reset`: Ctrl-X during a long move: the board must get a cancel at once, stop and stay armed, and
+  grblHAL's position must be resynced to where the board actually stopped (`-Immediate`: unlock and
+  move right after the reset, the move must start from the resynced position);
+- `estop`: the board's e-stop input is pressed during a move: grblHAL must raise ALARM:10, resync
+  to where the board stopped, and re-arm it for the next move once released and reset.
 
 ```
 powershell -File tests\run_fake_board.ps1 -Scenario all
@@ -169,8 +191,10 @@ powershell -File tests\run_fake_board.ps1 -Scenario all
   the upstream core plus one fix for a feed hold that could stay in `Hold:1` for seconds to minutes
   (float round-off at the end of the forced deceleration, in `stepper.c`). The fix is proposed
   upstream; the submodule will go back to grblHAL/core once it is merged.
-- The frame sequence (StartJog, jog slices, EndOfMotion) follows what BreakoutCNC bench-tested; it
-  is still to be compared with USB captures of the vendor Mach3 plugin.
+- The frame sequence follows USB captures of Mach3; the bridge itself has not been captured on the
+  real board yet (to compare frame by frame, including the 9-byte short reports).
+- Feed hold: grblHAL decelerates in the slices it sends, like Mach3. The board's "stop jog" frame,
+  which drops its buffer, is not used yet (it would make holds and jog cancels react faster).
 
 ## Roadmap
 
@@ -178,7 +202,7 @@ powershell -File tests\run_fake_board.ps1 -Scenario all
 2. ~~Build the simulator on Windows; slice sink interface with the file implementation.~~ Done.
 3. RNR USB sink: written and tested against the fake controller. Next: first hardware tests (drivers
    off, then small moves without a tool, far from the limits).
-4. Compare with USB captures of Mach3 driving the same machine.
+4. ~~USB captures of Mach3 driving the same machine; bridge aligned on them.~~ Done.
 5. Homing and probing using the controller's hardware latches.
 6. Mach3 XML profile importer, spindle and outputs.
 
@@ -186,9 +210,10 @@ powershell -File tests\run_fake_board.ps1 -Scenario all
 
 - This software is a **second layer** only. Use a hardwired emergency stop that cuts power to the
   stepper drivers.
-- On USB link loss, a board fault or 500 ms without a status report, the bridge sends an e-stop and
-  grblHAL raises ALARM:17. Thanks to real-time pacing the board never holds more than about 100 ms
-  of motion.
+- On USB link loss or 500 ms without a status report, the bridge sends an e-stop and grblHAL
+  raises ALARM:17. Thanks to real-time pacing the board never holds more than about 100 ms of
+  motion. The board has no watchdog of its own: if the PC freezes, it runs what it holds.
+- The board's e-stop input (IN1) stops it by itself, without the PC.
 - The TCP port listens on `127.0.0.1` only by default: GRBL has no authentication, so anyone
   reaching the port can move the machine. `-l <address>` opens it to the network and prints a
   warning. Never allow it on "Public" networks in your firewall.

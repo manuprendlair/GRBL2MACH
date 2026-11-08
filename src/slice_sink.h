@@ -14,7 +14,7 @@
 #include <stdbool.h>
 
 #define SLICE_AXES 4    // X, Y, Z, A: the four axes of the RNR controller
-#define SLICE_MS   25   // slice duration (the RNR controller executes one slice every 25 ms)
+#define SLICE_MS   5    // slice duration (the RNR controller executes one slice every 5 ms, as Mach3 configures it)
 
 typedef struct {
     uint32_t index;             // slice number since start; slice starts at index * SLICE_MS (simulated time)
@@ -49,9 +49,11 @@ struct slice_sink {
     bool (*get_halted_position)(slice_sink_t *sink, int32_t position[SLICE_AXES], uint32_t timeout_ms);
     // Finishes cleanly (drains the queue) and releases the sink.
     void (*close)(slice_sink_t *sink);
+    // True while the machine reports an emergency stop of its own (hardware e-stop input).
+    // Optional (NULL: no such input). Thread-safe.
+    bool (*estop_active)(slice_sink_t *sink);
     void *ctx;
-    // To come with the controller: input reading (limits, probe, e-stop),
-    // acknowledgements, homing/probe arming, latched positions.
+    // To come with the controller: limit and probe inputs, homing/probe arming, latched positions.
 };
 
 // File sink (CSV): dry run without hardware.

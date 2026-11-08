@@ -274,6 +274,10 @@ static control_signals_t systemGetState (void)
     if(settings.control_invert.mask)
         signals.mask ^= settings.control_invert.mask;
 
+    // GRBL2MACH: the controller's own e-stop input (after inversion: it is already active high)
+    if(slicer_estop())
+        signals.e_stop = On;
+
     return signals;
 }
 
@@ -553,6 +557,7 @@ bool driver_init ()
 
     hal.signals_cap.safety_door_ajar = On;
     hal.signals_cap.motor_fault = On;   // GRBL2MACH: controller lost
+    hal.signals_cap.e_stop = slicer_enabled();  // GRBL2MACH: e-stop input of the controller
     hal.driver_cap.control_pull_up = On;
     hal.driver_cap.limits_pull_up = On;
     hal.driver_cap.probe_pull_up = On;

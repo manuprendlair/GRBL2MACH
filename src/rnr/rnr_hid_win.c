@@ -3,9 +3,11 @@
 
   Finds the controller by VID/PID through SetupAPI and talks to it with
   overlapped ReadFile/WriteFile, like the vendor plugin (hidapi) does.
-  Frames are written as is, starting at byte 0 (buf[0] = 0x02 / 0x03), as
-  bench-tested by BreakoutCNC; buffers are sized to the report lengths
-  reported by the HID driver.
+  Frames are written as is: byte 0 is the report ID (2 or 3). Writes use the
+  largest output report length (27 bytes) reported by the HID driver, like
+  hidapi does; Windows should then send a report ID 2 frame as a 9-byte
+  transfer, as seen in the captures of Mach3 (to be checked by capturing the
+  bridge).
 
   Part of GRBL2MACH. GPL-3.0-or-later.
 */

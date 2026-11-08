@@ -71,6 +71,7 @@ static const char *fake_log = NULL;             // -f
 static bool use_usb = false;                    // -u
 static bool speedup_given = false;
 static bool irq_lock_on = true;                 // --no-irq-lock
+static rnr_options_t rnr_opt = {0};             // --rnr-invert
 
 void print_usage(const char* badarg)
 {
@@ -88,10 +89,12 @@ void print_usage(const char* badarg)
       "    -e <EEPROM file>   : file containing grblHAL settings.  default = EEPROM.DAT\n"
       "    -p <port>          : port to open raw telnet communication.\n"
       "    -l <address>       : GRBL2MACH: address to listen on with -p. Default=127.0.0.1 (this machine only).\n"
-      "    -o <slice file>    : GRBL2MACH: write 25 ms step slices (CSV) to file.\n"
+      "    -o <slice file>    : GRBL2MACH: write 5 ms step slices (CSV) to file.\n"
       "    -u                 : GRBL2MACH: drive the RNR Eco Motion USB controller.\n"
       "    -f <log file>      : GRBL2MACH: drive a fake RNR controller (tests), logging every frame.\n"
       "    --no-irq-lock      : GRBL2MACH: let simulated interrupts run concurrently with the core (upstream behaviour).\n"
+      "    --rnr-invert <hex> : GRBL2MACH: controller step/dir inversion byte (bits 0-3: step active low X..A,\n"
+      "                         bits 4-7: direction inverted X..A; Mach3 example 0x8F). Default 0.\n"
 	  "    -d <directory>     : directory to mount as local filing system.\n"
       "    -c<comment_char>   : character to print before each line from grbl.  default = '#'\n"
       "    -n                 : no comments before grbl response lines.\n"
@@ -281,6 +284,12 @@ int main(int argc, char *argv[])
                 continue;
             }
 
+            if (!strcmp(argv[0], "--rnr-invert") && argc > 1) {
+                argv++; argc--;
+                rnr_opt.step_dir_invert = (uint8_t)strtoul(*argv, NULL, 0);
+                continue;
+            }
+
             switch(argv[0][1]){
 
                 case 'c':  //set Comment char 
@@ -430,7 +439,7 @@ int main(int argc, char *argv[])
             printf("RNR controller: %s\n", info);
             fflush(stdout);
         }
-        slice_sink_t *sink = sink_rnr_open(t);
+        slice_sink_t *sink = sink_rnr_open(t, &rnr_opt);
         if (!sink) {
             printf("The RNR controller does not answer.\n");
             return EXIT_FAILURE;

@@ -160,6 +160,31 @@ bool slicer_motor_fault (void)
     return atomic_load(&sink_failed);
 }
 
+bool slicer_estop (void)
+{
+    slice_sink_t *s = sink;
+
+    return s && s->estop_active && s->estop_active(s);
+}
+
+// The machine stopped on its own e-stop input: tell the core like a control input interrupt
+// would (it resets and raises ALARM:10, which stays until the input is released and the user
+// resets). Runs on the simulator thread, as an interrupt handler: exclusive with the core
+// thread under the interrupt lock.
+static void check_estop (void)
+{
+    static bool was_active = false;
+    bool active = slicer_estop();
+
+    if(active && !was_active) {
+        fprintf(stderr, "[slicer] machine e-stop: signalled to the core\n");
+        bool locked = irq_lock_isr_enter();
+        hal.control.interrupt_callback(hal.control.get_state());
+        irq_lock_isr_leave(locked);
+    }
+    was_active = active;
+}
+
 void slicer_init (slice_sink_t *s)
 {
     sink = s;
@@ -251,8 +276,10 @@ void slicer_poll (void)
 {
     atomic_fetch_add(&sim_heartbeat, 1);
 
-    if(sink)
+    if(sink) {
+        check_estop();
         advance();
+    }
 }
 
 void slicer_close (void)

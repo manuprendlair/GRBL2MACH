@@ -19,5 +19,6 @@ void slicer_poll (void);                          // on every simulated tick: cl
 void slicer_close (void);                         // sends the current slice and closes the sink
 void slicer_attach_core (void);                   // hooks the core's reset event (call once the core is initialised)
 bool slicer_motor_fault (void);                   // true while the sink has failed (reported as the motor fault signal)
+bool slicer_estop (void);                         // true while the machine reports an e-stop (reported as the e-stop signal); any thread
 
 #endif

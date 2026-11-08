@@ -6,14 +6,16 @@
 #              real-time pacing (controller buffer depth, no underrun), no protocol error.
 #   watchdog : the fake controller stops reporting during a move: grblHAL must go to Alarm
 #              and the bridge must send an e-stop.
-#   reset    : a soft reset (Ctrl-X) during a long move: the controller must get an e-stop at once
-#              and must not execute the slices that were still queued.
+#   reset    : a soft reset (Ctrl-X) during a long move: the controller must get a cancel at once,
+#              must not execute the slices that were still queued and must stay armed.
+#   estop    : the controller's own e-stop input during a move: grblHAL must raise ALARM:10, resync
+#              to where the controller stopped and re-arm it for the next move after a reset.
 #
-# Usage: powershell -File tests\run_fake_board.ps1 [-Scenario motion|watchdog|reset|all]
+# Usage: powershell -File tests\run_fake_board.ps1 [-Scenario motion|watchdog|reset|estop|all]
 #                       [-GCode "G21 G91 G1 X10 F600"] [-Expect "2500,0,0"] [-OutDir folder] [-Immediate]
 
 param(
-    [ValidateSet("motion", "watchdog", "reset", "all")] [string]$Scenario = "all",
+    [ValidateSet("motion", "watchdog", "reset", "estop", "all")] [string]$Scenario = "all",
     [string]$GCode = "G21 G91 G1 X10 F600",
     [string]$Expect = "2500,0,0",
     [string]$OutDir = "$env:TEMP\grbl2mach_fake",
@@ -39,7 +41,7 @@ function Read-FakeLog([string]$path) {
             $frames += $f
         } elseif ($l -match "^# frames=") {
             foreach ($kv in ($l.Substring(2) -split " ")) { $p = $kv -split "="; $stats[$p[0]] = [int]$p[1] }
-        } elseif ($l -match "^# final position X=(-?\d+) Y=(-?\d+) Z=(-?\d+) A=(-?\d+) estop=(\d)") {
+        } elseif ($l -match "^# final position X=(-?\d+) Y=(-?\d+) Z=(-?\d+) A=(-?\d+) state=(\d)") {
             $final = @([int]$Matches[1], [int]$Matches[2], [int]$Matches[3], [int]$Matches[4], [int]$Matches[5])
         }
     }
@@ -60,26 +62,28 @@ function Test-Motion {
 
     $r = Read-FakeLog $log
     $ops = $r.Frames | ForEach-Object { $_.op }
-    $slices = @($r.Frames | Where-Object { $_.op -eq 5 })
+    $slices = @($r.Frames | Where-Object { $_.op -eq 4 })
     $sum = @(0, 0, 0, 0); foreach ($f in $slices) { for ($a = 0; $a -lt 4; $a++) { $sum[$a] += $f.d[$a] } }
     $exp = $Expect.Split(",") | ForEach-Object { [int]$_ }
     $fromMpos = @(0, 1, 2) | ForEach-Object { [math]::Round($mpos[$_] * $spm[$_]) }
     $span = $slices[-1].t - $slices[0].t
-    $expectedSpan = ($slices.Count - 1) * 25
+    $expectedSpan = ($slices.Count - 1) * 5
 
     "  slices sent: $($slices.Count), over $([math]::Round($span)) ms (real time: $expectedSpan ms), stats: " + (($r.Stats.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join " ")
     Check (($ops[0..3] -join ",") -eq "15,1,3,9") "connect sequence Configure, EStop, SetOutputs, SetPositions"
-    $firstSlice = [array]::IndexOf($ops, 5)
-    Check (($ops[($firstSlice - 4)..($firstSlice - 1)] -join ",") -eq "7,2,15,10") "arm then run start before the first slice: PreReset, ClearEStop, Configure, StartJog"
+    $firstSlice = [array]::IndexOf($ops, 4)
+    Check (($ops[($firstSlice - 4)..($firstSlice - 1)] -join ",") -eq "7,2,9,15") "arm like Mach3 before the first slice: PreReset, ClearEStop, SetPositions, Configure"
+    Check (@($r.Frames | Where-Object { $_.op -in 5, 10 }).Count -eq 0) "program run made of GcodeSlice frames only (no StartJog, no JogSlice)"
+    Check (@($r.Frames | Where-Object { $_.rest -notmatch "flags=0x00" }).Count -eq 0) "flags byte 0 in every frame, like Mach3"
     Check ($ops[-2] -eq 6 -and $ops[-1] -eq 1) "run closed with EndOfMotion, controller disarmed (EStop) at exit"
     for ($a = 0; $a -lt 3; $a++) {
         Check ($sum[$a] -eq $exp[$a] -and $sum[$a] -eq $fromMpos[$a]) "axis $a total $($sum[$a]) = expected $($exp[$a]) = MPos $($fromMpos[$a])"
     }
     Check ($r.Final[0] -eq $exp[0] -and $r.Final[1] -eq $exp[1] -and $r.Final[2] -eq $exp[2]) "controller executed every step (final position $($r.Final[0..3] -join ','))"
-    Check ($r.Stats.max_depth -le 4) "real-time pacing: controller buffer depth $($r.Stats.max_depth) <= 4 slices"
+    Check ($r.Stats.max_depth -le 20) "real-time pacing: controller buffer depth $($r.Stats.max_depth) <= 20 slices (100 ms)"
     Check ([math]::Abs($span - $expectedSpan) -le [math]::Max(50, 0.05 * $expectedSpan)) "slices spread in real time ($([math]::Round($span)) ms for $expectedSpan ms)"
     Check ($r.Stats.starved -eq 0) "no underrun during the run"
-    Check ($r.Stats.seq_errors -eq 0 -and $r.Stats.rejected_estop -eq 0 -and $r.Stats.overflows -eq 0) "no sequence error, no slice rejected"
+    Check ($r.Stats.seq_errors -eq 0 -and $r.Stats.rejected -eq 0 -and $r.Stats.overflows -eq 0) "no sequence error, no slice rejected"
     $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
     Check ($err -match "position checks after runs: [1-9]\d* ok, 0 mismatch") "controller counters = steps sent after each run ($(([regex]::Match($err, 'position checks[^\r\n]*')).Value))"
     Check ($err -notmatch "resynced") "no resync needed in normal operation"
@@ -103,7 +107,7 @@ function Test-Watchdog {
     Check ($out -match "ALARM:17") "grblHAL raised ALARM:17 (motor fault); alarms seen: $alarms"
     Check ($afterReset -match "<Alarm") "still in Alarm after a reset (fault latched)"
     Check ($err -match "watchdog") "bridge reported the watchdog fault"
-    $silentAt = ($r.Frames | Where-Object { $_.op -eq 5 } | Select-Object -First 1).t + 300
+    $silentAt = ($r.Frames | Where-Object { $_.op -eq 4 } | Select-Object -First 1).t + 300
     $estop = $r.Frames | Where-Object { $_.op -eq 1 -and $_.t -gt $silentAt } | Select-Object -First 1
     Check ($null -ne $estop -and ($estop.t - $silentAt) -lt 800) "e-stop sent $([math]::Round($estop.t - $silentAt)) ms after the controller went silent"
 }
@@ -137,11 +141,13 @@ function Test-Reset {
     } finally { Stop-Sim $s }
     $r = Read-FakeLog $log
     $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
-    $estop = $r.Frames | Where-Object { $_.op -eq 1 -and $_.rest -match "halted pos=(-?\d+)" -and $_.t -gt 100 } | Select-Object -First 1
-    $null = $estop.rest -match "halted pos=(-?\d+),(-?\d+),(-?\d+)"; $haltedX = [int]$Matches[1]
-    $lastSliceBefore = $r.Frames | Where-Object { $_.op -eq 5 -and $_.t -lt $estop.t } | Select-Object -Last 1
+    $cancel = $r.Frames | Where-Object { $_.op -eq 8 -and $_.rest -match "halted pos=(-?\d+)" } | Select-Object -First 1
+    $null = $cancel.rest -match "halted pos=(-?\d+),(-?\d+),(-?\d+)"; $haltedX = [int]$Matches[1]
+    $lastSliceBefore = $r.Frames | Where-Object { $_.op -eq 4 -and $_.t -lt $cancel.t } | Select-Object -Last 1
     $one = [math]::Round(1 * $spm[0])
-    Check ($null -ne $estop -and ($estop.t - $lastSliceBefore.t) -lt 50) "e-stop sent right after the last slice (+$([math]::Round($estop.t - $lastSliceBefore.t)) ms), controller halted at X=$haltedX"
+    Check ($null -ne $cancel -and ($cancel.t - $lastSliceBefore.t) -lt 50) "cancel sent right after the last slice (+$([math]::Round($cancel.t - $lastSliceBefore.t)) ms), controller halted at X=$haltedX"
+    $afterCancel = @($r.Frames | Where-Object { $_.t -gt $cancel.t } | ForEach-Object { $_.op })
+    Check (($afterCancel -notcontains 7) -and ($afterCancel -notcontains 2)) "controller stayed armed after the cancel (no re-arming sequence)"
     Check ($err -match "position resynced from the machine: X-\d+") "bridge resynced the position: $(([regex]::Match($err, 'resynced[^\r\n]*')).Value)"
     if ($afterReset) {
         Check ([math]::Round($afterReset[0] * $spm[0]) -eq $haltedX) "grblHAL position after reset = controller halted position ($([math]::Round($afterReset[0] * $spm[0])) / $haltedX steps)"
@@ -150,12 +156,51 @@ function Test-Reset {
     Check ([math]::Round($final[0] * $spm[0]) -eq $r.Final[0]) "grblHAL and controller agree at the end ($([math]::Round($final[0] * $spm[0])) / $($r.Final[0]) steps)"
     "  info : state after the reset: $state"
     Check ($r.Final[0] -lt 50 * 250) "controller stopped before the end of the long move"
-    Check ($r.Stats.still_buffered -eq 0 -and $r.Stats.rejected_estop -eq 0) "nothing left in the controller buffer, no slice sent in e-stop"
+    Check ($r.Stats.still_buffered -eq 0 -and $r.Stats.rejected -eq 0) "nothing left in the controller buffer, no slice rejected"
     Check ($err -match "position checks after runs: \d+ ok, 0 mismatch") "position check after the extra move"
+}
+
+function Test-EStop {
+    "=== estop: the controller's e-stop input is pressed 500 ms into a move, released 1 s later"
+    $dir = Join-Path $OutDir "estop"; $log = Join-Path $dir "fake.log"
+    $s = Start-Sim "-f `"$log`"" $dir ($Port + 3) @{ GRBL2MACH_FAKE_ESTOP_MS = "500,1500" }
+    try {
+        $spm = Get-StepsPerMm $s
+        Invoke-Line $s '$X' | Out-Null
+        Send-Sim $s "G21 G91 G1 X50 F1200`n"
+        $out = ""; for ($i = 0; $i -lt 30 -and $out -notmatch "ALARM:"; $i++) { Start-Sleep -Milliseconds 100; $out += Read-Sim $s }
+        $whilePressed = Wait-State $s "Alarm" 2000
+        Start-Sleep -Milliseconds 1500                     # input released meanwhile
+        Send-Sim $s ([string][char]0x18); Start-Sleep -Milliseconds 500; Read-Sim $s | Out-Null
+        $afterReset = Get-MPos (Wait-State $s "Alarm|Idle" 2000)
+        Invoke-Line $s '$X' | Out-Null
+        Invoke-GCode $s "G21 G91 G1 X1 F600"
+        $final = Get-MPos (Wait-State $s "Idle")
+    } finally { Stop-Sim $s }
+    $r = Read-FakeLog $log
+    $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
+    $pressed = Select-String -Path $log -Pattern "E-STOP INPUT pressed: halted pos=(-?\d+)" | Select-Object -First 1
+    $haltedX = [int]$pressed.Matches[0].Groups[1].Value
+    $tPress = [double]($pressed.Line.Trim() -split " ")[0]
+    $one = [math]::Round(1 * $spm[0])
+    $alarms = ([regex]::Matches($out, 'ALARM:\d+') | ForEach-Object { $_.Value }) -join ", "
+    Check ($out -match "ALARM:10") "grblHAL raised ALARM:10 (e-stop); alarms seen: $alarms"
+    Check ($whilePressed -match "<Alarm") "grblHAL in Alarm while the input is pressed"
+    Check ($err -match "controller e-stop: stopped at X=$haltedX") "bridge saw the controller e-stop at X=$haltedX"
+    $lateSlices = @($r.Frames | Where-Object { $_.op -eq 4 -and $_.t -gt $tPress -and $_.t -lt $tPress + 1500 }).Count
+    Check ($lateSlices -le 20) "slices stopped after the e-stop ($lateSlices sent before the bridge saw it, rejected by the controller)"
+    Check ([math]::Round($afterReset[0] * $spm[0]) -eq $haltedX) "grblHAL position after reset = where the controller stopped ($([math]::Round($afterReset[0] * $spm[0])) / $haltedX steps)"
+    $rearm = $r.Frames | Where-Object { $_.t -gt $tPress + 1000 } | ForEach-Object { $_.op }
+    $firstSlice = [array]::IndexOf(@($rearm), 4)
+    Check ($firstSlice -ge 4 -and (($rearm[($firstSlice - 4)..($firstSlice - 1)]) -join ",") -eq "7,2,9,15") "controller re-armed (PreReset, ClearEStop, SetPositions, Configure) before the next move"
+    Check ($r.Final[0] -eq $haltedX + $one) "controller ran exactly the extra 1 mm from where it stopped (final X=$($r.Final[0]))"
+    Check ([math]::Round($final[0] * $spm[0]) -eq $r.Final[0]) "grblHAL and controller agree at the end ($([math]::Round($final[0] * $spm[0])) / $($r.Final[0]) steps)"
+    Check ($err -match "position checks after runs: [1-9]\d* ok, 0 mismatch") "position check after the extra move"
 }
 
 if ($Scenario -in "motion", "all") { Test-Motion }
 if ($Scenario -in "watchdog", "all") { Test-Watchdog }
 if ($Scenario -in "reset", "all") { Test-Reset }
+if ($Scenario -in "estop", "all") { Test-EStop }
 
 if ($script:failures -eq 0) { "RESULT: PASS"; exit 0 } else { "RESULT: FAIL ($script:failures)"; exit 1 }
