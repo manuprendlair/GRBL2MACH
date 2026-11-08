@@ -135,8 +135,8 @@ expected value and the final position reported by grblHAL, with no missing slice
 powershell -File tests\run_slices.ps1 -GCode "G21 G91 G1 X10 F600" -Expect "2500,0,0" -MaxStepsPerSlice 63
 ```
 
-With the default settings (`$100=250` steps/mm), `G1 X10 F600` produces 2500 steps over 83 slices
-(2.08 s, triangular velocity profile at 10 mm/s²).
+With the default settings (`$100=250` steps/mm), `G1 X10 F600` produces 2500 steps over 82 slices
+(2.05 s, triangular velocity profile at 10 mm/s²).
 
 `tests/run_fake_board.ps1` runs the RNR sink against the fake controller:
 
@@ -164,9 +164,11 @@ powershell -File tests\run_fake_board.ps1 -Scenario all
   the steppers or calling `grbl.on_reset`. The bridge stops the board and resyncs the position from
   `hal.driver_reset`, which the core always calls on its own thread, so the position is right
   either way. With the lock, alarm 3 is raised every time.
-- After a feed hold, `Hold:1` sometimes lasts 10, 20 or 30 s before `Hold:0` (the last steps of the
-  deceleration come seconds apart). Seen in the upstream simulator without any GRBL2MACH code,
-  with or without the lock; resuming works. Not investigated yet.
+- The grblHAL core submodule (`src/grbl`) points to
+  [manuprendlair/grblHAL-core](https://github.com/manuprendlair/grblHAL-core), branch `grbl2mach`:
+  the upstream core plus one fix for a feed hold that could stay in `Hold:1` for seconds to minutes
+  (float round-off at the end of the forced deceleration, in `stepper.c`). The fix is proposed
+  upstream; the submodule will go back to grblHAL/core once it is merged.
 - The frame sequence (StartJog, jog slices, EndOfMotion) follows what BreakoutCNC bench-tested; it
   is still to be compared with USB captures of the vendor Mach3 plugin.
 
