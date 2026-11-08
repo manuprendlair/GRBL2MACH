@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mach3 Profile Editor</title>
+<!--
+  Mach3 profile editor - part of GRBL2MACH (GPL-3.0-or-later)
+
+  Edits a Mach3 profile (.xml) outside Mach3, for instance to drive the machine with GRBL2MACH and a
+  GRBL sender instead of Mach3. Everything runs in the browser: the file never leaves the computer.
+  Only the values of the edited tags are replaced; every other byte of the file is kept, so that
+  Mach3 can still read it.
+-->
+<style>
+/* Dark by default; "Light" button for the light theme */
+:root {
+  --bg: #0f1218; --panel: #171c24; --panel2: #1d2430; --text: #e6e9ee; --muted: #8f9bab; --line: #2a3240;
+  --accent: #4c8dff; --accent-weak: #1b2a44; --changed: #3a3216; --changed-line: #d0a127;
+  --warn: #ffb066; --warn-bg: #3a2614; --ok: #4ac26b; --input: #0f1319; --hover: #222b38;
+}
+:root[data-theme="light"] {
+  --bg: #f4f6f9; --panel: #ffffff; --panel2: #f7f9fb; --text: #1d2330; --muted: #5f6b7a; --line: #dde2e8;
+  --accent: #1f6feb; --accent-weak: #e7f0fd; --changed: #fff4d6; --changed-line: #d29922;
+  --warn: #9a4b00; --warn-bg: #fff1e3; --ok: #1a7f37; --input: #ffffff; --hover: #f0f3f7;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { background: var(--panel); border-bottom: 1px solid var(--line); padding: 14px 20px; display: flex; flex-wrap: wrap; gap: 12px; align-items: center; position: sticky; top: 0; z-index: 2; }
+header h1 { font-size: 17px; margin: 0 12px 0 0; }
+header .file { color: var(--muted); flex: 1; min-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+button, .button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--text); padding: 6px 12px; border-radius: 6px; cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:disabled { opacity: .45; cursor: default; }
+main { max-width: 1180px; margin: 0 auto; padding: 18px 20px 60px; }
+#drop { border: 2px dashed var(--line); border-radius: 10px; padding: 48px 20px; text-align: center; color: var(--muted); background: var(--panel); }
+#drop.over { border-color: var(--accent); background: var(--accent-weak); }
+#drop p { margin: 6px 0; }
+nav { display: flex; flex-wrap: wrap; gap: 4px; margin: 0 0 14px; }
+nav button { border-radius: 6px 6px 0 0; border-bottom: none; }
+nav button.active { background: var(--accent-weak); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+section { display: none; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+section.active { display: block; }
+h2 { font-size: 15px; margin: 18px 0 8px; }
+h2:first-child { margin-top: 0; }
+p.note { color: var(--muted); margin: 4px 0 12px; }
+table { border-collapse: collapse; width: 100%; }
+th, td { border-bottom: 1px solid var(--line); padding: 5px 8px; text-align: left; vertical-align: middle; }
+th { font-weight: 600; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
+td.axis { font-weight: 700; width: 40px; }
+input[type=text], input[type=number], select { font: inherit; color: var(--text); background: var(--input); border: 1px solid var(--line); border-radius: 5px; padding: 4px 6px; width: 110px; }
+input[type=number] { text-align: right; }
+input[type=checkbox] { width: 16px; height: 16px; }
+.cell { display: inline-flex; align-items: center; gap: 4px; padding: 2px; border-radius: 6px; }
+.cell.changed { background: var(--changed); outline: 1px solid var(--changed-line); }
+.cell .reset { display: none; border: none; background: none; padding: 0 2px; color: var(--muted); cursor: pointer; }
+.cell.changed .reset { display: inline; }
+.unit { color: var(--muted); font-size: 12px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 6px 20px; }
+.field { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 3px 0; border-bottom: 1px dashed var(--line); }
+.field label { flex: 1; }
+.tag { color: var(--muted); font: 11px ui-monospace, Consolas, monospace; }
+.warn { color: var(--warn); background: var(--warn-bg); border-radius: 6px; padding: 6px 10px; margin: 4px 0; }
+.ok { color: var(--ok); }
+.missing { color: var(--muted); font-style: italic; }
+pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 10px; overflow: auto; font: 12.5px ui-monospace, Consolas, monospace; }
+#search { width: 260px; margin-bottom: 8px; }
+.scroll { max-height: 560px; overflow: auto; }
+tr:hover td { background: var(--hover); }
+nav { position: sticky; top: 62px; z-index: 1; background: var(--bg); padding-top: 6px; }
+nav .badge { display: inline-block; min-width: 18px; padding: 0 5px; margin-left: 5px; border-radius: 9px; background: var(--changed-line); color: #111; font-size: 11px; font-weight: 700; text-align: center; }
+nav .badge.warnb { background: var(--warn); }
+nav .badge[hidden] { display: none; }
+section { background: var(--panel); }
+.field:hover { background: var(--hover); }
+.changes td.old { color: var(--muted); text-decoration: line-through; }
+.changes td.new { color: var(--changed-line); font-weight: 600; }
+.hint { color: var(--muted); font-size: 12px; margin-left: 6px; }
+a { color: var(--accent); }
+label.toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); margin: 0 0 8px; cursor: pointer; }
+kbd { font: 11px ui-monospace, Consolas, monospace; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; }
+footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 24px; }
+@media (max-width: 640px) { header { position: static; } input[type=number], input[type=text], select { width: 84px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Mach3 profile editor</h1>
+  <span class="file" id="fileinfo">No profile open</span>
+  <label class="button">Open…<input type="file" id="open" accept=".xml" hidden></label>
+  <button id="resetAll" disabled>Undo all changes</button>
+  <button id="save" class="primary" disabled title="Ctrl+S">Save as MACH3.xml</button>
+  <button id="theme" title="Dark / light theme">Light</button>
+</header>
+<main>
+  <div id="drop">
+    <p><strong>Open a Mach3 profile</strong> (the <code>.xml</code> file in Mach3's folder, e.g. <code>C:\Mach3\Mach3Mill.xml</code>)</p>
+    <p>Drop it here or use <em>Open…</em>. The file is read and written in your browser only.</p>
+    <p>Saving replaces only the values you changed: Mach3 can still read the file. Keep the original as a backup.</p>
+    <p class="hint">Changed values are highlighted (↺ puts one back); the <em>Changes</em> tab lists them all. <kbd>Ctrl</kbd>+<kbd>S</kbd> saves.</p>
+  </div>
+  <div id="editor" hidden>
+    <nav id="tabs"></nav>
+    <div id="sections"></div>
+  </div>
+  <footer>Part of <a href="https://github.com/manuprendlair/GRBL2MACH">GRBL2MACH</a>, GPL-3.0-or-later. Mach3 is a trademark of Newfangled Solutions; this tool is not affiliated with it.</footer>
+</main>
+
+<script id="core">
+// ---- Core: profile parsing, byte-exact patching, GRBL2MACH mapping (no DOM; tested with Node) ----
+
+// Decodes bytes one char per byte (windows-1252), so that string offsets are byte offsets
+function decodeBytes (bytes) {
+  return new TextDecoder("windows-1252").decode(bytes);
+}
+
+// Leaf tags <Name>value</Name>: first occurrence of each name, with the value's byte offsets
+function parseProfile (bytes) {
+  const text = decodeBytes(bytes);
+  const tags = new Map();
+  const re = /<([A-Za-z_][A-Za-z0-9_]*)>([^<]*)<\/\1>/g;
+  let m;
+  while ((m = re.exec(text))) {
+    if (!tags.has(m[1])) {
+      const start = m.index + m[1].length + 2;
+      tags.set(m[1], { start, end: start + m[2].length, value: m[2] });
+    }
+  }
+  return { bytes, text, tags, isMach3: /<profile>/.test(text) && tags.has("Steps0") };
+}
+
+// New file content: the original bytes with only the edited values replaced (values must be ASCII)
+function buildFile (profile, edits) {
+  const list = [...edits].filter(([name]) => profile.tags.has(name))
+    .map(([name, value]) => ({ ...profile.tags.get(name), value: String(value) }))
+    .sort((a, b) => a.start - b.start);
+  const parts = [];
+  let pos = 0;
+  for (const e of list) {
+    if (/[^\x20-\x7e]/.test(e.value)) throw new Error("only plain ASCII characters can be written: " + e.value);
+    parts.push(profile.bytes.subarray(pos, e.start), new TextEncoder().encode(e.value));
+    pos = e.end;
+  }
+  parts.push(profile.bytes.subarray(pos));
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+// A number as Mach3 writes it: "801.5", "45." for a whole value, "1.638e+004" style kept by Mach3 only
+function mach3Number (v) {
+  if (!isFinite(v)) return "0.";
+  let s = String(+Number(v).toPrecision(10));
+  if (/e/.test(s)) return s;
+  return s.includes(".") ? s : s + ".";
+}
+
+const AXES = ["X", "Y", "Z", "A"];
+
+// Mach3 input signals (Ports & Pins > Input Signals), by index
+const INPUT_SIGNALS = ["X ++", "X --", "X Home", "Y ++", "Y --", "Y Home", "Z ++", "Z --", "Z Home",
+  "A ++", "A --", "A Home", "B ++", "B --", "B Home", "C ++", "C --", "C Home",
+  "Input #1", "Input #2", "Input #3", "Input #4", "Probe", "Index", "Limit Ovrd", "EStop",
+  "THC On", "THC Up", "THC Down", "OEM Trig #1", "OEM Trig #2", "OEM Trig #3", "OEM Trig #4"];
+
+// Mach3 output signals: indices 7.. are Output #1.. (confirmed for #1-#4 on the reference profile)
+function outputName (i) {
+  if (i >= 1 && i <= 6) return "Enable" + i;
+  if (i >= 7 && i <= 12) return "Output #" + (i - 6);
+  return "Output signal " + i;
+}
+
+// What GRBL2MACH derives from the profile (same rules as src/mach3.c)
+function grbl2machView (p) {
+  const num = (name, d = 0) => { const t = p.tags.get(name); const v = t ? parseFloat(t.value) : NaN; return isFinite(v) ? v : d; };
+  const int = (name, d = 0) => Math.round(num(name, d));
+  const unit = int("Units") ? 25.4 : 1;
+  const out = { settings: [], warnings: [], invert: 0, pins: [], outputs: {} };
+  const set = (id, v, note) => out.settings.push({ id, value: +Number(v).toPrecision(9), note });
+  const inp = (i) => ({ active: !!int(`Input${i}Active`), port: int(`Input${i}Port`), pin: int(`Input${i}Pin`), low: !!int(`Input${i}Neg`) });
+  const pin = (s) => (s.active && s.port === 3 ? s.pin & 15 : 0);
+
+  for (let a = 0; a < 4; a++) {
+    const u = a < 3 ? unit : 1, rate = num(`Vel${a}`, 1) * 60 * u;
+    set(100 + a, num(`Steps${a}`, 1) / u, AXES[a] + " steps/mm");
+    set(110 + a, rate, AXES[a] + " max rate");
+    set(120 + a, num(`Acc${a}`, 1) * u, AXES[a] + " acceleration");
+    set(130 + a, (num(`M${a}Max`) - num(`M${a}Min`)) * u, AXES[a] + " max travel");
+    set(190 + a, rate * int(`RefSpeed${a}`, 20) / 100, AXES[a] + " homing seek rate");
+    if (int(`AxisToMotor${a}`, a) !== a) out.warnings.push(`Axis ${AXES[a]} is mapped to motor ${int(`AxisToMotor${a}`, a)}: GRBL2MACH only supports X-0 Y-1 Z-2 A-3.`);
+    if (int(`Motor${a}StepNeg`)) out.invert |= 1 << a;
+    if (int(`Motor${a}DirNeg`)) out.invert |= 0x10 << a;
+  }
+  let homeDir = 0;
+  for (let a = 0; a < 4; a++) homeDir |= int(`M${a}Neg`) << a;
+  set(2, out.invert & 15, "step pulse active low");
+  set(3, out.invert >> 4, "direction inverted");
+  set(20, int("SoftLimit") ? 1 : 0, "soft limits");
+  set(23, homeDir, "homing direction (bit set = towards minus)");
+  set(27, Math.max(num("XPullOff", .5), num("YPullOff", .5), num("ZPullOff", .5)) * unit, "homing pull-off");
+  const pulley = int("PULLEY") + 1, ratio = num("SpindleRatio", 1) || 1;
+  set(30, num(`SPEED${pulley}`, 1000) / ratio, "spindle max (pulley " + pulley + " / Calibration)");
+  set(31, num(`LSPEED${pulley}`, 0) / ratio, "spindle min");
+
+  // Configure bytes 5..14 (input pins), as the controller plugin encodes them
+  const lim = (a, k) => inp(3 * a + k);
+  for (let a = 0; a < 4; a++) {
+    const lp = lim(a, 0), ln = lim(a, 1), h = lim(a, 2);
+    out.pins.push((pin(ln) << 4) | pin(lp));
+    out.pins.push((h.low ? 0x40 : 0) | (ln.low ? 0x20 : 0) | (lp.low ? 0x10 : 0) | pin(h));
+  }
+  const probe = inp(22), estop = inp(25);
+  out.pins.push((pin(estop) << 4) | pin(probe));
+  out.pins.push((estop.low ? 0x20 : 0) | (probe.low ? 0x10 : 0));
+  for (const i of [...Array(12).keys(), 22, 25]) {
+    const s = inp(i);
+    if (s.active && (s.port !== 3 || s.pin < 1 || s.pin > 15))
+      out.warnings.push(`${INPUT_SIGNALS[i]} is on port ${s.port} pin ${s.pin}: the RNR controller's inputs are port 3, pins 1-15.`);
+  }
+  if (!estop.active) out.warnings.push("No EStop input: the controller will not stop by itself on an e-stop button.");
+
+  const outNum = (idx) => (idx > 0 && int(`Output${idx}Active`) && int(`Output${idx}Port`) === 3 ? int(`Output${idx}Pin`) : 0);
+  const cw = int("SpinCW"), ccw = int("SpinCCW");
+  out.outputs = {
+    spindle: int("NoSpindle") ? 0 : outNum(cw),
+    ccw: !int("NoSpindle") && ccw !== cw ? outNum(ccw) : 0,
+    flood: int("NoFlood") ? 0 : outNum(int("Flood")),
+    mist: int("NoFlood") ? 0 : outNum(int("Mist"))
+  };
+  out.pulseKhz = int("PulseRates", 100);
+  if (int("MultiStep")) out.warnings.push("Multi-Step Speed is on: not supported by GRBL2MACH (spindle speed on several outputs).");
+  if (unit !== 1) out.warnings.push("The profile is in inches: GRBL2MACH converts it to millimetres (A stays in degrees).");
+  return out;
+}
+
+if (typeof module !== "undefined") module.exports = { parseProfile, buildFile, mach3Number, grbl2machView, INPUT_SIGNALS, outputName };
+</script>
+
+<script>
+// ---- User interface ----
+let profile = null, fileName = "", fileHandle = null;
+const edits = new Map();
+const $ = (sel, el = document) => el.querySelector(sel);
+const el = (tag, attrs = {}, ...kids) => {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v; else if (k.startsWith("on")) e.addEventListener(k.slice(2), v); else if (v !== undefined) e.setAttribute(k, v);
+  }
+  for (const k of kids.flat()) if (k != null) e.append(k.nodeType ? k : document.createTextNode(k));
+  return e;
+};
+const current = (name) => (edits.has(name) ? edits.get(name) : profile.tags.has(name) ? profile.tags.get(name).value : undefined);
+const original = (name) => (profile.tags.has(name) ? profile.tags.get(name).value : undefined);
+
+function setValue (name, value) {
+  if (!profile.tags.has(name)) return;
+  if (value === original(name)) edits.delete(name); else edits.set(name, value);
+  refreshStatus();
+}
+
+// A field bound to one tag. kind: num (Mach3 float), int, bool, text, select; scale: shown = stored x scale
+function field (name, { kind = "num", scale = 1, options = null, unit = "", digits = null, width = null, readonly = false } = {}) {
+  if (!profile.tags.has(name)) return el("span", { class: "missing", title: "not in this profile" }, "—");
+  const cell = el("span", { class: "cell", title: name });
+  let input;
+  const toShown = (v) => {
+    if (kind === "num") { const n = parseFloat(v) * scale; return isFinite(n) ? String(+n.toPrecision(10)) : v; }
+    return v;
+  };
+  const toStored = (shown) => {
+    if (kind === "num") { const n = parseFloat(shown) / scale; return isFinite(n) ? (digits != null ? n.toFixed(digits) : mach3Number(n)) : null; }
+    if (kind === "int") { const n = parseInt(shown, 10); return isFinite(n) ? String(n) : null; }
+    return shown;
+  };
+  if (kind === "bool") {
+    input = el("input", { type: "checkbox" });
+    input.checked = parseFloat(current(name)) !== 0;
+    input.addEventListener("change", () => { setValue(name, input.checked ? "1" : "0"); mark(); });
+  } else if (kind === "select") {
+    input = el("select", {}, options.map(([v, label]) => el("option", { value: v }, label)));
+    if (!options.some(([v]) => String(v) === String(current(name)))) input.append(el("option", { value: current(name) }, current(name)));
+    input.value = current(name);
+    input.addEventListener("change", () => { setValue(name, input.value); mark(); });
+  } else {
+    input = el("input", { type: kind === "text" ? "text" : "number", step: "any" });
+    if (width) input.style.width = width;
+    input.value = toShown(current(name));
+    input.readOnly = readonly;
+    input.addEventListener("change", () => {
+      const stored = toStored(input.value);
+      if (stored == null) { input.value = toShown(current(name)); return; }
+      // keep the original text when the number did not change (e.g. "45." vs "45")
+      const same = kind === "num" && parseFloat(stored) === parseFloat(original(name));
+      setValue(name, same ? original(name) : stored);
+      input.value = toShown(current(name));
+      mark();
+    });
+  }
+  const reset = el("button", { class: "reset", title: "back to the value in the file", onclick: () => {
+    edits.delete(name); refreshStatus();
+    if (kind === "bool") input.checked = parseFloat(original(name)) !== 0; else input.value = toShown(original(name));
+    mark();
+  } }, "↺");
+  function mark () { cell.classList.toggle("changed", edits.has(name)); refreshPreview(); }
+  cell.append(input);
+  if (unit) cell.append(el("span", { class: "unit" }, unit));
+  cell.append(reset);
+  mark();
+  return cell;
+}
+
+const row = (label, node, tag) => el("div", { class: "field" }, el("label", {}, label, " ", el("span", { class: "tag" }, tag || "")), node);
+
+// ---- Sections ----
+const SECTIONS = [];
+function section (id, title, build) { SECTIONS.push({ id, title, build }); }
+
+section("motors", "Motors", (s) => {
+  const u = parseFloat(current("Units")) ? "in" : "mm";
+  s.append(el("p", { class: "note" }, "Motor Tuning and Motor Outputs pages. Velocity is shown per minute (Mach3 stores it per second)."));
+  s.append(el("table", {},
+    el("tr", {}, ["Axis", "Enabled", "Steps per " + u, "Velocity (" + u + "/min)", "Acceleration (" + u + "/s²)", "Step low active", "Dir low active"].map((h) => el("th", {}, h))),
+    AXES.map((ax, a) => el("tr", {}, el("td", { class: "axis" }, ax),
+      el("td", {}, field(`Motor${a}Active`, { kind: "bool" })),
+      el("td", {}, field(`Steps${a}`)),
+      el("td", {}, field(`Vel${a}`, { scale: 60 })),
+      el("td", {}, field(`Acc${a}`)),
+      el("td", {}, field(`Motor${a}StepNeg`, { kind: "bool" })),
+      el("td", {}, field(`Motor${a}DirNeg`, { kind: "bool" }))))));
+  s.append(el("p", { class: "note" }, "Axis A is angular (degrees) when Mach3's \"A-Axis is Angular\" is set. The RNR controller drives X, Y, Z, A; step pins and ports are for the parallel port and are not used by it."));
+});
+
+section("homing", "Homing & limits", (s) => {
+  s.append(el("p", { class: "note" }, "Motor Home/SoftLimits page. Soft Max / Soft Min also give GRBL2MACH the travel of each axis ($130-$133)."));
+  s.append(el("table", {},
+    el("tr", {}, ["Axis", "Reversed", "Soft Max", "Soft Min", "Slow zone", "Home offset", "Home neg", "Auto zero", "Speed %"].map((h) => el("th", {}, h))),
+    AXES.map((ax, a) => el("tr", {}, el("td", { class: "axis" }, ax),
+      el("td", {}, field(`M${a}Rev`, { kind: "bool" })),
+      el("td", {}, field(`M${a}Max`)), el("td", {}, field(`M${a}Min`)),
+      el("td", {}, field(`M${a}SoftRamp`)), el("td", {}, field(`M${a}RefHome`)),
+      el("td", {}, field(`M${a}Neg`, { kind: "bool" })), el("td", {}, field(`M${a}AutoZero`, { kind: "bool" })),
+      el("td", {}, field(`RefSpeed${a}`, { kind: "int", unit: "%" }))))));
+  s.append(el("h2", {}, "General"));
+  s.append(el("div", { class: "grid" },
+    row("Soft limits on", field("SoftLimit", { kind: "bool" }), "SoftLimit"),
+    row("G28 home X", field("G20X"), "G20X"), row("G28 home Y", field("G20Y"), "G20Y"),
+    row("G28 home Z", field("G20Z"), "G20Z"), row("G28 home A", field("G20A"), "G20A")));
+  s.append(el("h2", {}, "Pull-off (controller plugin)"));
+  s.append(el("div", { class: "grid" },
+    row("Pull off after homing", field("HomePullOff", { kind: "bool" }), "HomePullOff"),
+    ...["X", "Y", "Z", "A"].map((ax) => row("Pull-off " + ax, field(ax + "PullOff", { digits: 3 }), ax + "PullOff"))));
+  s.append(el("p", { class: "note" }, "GRBL2MACH uses the largest of X, Y, Z as grblHAL's pull-off ($27). Make it larger than your switches' hysteresis."));
+});
+
+// Signals table; rows not in "main" (and not enabled) are hidden until "show all" is ticked
+function signalTable (count, prefix, names, main, extra) {
+  const rows = [];
+  for (let i = 0; i < count; i++) {
+    if (!profile.tags.has(`${prefix}${i}Active`)) continue;
+    const active = parseFloat(current(`${prefix}${i}Active`)) !== 0, port = parseFloat(current(`${prefix}${i}Port`));
+    rows.push(el("tr", { class: main(i) || active ? "" : "extra" }, el("td", {}, names(i)),
+      el("td", {}, field(`${prefix}${i}Active`, { kind: "bool" })),
+      el("td", {}, field(`${prefix}${i}Port`, { kind: "int", width: "60px" })),
+      el("td", {}, field(`${prefix}${i}Pin`, { kind: "int", width: "60px" })),
+      el("td", {}, field(`${prefix}${i}Neg`, { kind: "bool" })),
+      el("td", {}, active && port !== 3 ? el("span", { class: "warn" }, "not on the controller (port 3)") : extra ? extra(i) : "")));
+  }
+  const table = el("table", { class: "signals" }, el("tr", {}, ["Signal", "Enabled", "Port", "Pin", "Active low", ""].map((h) => el("th", {}, h))), rows);
+  const all = el("input", { type: "checkbox" });
+  const apply = () => table.querySelectorAll("tr.extra").forEach((r) => { r.hidden = !all.checked; });
+  all.addEventListener("change", apply);
+  apply();
+  return el("div", {}, el("label", { class: "toggle" }, all, "Show all signals (the others are Mach3's own and are not used here)"), table);
+}
+
+section("inputs", "Inputs", (s) => {
+  s.append(el("p", { class: "note" }, "Input Signals page. On the RNR controller, port 3 pin n is input INn. GRBL2MACH uses the axis limits and homes, Probe and EStop; the other signals are Mach3's own."));
+  s.append(signalTable(40, "Input", (i) => INPUT_SIGNALS[i] || "Input signal " + i, (i) => i < 12 || i === 22 || i === 25));
+  s.append(el("h2", {}, "Debounce (Mach3 only, not sent to the controller)"));
+  s.append(el("div", { class: "grid" },
+    row("Debounce interval", field("Debounce", { kind: "int", unit: "× 40 µs" }), "Debounce"),
+    row("Index debounce", field("IndexDebounce", { kind: "int" }), "IndexDebounce")));
+});
+
+section("outputs", "Outputs & spindle", (s) => {
+  const outOptions = [["0", "none"]];
+  for (let i = 1; i < 30; i++) if (profile.tags.has(`Output${i}Active`)) outOptions.push([String(i), outputName(i)]);
+  s.append(el("h2", {}, "Spindle and coolant relays"));
+  s.append(el("div", { class: "grid" },
+    row("Spindle CW (M3) output", field("SpinCW", { kind: "select", options: outOptions }), "SpinCW"),
+    row("Spindle CCW (M4) output", field("SpinCCW", { kind: "select", options: outOptions }), "SpinCCW"),
+    row("Disable spindle relays", field("NoSpindle", { kind: "bool" }), "NoSpindle"),
+    row("Flood (M8) output", field("Flood", { kind: "select", options: outOptions }), "Flood"),
+    row("Mist (M7) output", field("Mist", { kind: "select", options: outOptions }), "Mist"),
+    row("Disable flood/mist relays", field("NoFlood", { kind: "bool" }), "NoFlood")));
+  s.append(el("h2", {}, "Spindle speed"));
+  s.append(el("div", { class: "grid" },
+    row("PWM control", field("PWM", { kind: "bool" }), "PWM"),
+    row("Minimum PWM", field("PWMin", { unit: "%" }), "PWMin"),
+    row("PWM base frequency", field("PWMBase", { unit: "Hz" }), "PWMBase"),
+    row("Current pulley", field("PULLEY", { kind: "select", options: [["0", "1"], ["1", "2"], ["2", "3"], ["3", "4"]] }), "PULLEY"),
+    ...[1, 2, 3, 4].flatMap((n) => [row(`Pulley ${n} max`, field("SPEED" + n, { kind: "int", unit: "rpm" }), "SPEED" + n),
+      row(`Pulley ${n} min`, field("LSPEED" + n, { kind: "int", unit: "rpm" }), "LSPEED" + n)]),
+    row("Spin up delay CW", field("SpinDelayCW", { unit: "s" }), "SpinDelayCW"),
+    row("Spin up delay CCW", field("SpinDelayCCW", { unit: "s" }), "SpinDelayCCW"),
+    row("Spin down delay CW", field("SpinDownCW", { unit: "s" }), "SpinDownCW"),
+    row("Spin down delay CCW", field("SpinDownCCW", { unit: "s" }), "SpinDownCCW")));
+  s.append(el("h2", {}, "Output signals"));
+  s.append(el("p", { class: "note" }, "Output Signals page. On the RNR controller, port 3 pin n is output OUTn."));
+  s.append(signalTable(30, "Output", outputName, (i) => i >= 7 && i <= 10));
+});
+
+section("controller", "Controller", (s) => {
+  s.append(el("p", { class: "note" }, "Settings of the RNR / Bitsensor controller plugin (Config > Config Plugins). Kept in the <RnRMotion> part of the profile."));
+  s.append(el("div", { class: "grid" },
+    row("Frequency of pulse output", field("PulseRates", { kind: "select", options: [["100", "100 kHz"], ["50", "50 kHz"], ["25", "25 kHz"], ["10", "10 kHz"]] }), "PulseRates"),
+    row("Spindle calibration", field("SpindleRatio", { digits: 3 }), "SpindleRatio"),
+    row("Spindle initial RV", field("SpindleRV", { digits: 3, unit: "rpm" }), "SpindleRV"),
+    row("Multi-step speed", field("MultiStep", { kind: "bool" }), "MultiStep"),
+    row("Jog rapid stop", field("RapidStop", { kind: "bool" }), "RapidStop"),
+    row("MPG disable", field("MPGDisable", { kind: "bool" }), "MPGDisable"),
+    row("Laser output pin", field("OutputPin", { kind: "int" }), "OutputPin"),
+    row("Laser Z depth", field("ZDeepth", { kind: "int" }), "ZDeepth")));
+  s.append(el("p", { class: "note" }, "Spindle calibration multiplies the requested speed before the PWM is computed (captured on the reference board); Initial RV has no effect on it."));
+});
+
+section("general", "General", (s) => {
+  s.append(el("div", { class: "grid" },
+    row("Units", field("Units", { kind: "select", options: [["0", "millimetres"], ["1", "inches"]] }), "Units"),
+    row("Look-ahead", field("LookAhead", { kind: "int", unit: "lines" }), "LookAhead"),
+    row("Profile name", field("Profile", { kind: "text", readonly: true }), "Profile"),
+    row("Screen set", field("Layout", { kind: "text", readonly: true }), "Layout")));
+  s.append(el("p", { class: "note" }, "Changing Units does not convert the other values: Mach3 stores everything in the profile's units."));
+});
+
+section("grbl2mach", "GRBL2MACH", (s) => { s.append(el("div", { id: "preview" })); });
+
+section("changes", "Changes", (s) => { s.append(el("div", { id: "changes" })); });
+
+section("all", "All tags", (s) => {
+  const search = el("input", { type: "text", id: "search", placeholder: "Search a tag or value…" });
+  const box = el("div", { class: "scroll" });
+  const render = () => {
+    const q = search.value.trim().toLowerCase();
+    box.replaceChildren(el("table", {}, el("tr", {}, el("th", {}, "Tag"), el("th", {}, "Value")),
+      [...profile.tags.keys()].filter((k) => !q || k.toLowerCase().includes(q) || String(current(k)).toLowerCase().includes(q)).slice(0, 400)
+        .map((k) => el("tr", {}, el("td", { class: "tag" }, k), el("td", {}, field(k, { kind: "text", width: "260px" }))))));
+  };
+  search.addEventListener("input", render);
+  s.append(el("p", { class: "note" }, "Every value of the profile (first 400 matches). Edit with care: values are written as typed."), search, box);
+  render();
+});
+
+function refreshPreview () {
+  const box = $("#preview");
+  if (!box || !profile) return;
+  const v = grbl2machView({ tags: new Map([...profile.tags].map(([k, t]) => [k, { ...t, value: current(k) }])) });
+  const hex = (n) => n.toString(16).toUpperCase().padStart(2, "0");
+  box.replaceChildren(
+    el("p", { class: "note" }, "What GRBL2MACH will make of this profile (MACH3.xml next to grblHAL_sim): grblHAL settings and the controller's configuration."),
+    ...v.warnings.map((w) => el("div", { class: "warn" }, w)),
+    v.warnings.length ? "" : el("p", { class: "ok" }, "✓ Nothing GRBL2MACH cannot handle."),
+    el("h2", {}, "grblHAL settings"),
+    el("pre", {}, v.settings.map((x) => `$${x.id}=${x.value}`.padEnd(18) + "; " + x.note).join("\n") +
+      "\n" + "$22=515".padEnd(18) + "; homing on, single axis commands, per-axis rates" +
+      "\n; first start only: $44=4 $45=1 $46=2 (Z, X, Y), $180-$183=45 (slow approach)"),
+    el("h2", {}, "Controller configuration"),
+    el("pre", {}, `step/dir inversion  0x${hex(v.invert)}\npulse frequency     ${v.pulseKhz} kHz\ninput pins          ${v.pins.map(hex).join(" ")}` +
+      `\noutputs             spindle OUT${v.outputs.spindle}, ccw OUT${v.outputs.ccw}, flood OUT${v.outputs.flood}, mist OUT${v.outputs.mist} (OUT0 = none)`));
+}
+
+function refreshChanges () {
+  const box = $("#changes");
+  if (!box || !profile) return;
+  const list = [...edits].sort((a, b) => profile.tags.get(a[0]).start - profile.tags.get(b[0]).start);
+  box.replaceChildren(
+    el("p", { class: "note" }, list.length ? `${list.length} value(s) will be changed on save. Everything else in the file stays as it is.` : "No change yet."),
+    list.length ? el("table", { class: "changes" }, el("tr", {}, ["Tag", "In the file", "New value", ""].map((h) => el("th", {}, h))),
+      list.map(([k, v]) => el("tr", {}, el("td", { class: "tag" }, k), el("td", { class: "old" }, original(k)), el("td", { class: "new" }, v),
+        el("td", {}, el("button", { onclick: () => { edits.delete(k); rebuild(); } }, "Undo"))))) : "");
+}
+
+// ---- Files ----
+let shown = "motors";
+function refreshStatus () {
+  $("#fileinfo").textContent = profile ? `${fileName} — ${profile.tags.size} values — ${edits.size} changed` : "No profile open";
+  $("#save").disabled = !profile;
+  $("#resetAll").disabled = !edits.size;
+  if (!profile) return;
+  const badge = (id, n, cls) => {
+    const b = $(`#tab-${id} .badge`);
+    if (b) { b.textContent = n; b.hidden = !n; b.className = "badge " + (cls || ""); }
+  };
+  badge("changes", edits.size);
+  const view = grbl2machView({ tags: new Map([...profile.tags].map(([k, t]) => [k, { ...t, value: current(k) }])) });
+  badge("grbl2mach", view.warnings.length, "warnb");
+  refreshChanges();
+}
+
+// Builds the tabs from the profile and the current edits (keeps the tab shown)
+function rebuild () {
+  const tabs = $("#tabs"), sections = $("#sections");
+  tabs.replaceChildren(); sections.replaceChildren();
+  for (const sec of SECTIONS) {
+    const s = el("section", { id: "s-" + sec.id });
+    sec.build(s);
+    sections.append(s);
+    tabs.append(el("button", { id: "tab-" + sec.id, onclick: () => show(sec.id) }, sec.title, el("span", { class: "badge", hidden: "" })));
+  }
+  show(shown);
+  refreshStatus(); refreshPreview();
+}
+
+function openProfile (bytes, name, handle = null) {
+  const p = parseProfile(bytes);
+  if (!p.isMach3 && !confirm(`${name} does not look like a Mach3 profile (no <profile> or <Steps0>). Open it anyway?`)) return;
+  profile = p; fileName = name; fileHandle = handle; edits.clear();
+  $("#drop").hidden = true; $("#editor").hidden = false;
+  rebuild();
+}
+
+function show (id) {
+  shown = id;
+  SECTIONS.forEach((sec) => {
+    const s = $("#s-" + sec.id);
+    if (sec.id === id) { s.replaceChildren(); sec.build(s); }   // a value may have been edited in another tab
+    s.classList.toggle("active", sec.id === id);
+    $("#tab-" + sec.id).classList.toggle("active", sec.id === id);
+  });
+  refreshPreview(); refreshChanges();
+}
+
+// Theme: dark unless the user chose light (remembered in this browser when possible)
+function setTheme (light) {
+  document.documentElement.dataset.theme = light ? "light" : "dark";
+  $("#theme").textContent = light ? "Dark" : "Light";
+  try { localStorage.setItem("mach3editor.theme", light ? "light" : "dark"); } catch (e) {}
+}
+let savedTheme = null;
+try { savedTheme = localStorage.getItem("mach3editor.theme"); } catch (e) {}
+setTheme(savedTheme === "light");
+$("#theme").addEventListener("click", () => setTheme(document.documentElement.dataset.theme !== "light"));
+
+document.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); if (profile) $("#save").click(); }
+});
+
+async function readFile (file, handle) { openProfile(new Uint8Array(await file.arrayBuffer()), file.name, handle); }
+
+$("#open").addEventListener("change", (e) => e.target.files[0] && readFile(e.target.files[0]));
+const drop = $("#drop");
+["dragover", "dragenter"].forEach((t) => document.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach((t) => document.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
+document.addEventListener("drop", (e) => { const f = e.dataTransfer.files[0]; if (f) readFile(f); });
+
+$("#resetAll").addEventListener("click", () => { if (confirm("Undo all changes?")) openProfile(profile.bytes, fileName, fileHandle); });
+
+$("#save").addEventListener("click", async () => {
+  let bytes;
+  try { bytes = buildFile(profile, edits); } catch (err) { alert(err.message); return; }
+  const blob = new Blob([bytes], { type: "application/xml" });
+  if (window.showSaveFilePicker) {
+    try {
+      const h = await window.showSaveFilePicker({ suggestedName: "MACH3.xml", types: [{ description: "Mach3 profile", accept: { "application/xml": [".xml"] } }] });
+      const w = await h.createWritable(); await w.write(blob); await w.close();
+      alert(`Saved (${edits.size} values changed). Keep the original file as a backup.`);
+      return;
+    } catch (err) { if (err.name === "AbortError") return; }
+  }
+  const a = el("a", { href: URL.createObjectURL(blob), download: "MACH3.xml" });
+  document.body.append(a); a.click(); a.remove();
+});
+
+window.addEventListener("beforeunload", (e) => { if (edits.size) { e.preventDefault(); e.returnValue = ""; } });
+</script>
+</body>
+</html>

@@ -271,6 +271,25 @@ commands and per-axis rates on (`515`, other bits kept); on the first start, hom
 `$180`-`$183` = 45 mm/min (as measured with Mach3). grblHAL settings with no Mach3 equivalent
 (`$11`, `$24`, `$26`...) stay in grblHAL's own settings file.
 
+### Editing the profile without Mach3
+
+[`tools/mach3_editor.html`](tools/mach3_editor.html) edits a Mach3 profile in any web browser, with
+no Mach3 and nothing to install: open the page (double-click it), open the `.xml`, edit, save as
+`MACH3.xml`. The file is read and written in the browser only.
+
+- Tabs follow Mach3's pages: motors, homing and soft limits, inputs, outputs and spindle, the
+  controller plugin, general settings, and every tag of the file (with search).
+- Changed values are highlighted and can be put back one by one; the *Changes* tab lists them all.
+- The *GRBL2MACH* tab shows what the bridge will make of the profile (grblHAL settings, controller
+  configuration) and warns about what it cannot handle (inputs off the controller's port, axis
+  mapping, Multi-Step Speed).
+- Saving replaces only the values changed: every other byte stays as it was, so Mach3 can still
+  read the file. Keep the original as a backup. Ctrl+S saves; dark theme, light on request.
+
+`node tests/mach3_editor_test.js [profile.xml]` checks the editor's core: an unchanged profile is
+saved byte for byte, edits touch nothing else, and its GRBL2MACH view equals what the bridge
+computes.
+
 ## Tests
 
 `tests/run_slices.ps1` (Windows PowerShell) starts the simulator, sends G-code over TCP, waits
