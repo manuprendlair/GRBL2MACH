@@ -49,6 +49,7 @@
 #include "grbl_interface.h"
 #include "platform.h"
 #include "slicer.h"
+#include "mach3.h"
 #include "irq_lock.h"
 
 #include "grbl/hal.h"
@@ -422,6 +423,8 @@ static uint_fast16_t valueSetAtomic (volatile uint_fast16_t *ptr, uint_fast16_t 
 
 void settings_changed (settings_t *settings, settings_changed_flags_t changed)
 {
+    mach3_settings_changed();   // GRBL2MACH: write changed settings back to the Mach3 profile
+
     if(changed.spindle) {
         spindleConfig(spindle_get_hal(spindle_id, SpindleHAL_Configured));
         if(spindle_id == spindle_get_default())
@@ -437,6 +440,7 @@ bool driver_setup (settings_t *settings)
 {
     // GRBL2MACH: stop the slice sink on every core reset
     slicer_attach_core();
+    mach3_attach_core();        // GRBL2MACH: settings from the machine's Mach3 profile, and back
 
     timer[STEPPER_TIMER].prescaler = 0;
     timer[STEPPER_TIMER].irq_enable = 1;

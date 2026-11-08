@@ -17,6 +17,8 @@ typedef struct {
     // Controller output (1..4 = OUT1..OUT4, 0 = none) driven by: spindle on, spindle on in
     // counter-clockwise (0: same output as spindle_out), flood coolant, mist coolant
     uint8_t spindle_out, spindle_ccw_out, flood_out, mist_out;
+    // Step pulse frequency, kHz (Configure byte 16; Mach3: controller plugin "Frequency of Pulse Output"). 0 = 100
+    uint8_t pulse_khz;
     // Inputs declared to the controller (--rnr-in, --rnr-estop-in). The e-stop input is also
     // watched by the bridge itself. The controller stops on it by itself once declared.
     rnr_inputs_t inputs;

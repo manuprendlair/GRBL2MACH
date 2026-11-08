@@ -184,7 +184,7 @@ static void outputs_off (rnr_sink_t *s)
 static int send_configure (rnr_sink_t *s)
 {
     uint8_t buf[RNR_OUT_BYTES];
-    rnr_config_t cfg = { .pulse_khz = 100, .slice_ms = SLICE_MS, .step_dir_invert = s->opt.step_dir_invert };
+    rnr_config_t cfg = { .pulse_khz = s->opt.pulse_khz ? s->opt.pulse_khz : 100, .slice_ms = SLICE_MS, .step_dir_invert = s->opt.step_dir_invert };
     if(s->opt.pins_raw)
         memcpy(cfg.pins, s->opt.pins, RNR_PIN_BYTES);
     else

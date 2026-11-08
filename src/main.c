@@ -46,6 +46,7 @@
 #include "build_info.h"
 #include "fs_posix.h"
 #include "slicer.h"
+#include "mach3.h"
 #include "rnr/sink_rnr.h"
 #include "irq_lock.h"
 
@@ -75,6 +76,9 @@ static bool irq_lock_on = true;                 // --no-irq-lock
 // on IN1 active high (Mach3's EStop on port 3 pin 1), declared to the controller so that it stops
 // by itself.
 static rnr_options_t rnr_opt = { .spindle_out = 1, .inputs.estop = { .pin = 1 } };
+// Options given on the command line win over the Mach3 profile (tests, trials)
+static const char *mach3_path = NULL;           // --mach3
+static bool cli_invert = false, cli_out = false, cli_in = false, cli_estop = false;
 
 // "<n>" or "<n>low": input number (0 = not used, 1..15) and polarity
 static bool parse_rnr_input (const char *s, rnr_input_t *in)
@@ -162,6 +166,8 @@ void print_usage(const char* badarg)
       "    -u                 : GRBL2MACH: drive the RNR Eco Motion USB controller.\n"
       "    -f <log file>      : GRBL2MACH: drive a fake RNR controller (tests), logging every frame.\n"
       "    --no-irq-lock      : GRBL2MACH: let simulated interrupts run concurrently with the core (upstream behaviour).\n"
+      "    --mach3 <file>     : GRBL2MACH: the machine's Mach3 profile. Default: MACH3.xml next to this program,\n"
+      "                         required with -u. The --rnr-* options below override what it describes.\n"
       "    --rnr-invert <hex> : GRBL2MACH: controller step/dir inversion byte (bits 0-3: step active low X..A,\n"
       "                         bits 4-7: direction inverted X..A; Mach3 example 0x8F). Default 0.\n"
       "    --rnr-out <function>=<n>[,...] : GRBL2MACH: controller output OUT<n> (1-4, 0 = none) driven by\n"
@@ -364,6 +370,12 @@ int main(int argc, char *argv[])
                 continue;
             }
 
+            if (!strcmp(argv[0], "--mach3") && argc > 1) {
+                argv++; argc--;
+                mach3_path = *argv;
+                continue;
+            }
+
             if (!strcmp(argv[0], "--rnr-pins") && argc > 1) {
                 argv++; argc--;
                 const char *h = *argv;
@@ -387,6 +399,7 @@ int main(int argc, char *argv[])
                     print_usage(*argv);
                     exit(-1);
                 }
+                cli_in = true;
                 continue;
             }
 
@@ -396,6 +409,7 @@ int main(int argc, char *argv[])
                     print_usage(*argv);
                     exit(-1);
                 }
+                cli_estop = true;
                 continue;
             }
 
@@ -405,12 +419,14 @@ int main(int argc, char *argv[])
                     print_usage(*argv);
                     exit(-1);
                 }
+                cli_out = true;
                 continue;
             }
 
             if (!strcmp(argv[0], "--rnr-invert") && argc > 1) {
                 argv++; argc--;
                 rnr_opt.step_dir_invert = (uint8_t)strtoul(*argv, NULL, 16);
+                cli_invert = true;
                 continue;
             }
 
@@ -552,6 +568,37 @@ int main(int argc, char *argv[])
         }
         slicer_init(sink);
     }
+    // GRBL2MACH: the machine's Mach3 profile describes it (axes, homing, inputs, outputs, spindle).
+    // Required to drive the real controller; optional with the fake one (--mach3).
+    if (use_usb || mach3_path) {
+        char profile[1024], err[600];
+        if (mach3_path)
+            snprintf(profile, sizeof(profile), "%s", mach3_path);
+        else
+            mach3_default_path(profile, sizeof(profile), progname);
+        if (!mach3_load(profile, err, sizeof(err))) {
+            printf("Mach3 profile: %s\n", err);
+            return EXIT_FAILURE;
+        }
+        rnr_options_t from_profile = rnr_opt;
+        mach3_bridge_options(&from_profile);
+        if (!cli_invert)
+            rnr_opt.step_dir_invert = from_profile.step_dir_invert;
+        if (!cli_out) {
+            rnr_opt.spindle_out = from_profile.spindle_out;
+            rnr_opt.spindle_ccw_out = from_profile.spindle_ccw_out;
+            rnr_opt.flood_out = from_profile.flood_out;
+            rnr_opt.mist_out = from_profile.mist_out;
+        }
+        if (!cli_in) {
+            rnr_input_t estop = rnr_opt.inputs.estop;
+            rnr_opt.inputs = from_profile.inputs;
+            if (cli_estop)
+                rnr_opt.inputs.estop = estop;
+        }
+        rnr_opt.pulse_khz = from_profile.pulse_khz;
+    }
+
     if (fake_log || use_usb) {
         char info[256] = "";
         rnr_transport_t *t = use_usb ? rnr_hid_open(info, sizeof(info)) : rnr_fake_open(fake_log);

@@ -1,4 +1,4 @@
-﻿# run_fake_board.ps1 - RNR sink tests against the fake controller (GRBL2MACH, plan step C)
+# run_fake_board.ps1 - RNR sink tests against the fake controller (GRBL2MACH, plan step C)
 #
 # Scenarios:
 #   motion   : runs a G-code program, then checks the fake controller log: frame sequence
@@ -18,7 +18,7 @@
 #                       [-GCode "G21 G91 G1 X10 F600"] [-Expect "2500,0,0"] [-OutDir folder] [-Immediate]
 
 param(
-    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "home", "probe", "all")] [string]$Scenario = "all",
+    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "home", "probe", "mach3", "all")] [string]$Scenario = "all",
     [string]$GCode = "G21 G91 G1 X10 F600",
     [string]$Expect = "2500,0,0",
     [string]$OutDir = "$env:TEMP\grbl2mach_fake",
@@ -333,18 +333,74 @@ function Test-Probe {
     } finally { Stop-Sim $s }
     $r = Read-FakeLog $log
     $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
-    $zc = [regex]::Match($prb, "\[PRB:[-0-9.]+,[-0-9.]+,([-0-9.]+):(\d)\]")
+    $zc = [regex]::Match($prb, "\[PRB:[-0-9.]+,[-0-9.]+,([-0-9.]+)(,[-0-9.]+)*:(\d)\]")
     $contacts = @(Select-String -Path $log -Pattern "PROBE CONTACT").Count
     "  G38.2 answered: $(($prb -replace '\s+', ' ').Trim()); stats: " + (($r.Stats.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join " ")
     Check (@($r.Frames | Where-Object { $_.op -eq 12 }).Count -eq 2) "ArmProbe (0x0C) sent for each G38.2"
     Check ($contacts -eq 1) "controller stopped by itself on contact"
-    Check ($zc.Success -and $zc.Groups[2].Value -eq "1" -and [math]::Round([double]$zc.Groups[1].Value * $spm[2]) -eq -500) "probe position from the controller's latch, to the step (PRB Z=$($zc.Groups[1].Value))"
+    Check ($zc.Success -and $zc.Groups[3].Value -eq "1" -and [math]::Round([double]$zc.Groups[1].Value * $spm[2]) -eq -500) "probe position from the controller's latch, to the step (PRB Z=$($zc.Groups[1].Value))"
     Check ([math]::Round($atContact[2] * $spm[2]) -eq -500) "grblHAL position after probing = where the controller stopped (Z=$($atContact[2]))"
     Check ([math]::Round(($up[2] - $atContact[2]) * $spm[2]) -eq [math]::Round(5 * $spm[2])) "move after probing starts from there"
     Check ($out -match "ALARM:5") "no contact: ALARM:5 (probe fail, no contact)"
     Check ([math]::Round($noContact[2] * $spm[2]) -eq $r.Final[2]) "no contact: whole move run, grblHAL and controller agree (Z=$($r.Final[2]) steps)"
     Check ($r.Stats.rejected -eq 0 -and $r.Stats.seq_errors -eq 0) "no rejected slice, no sequence error"
     Check ($err -notmatch "POSITION MISMATCH") "no position mismatch ($(([regex]::Match($err, 'position checks[^\r\n]*')).Value))"
+}
+
+function Test-Mach3 {
+    "=== mach3: machine profile -> grblHAL settings and controller configuration; settings changes -> profile"
+    $dir = Join-Path $OutDir "mach3"
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    Remove-Item (Join-Path $dir "MACH3.xml*") -ErrorAction SilentlyContinue
+    $src = Join-Path $PSScriptRoot "mach3_test.xml"; $xml = Join-Path $dir "MACH3.xml"; $log = Join-Path $dir "fake.log"
+    Copy-Item $src $xml
+    foreach ($i in 1..11) { Set-Content (Join-Path $dir ("MACH3.xml.2000-01-{0:D2}_00-00-00.bak" -f $i)) "old" }   # only 10 must stay
+    $tag = { param($name) [regex]::Match([IO.File]::ReadAllText($xml), "<$name>([^<]*)</$name>").Groups[1].Value }
+
+    # 1. Start-up from the profile, then settings changed by the sender
+    $s = Start-Sim "-f `"$log`" --mach3 `"$xml`"" $dir ($Port + 9)
+    try {
+        $set = Invoke-Line $s '$$'
+        foreach ($l in '$100=802', '$110=900', '$27=1') { Invoke-Line $s $l | Out-Null }
+        Start-Sleep -Seconds 4      # written 2 s after the last change
+    } finally { Stop-Sim $s }
+    $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
+    $val = { param($id) [regex]::Match($set, "(?m)^\`$$id=([-0-9.]+)").Groups[1].Value }
+    $got = (@(100, 101, 102, 103, 110, 112, 120, 121, 130, 131, 132, 2, 3, 20, 22, 23, 27, 30, 190, 192) | ForEach-Object { "`$$_=$(& $val $_)" }) -join " "
+    "  settings: $got"
+    Check ([double](& $val 100) -eq 801.5 -and [double](& $val 101) -eq 806.5 -and [math]::Abs([double](& $val 102) - 803.9) -lt 0.001) "steps/mm from Steps0..2"
+    Check ([double](& $val 110) -eq 799.8 -and [double](& $val 112) -eq 499.98 -and [double](& $val 121) -eq 35) "max rates from Vel0..2 (mm/s x 60), accelerations from Acc0..2"
+    Check ([double](& $val 130) -eq 285 -and [double](& $val 131) -eq 376 -and [double](& $val 132) -eq 50) "max travel from the soft limits (Max - Min)"
+    Check ((& $val 2) -eq "15" -and (& $val 3) -eq "8" -and (& $val 20) -eq "1" -and (& $val 22) -eq "515" -and (& $val 23) -eq "0") "step/dir inversion, soft limits, homing on (single axis, per-axis rates), homing direction"
+    Check ([double](& $val 190) -eq 639.8 -and [double](& $val 192) -eq 400 -and [double](& $val 27) -eq 0.5 -and [double](& $val 30) -eq 24000) "homing seek = RefSpeed % of the max rate, pull-off from the plugin, spindle max from the pulley"
+    $cfg = Select-String -Path $log -Pattern "op=0x0F .*" | Select-Object -First 1
+    Check ($cfg.Line -match "khz=100 slice_ms=5 invert=0x8F pins=00730073007300701200") "configuration frame identical to Mach3's (invert 0x8F, 100 kHz, pins)"
+    Check ((& $tag "Steps0") -eq "802." -and (& $tag "Vel0") -eq "15." -and (& $tag "XPullOff") -eq "1.000" -and (& $tag "RefSpeed0") -eq "71") "changed settings written back (Steps0=802. Vel0=15. XPullOff=1.000, RefSpeed0=71 keeps the homing speed)"
+    $norm = { param($bytes) [regex]::Replace([Text.Encoding]::GetEncoding(28591).GetString($bytes), "<(Steps0|Vel0|RefSpeed0|XPullOff|YPullOff|ZPullOff)>[^<]*<", '<$1>#<') }
+    Check ((& $norm ([IO.File]::ReadAllBytes($src))) -eq (& $norm ([IO.File]::ReadAllBytes($xml)))) "every other byte of the profile unchanged (Latin-1 accent, layout, other tags)"
+    $baks = @(Get-ChildItem $dir -Filter "MACH3.xml.*.bak" | Sort-Object Name)
+    Check ($baks.Count -eq 10 -and [Linq.Enumerable]::SequenceEqual([IO.File]::ReadAllBytes($baks[-1].FullName), [IO.File]::ReadAllBytes($src))) "one backup of the previous file, the 10 most recent kept ($($baks.Count))"
+    Check (@([regex]::Matches($err, "profile updated")).Count -eq 1) "one write for the batch of 3 changes"
+
+    # 2. Restart from the updated profile: the changed settings come back, nothing is written
+    $s = Start-Sim "-f `"$log`" --mach3 `"$xml`"" $dir ($Port + 9)
+    try {
+        $set = Invoke-Line $s '$$'
+        Start-Sleep -Seconds 3
+        # 3. The file is changed on disk while the bridge runs: it must not be overwritten
+        Add-Content $xml "<!-- edited by hand -->"
+        Invoke-Line $s '$100=803' | Out-Null
+        Start-Sleep -Seconds 4
+    } finally { Stop-Sim $s }
+    $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
+    Check ([double](& $val 100) -eq 802 -and [double](& $val 110) -eq 900 -and [double](& $val 27) -eq 1) "restart: settings read back from the updated profile (round trip)"
+    Check ($err -match "changed on disk" -and (& $tag "Steps0") -eq "802.") "profile changed on disk meanwhile: not overwritten, reported"
+
+    # 4. No profile: refused, with a message saying what to do
+    $p = Start-Process $script:SimExe -ArgumentList "-n -f `"$log`" --mach3 `"$dir\missing.xml`"" -PassThru -Wait -WindowStyle Hidden `
+            -RedirectStandardOutput (Join-Path $dir "missing_stdout.txt") -RedirectStandardError (Join-Path $dir "missing_stderr.txt")
+    $msg = Get-Content (Join-Path $dir "missing_stdout.txt") -Raw
+    Check ($p.ExitCode -ne 0 -and $msg -match "no Mach3 profile") "missing profile: refused ($(($msg -replace '\s+', ' ').Trim()))"
 }
 
 if ($Scenario -in "motion", "all") { Test-Motion }
@@ -355,5 +411,6 @@ if ($Scenario -in "outputs", "all") { Test-Outputs }
 if ($Scenario -in "pins", "all") { Test-Pins }
 if ($Scenario -in "home", "all") { Test-Home }
 if ($Scenario -in "probe", "all") { Test-Probe }
+if ($Scenario -in "mach3", "all") { Test-Mach3 }
 
 if ($script:failures -eq 0) { "RESULT: PASS"; exit 0 } else { "RESULT: FAIL ($script:failures)"; exit 1 }

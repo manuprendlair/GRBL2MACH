@@ -118,6 +118,8 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc
 cmake --build build
 ```
 
+The simulator is built with 4 axes (X, Y, Z, A), the controller's; the upstream simulator builds 3.
+
 (`-G "MinGW Makefiles"` works too.) A MinGW-only workaround for a `strset()` name clash between
 the grblHAL core and MinGW's `<string.h>` is applied automatically, see `cmake/mingw_strset_fix.h`.
 
@@ -135,10 +137,13 @@ GRBL2MACH adds these options to the simulator (all other options are described i
 
 ```
 grblHAL_sim -o <slice file>    write 5 ms step slices (CSV) to a file
-grblHAL_sim -u                 drive the RNR Eco Motion USB controller
+grblHAL_sim -u                 drive the RNR Eco Motion USB controller (needs MACH3.xml, see below)
 grblHAL_sim -f <log file>      drive a fake RNR controller (tests), logging every frame
 grblHAL_sim -l <address>       address to listen on with -p (default 127.0.0.1)
 grblHAL_sim --no-irq-lock      let simulated interrupts run concurrently with the core (upstream)
+grblHAL_sim --mach3 <file>     the machine's Mach3 profile (default: MACH3.xml next to the program)
+
+options overriding what the Mach3 profile describes (trials, tests):
 grblHAL_sim --rnr-invert <hex> step/direction inversion sent to the controller (default 0)
 grblHAL_sim --rnr-out spindle=1,ccw=0,flood=0,mist=0   controller outputs (default: spindle on OUT1)
 grblHAL_sim --rnr-in xhome=3low,...,probe=2            controller inputs (as Mach3's Input Signals page)
@@ -168,10 +173,10 @@ grblHAL_sim -n -p 23023 -o slices.csv
 Each CSV line is `index,t_s,dx,dy,dz,da,out,pwm` (slice number, start time in seconds, signed steps
 per axis, outputs bitmask: 1 spindle, 2 counter-clockwise, 4 flood, 8 mist; spindle PWM in 1/1000). The last line gives the totals.
 
-> `-u` has had **two short hardware tests** (connection, small moves, reset, e-stop input): frames
-> identical to Mach3's (short reports go out as 9-byte transfers), step counts exact, e-stop input
-> stopping the board by itself once declared in the configuration frame, home and probe inputs seen
-> by grblHAL. Homing and probing through the board are tested against the fake controller only.
+> `-u` has been tested on the reference machine: frames identical to Mach3's (short reports go out
+> as 9-byte transfers), step counts exact, reset, e-stop input stopping the board by itself,
+> homing (`$HZ`, `$H` at Mach3's rates, repeatable to 0.01 mm) and probing (`G38.2`, position
+> latched by the board). Not yet: a full session driven by gSender.
 
 `--rnr-in` declares the board's inputs as Mach3's *Ports & Pins > Input Signals* page does (port 3
 pin n = IN n): `x+`, `x-`, `xhome` (same for `y`, `z`, `a`), `probe` and `estop`, each `=<n>` (0 = not
@@ -195,6 +200,56 @@ changing); the `pins` test checks it against 15 of those frames.
 
 On Windows the console input only reads the keyboard: type commands in the console window, or
 connect over TCP (`-p`). Piping commands into stdin does not work.
+
+## Machine profile (Mach3 XML)
+
+GRBL2MACH takes the machine's description from its **Mach3 profile**: the `.xml` file Mach3 keeps
+in its folder (for example `C:\Mach3\MACH3_CNCX.xml`). **Copy it next to `grblHAL_sim` and name it
+`MACH3.xml`** (or give its path with `--mach3`). Driving the real controller (`-u`) is refused
+without it; the fake controller (`-f`) uses one only with `--mach3`. The copy is GRBL2MACH's own:
+it is never looked for in Mach3's folder, and providing it is the user's responsibility.
+
+- **At start-up**, the profile is the reference: grblHAL's settings it describes are set from it
+  (the log shows each one that changed) and the controller is configured from it (inputs, outputs,
+  step/direction inversion, pulse rate). With the reference machine's profile, the configuration
+  frame is byte for byte the one Mach3 sends.
+- **Settings changed afterwards** (from gSender or any sender) are written back to the profile, 2 s
+  after the last change, as one batch. Only the values of the tags concerned are replaced; every
+  other byte stays as it was, so Mach3 can still read the file. A timestamped backup is made
+  before each write (`MACH3.xml.2026-11-08_15-32-10.bak`, the 10 most recent kept). If the file was
+  changed on disk while the bridge ran, it is not overwritten (the log says so).
+- Refused with an explicit message: axes not mapped X-0 Y-1 Z-2 A-3 (`AxisToMotor`), inputs on
+  another port than the controller's (port 3), the controller plugin's *Multi-Step Speed*.
+- The profile holds the user's file paths (recent files): do not publish it.
+
+Mapping (↔: written back when changed in grblHAL; →: read only, no grblHAL setting matches):
+
+| Mach3 profile tag | Mach3 page | grblHAL / bridge | |
+|---|---|---|---|
+| `Steps0..3` | Motor Tuning, *Steps per* | `$100`-`$103` | ↔ |
+| `Vel0..3` (units/s) | Motor Tuning, *Velocity* | `$110`-`$113` (× 60, units/min) | ↔ |
+| `Acc0..3` | Motor Tuning, *Acceleration* | `$120`-`$123` | ↔ |
+| `M0..3Max`, `M0..3Min` | Home/SoftLimits, *Soft Max / Min* | `$130`-`$133` = Max - Min (Min written back) | ↔ |
+| `SoftLimit` | soft limits on/off | `$20` | ↔ |
+| `Motor0..3StepNeg` | Motor Outputs, *Step Low Active* | `$2`, controller step polarity | ↔ (controller: at next start) |
+| `Motor0..3DirNeg` | Motor Outputs, *Dir Low Active* | `$3`, controller direction | ↔ (controller: at next start) |
+| `M0..3Neg` | Home/SoftLimits, *Home Neg* | `$23` (homing direction) | ↔ |
+| `RefSpeed0..3` (%) | Home/SoftLimits, *Speed %* | `$190`-`$193` = % × max rate | ↔ (rounded to 1 %) |
+| `XPullOff`, `YPullOff`, `ZPullOff` | controller plugin, *Pull off* | `$27` (largest) | ↔ (written to all three) |
+| `SPEEDn`, `LSPEEDn` (`PULLEY` = n - 1), `SpindleRatio` | Spindle Setup pulleys, plugin *Calibration* | `$30`, `$31` = speed / Calibration | ↔ |
+| `Input0..11` | Input Signals, X++ X-- X Home ... A Home | controller inputs (`--rnr-in`) | → |
+| `Input22`, `Input25` | Input Signals, Probe, EStop | controller inputs (`--rnr-in probe`, `--rnr-estop-in`) | → |
+| `SpinCW`, `SpinCCW`, `Flood`, `Mist`, `NoFlood`, `NoSpindle`, `Output7..10` | Spindle Setup, Output Signals | controller outputs (`--rnr-out`) | → |
+| `PulseRates` | controller plugin, *Frequency of Pulse Output* | controller pulse rate | → |
+| `Units` | — | inch profiles converted to mm (A stays in degrees) | → |
+| `AxisToMotor0..3`, `MultiStep` | — | checked (refused if unsupported) | → |
+| `Debounce`, `LookAhead`, `G20X/Y/Z` (G28 position) | General Config | logged only | → |
+
+Not in the profile, set once then left to the sender: `$22` gets homing, single axis homing
+commands and per-axis rates on (`515`, other bits kept); on the first start, homing cycles
+`$44`=Z, `$45`=X, `$46`=Y (Mach3's *Ref All* order, one axis per cycle) and slow approach
+`$180`-`$183` = 45 mm/min (as measured with Mach3). grblHAL settings with no Mach3 equivalent
+(`$11`, `$24`, `$26`...) stay in grblHAL's own settings file.
 
 ## Tests
 
@@ -234,6 +289,10 @@ The fake controller behaves like the real board as seen in the Mach3 captures (s
   switch, ending exactly at switch minus pull-off; grblHAL and board agree afterwards;
 - `probe`: `G38.2` with contact (probe position = the board's latch, to the step; grblHAL resynced
   to where the board stopped) and without contact (ALARM:5, whole move run).
+- `mach3`: start from a synthetic profile (`tests/mach3_test.xml`, the reference machine's values):
+  grblHAL settings and configuration frame as expected; settings changed by the sender written
+  back in one batch, every other byte unchanged, one backup, 10 kept; restart reads them back; a
+  profile changed on disk is not overwritten; a missing profile is refused.
 - `pins`: the configuration frame's input bytes computed from `--rnr-in` must equal the frames Mach3
   sent for the same settings (15 variants captured on the real board).
 
@@ -277,7 +336,7 @@ powershell -File tests\run_fake_board.ps1 -Scenario all
 4. ~~USB captures of Mach3 driving the same machine; bridge aligned on them.~~ Done.
 5. Homing and probing using the controller's hardware stop and latch: done against the fake
    controller; next, on the reference machine.
-6. ~~Spindle and outputs.~~ Done (against the fake controller). Mach3 XML profile importer.
+6. ~~Spindle and outputs.~~ Done (against the fake controller). ~~Mach3 XML profile importer.~~ Done.
 
 ## Safety
 

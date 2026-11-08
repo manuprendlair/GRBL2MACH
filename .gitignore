@@ -40,3 +40,9 @@ build*
 # run output
 *.out
 *.DAT
+# GRBL2MACH: never publish the vendor's plugin nor a user's machine profile (it holds their file paths)
+RnRMotion*.dll
+*.dll
+MACH3.xml
+MACH3.xml.*.bak
+MACH3.xml.tmp

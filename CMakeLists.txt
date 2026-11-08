@@ -19,6 +19,8 @@ if(MINGW)
 endif()
 
 add_compile_definitions(F_CPU=16000000)
+# GRBL2MACH: X, Y, Z and A, the four axes of the RNR controller (the upstream simulator builds 3)
+add_compile_definitions(N_AXIS=4)
 #add_compile_definitions(SQUARING_ENABLED=1)
 
 # Capture the effective build-time flags for the -v/--version output.
@@ -84,6 +86,7 @@ add_executable(grblHAL_sim
     src/grbl_interface.c
 	src/fs_posix.c
     src/slicer.c
+    src/mach3.c
     src/irq_lock.c
     src/sink_file.c
     src/rnr/rnr_protocol.c
