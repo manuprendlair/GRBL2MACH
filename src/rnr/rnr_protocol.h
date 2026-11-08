@@ -25,6 +25,7 @@
 #define RNR_IN_BYTES  49    // controller -> PC, report ID included
 #define RNR_AXES      4
 #define RNR_PWM_PERIOD 1000 // SpindlePwm period: Mach3 always sends 1000
+#define RNR_PIN_BYTES  10   // Configure buf[5..14]: input pins
 
 #define RNR_FRAME_SHORT    0x02 // report ID 2: 8 data bytes
 #define RNR_FRAME_EXTENDED 0x03 // report ID 3: 26 data bytes
@@ -83,9 +84,11 @@ typedef struct {
     uint8_t pulse_khz;          // 1..100 (Mach3: <RnRMotion><PulseRates>)
     uint8_t slice_ms;           // 5, as Mach3 configures it
     uint8_t step_dir_invert;    // bits 0-3: step active low X..A, bits 4-7: dir active low X..A
-    // Pin assignments (limits, home, probe) are left at 0 (disabled) for now. Mach3 encodes
-    // them in buf[5..14]: one (limit, home) byte pair per axis, then probe; low nibble = input
-    // number, 0x20 = active low (to be confirmed).
+    // buf[5..14], input pins as Mach3 encodes them: one (limit, home) byte pair per axis, then
+    // probe; low nibble = input number, other bits to be decoded. Example (reference machine,
+    // homes on IN3 active low, probe on IN2): 00 73 00 73 00 73 00 70 12 00. The controller stops
+    // on its e-stop input (IN1) by itself only with pins declared here.
+    uint8_t pins[RNR_PIN_BYTES];
 } rnr_config_t;
 
 void rnr_build_short (uint8_t buf[RNR_OUT_BYTES], rnr_opcode_t op, uint16_t seq, uint8_t arg5, uint8_t arg6);

@@ -22,6 +22,9 @@
   Environment (times in ms after the first slice):
     GRBL2MACH_FAKE_SILENT_MS=<n>         stop reporting (watchdog test)
     GRBL2MACH_FAKE_ESTOP_MS=<on>,<off>   press the e-stop input at <on>, release at <off>
+    GRBL2MACH_FAKE_ESTOP_SELF=1          the controller stops by itself on the e-stop input (as it
+                                         does with Mach3's pin configuration); by default it only
+                                         reports the input (IN1), as with no input pins configured
 
   Part of GRBL2MACH. GPL-3.0-or-later.
 */
@@ -59,6 +62,7 @@ typedef struct {
     int idle_in_run;    // empty periods since the last executed slice of the open run
     uint64_t first_slice_us;
     int64_t silent_ms, estop_on_ms, estop_off_ms;
+    bool estop_self;    // stops by itself on the e-stop input (else only reports it)
 } fake_t;
 
 static double ms (fake_t *f, uint64_t t)
@@ -112,11 +116,15 @@ static void update_estop_input (fake_t *f, uint64_t now)
     int64_t t = (int64_t)(now - f->first_slice_us) / 1000;
     bool active = t >= f->estop_on_ms && t < f->estop_off_ms;
 
-    if(active && !f->estop_input) {
+    if(active && !f->estop_input && f->estop_self) {
         fprintf(f->log, "%10.3f E-STOP INPUT pressed: halted pos=%d,%d,%d,%d dropped=%d\n",
                  ms(f, now), f->live[0], f->live[1], f->live[2], f->live[3], f->count);
         f->state = RnrState_EStop;
         f->count = 0;
+        f->estops++;
+    } else if(active && !f->estop_input) {
+        fprintf(f->log, "%10.3f E-STOP INPUT pressed (reported only): pos=%d,%d,%d,%d buffered=%d\n",
+                 ms(f, now), f->live[0], f->live[1], f->live[2], f->live[3], f->count);
         f->estops++;
     } else if(!active && f->estop_input)
         fprintf(f->log, "%10.3f E-STOP INPUT released\n", ms(f, now));
@@ -169,7 +177,7 @@ static int fake_write (rnr_transport_t *t, const uint8_t b[RNR_OUT_BYTES])
             break;
 
         case RnrOp_ClearEStop:
-            if(f->estop_input)
+            if(f->estop_input && f->estop_self)
                 fprintf(f->log, " IGNORED (e-stop input active)");
             else if(f->state == RnrState_EStop)
                 f->state = RnrState_Ready;
@@ -209,6 +217,9 @@ static int fake_write (rnr_transport_t *t, const uint8_t b[RNR_OUT_BYTES])
 
         case RnrOp_Configure:
             fprintf(f->log, " khz=%u slice_ms=%u invert=0x%02X", b[16], b[17], b[15]);
+            fprintf(f->log, " pins=");
+            for(int i = 5; i <= 14; i++)
+                fprintf(f->log, "%02X", b[i]);
             if(b[17])
                 f->slice_us = b[17] * 1000u;
             break;
@@ -292,7 +303,7 @@ static int fake_read (rnr_transport_t *t, uint8_t rx[RNR_IN_BYTES], uint32_t tim
     memset(rx, 0, RNR_IN_BYTES);
     rx[0] = 0x01;
     rx[1] = f->state;
-    rx[2] = 0x81 | (f->estop_input ? RNR_FAULT_ESTOP : 0);
+    rx[2] = 0x81 | (f->estop_input && f->estop_self ? RNR_FAULT_ESTOP : 0);
     rnr_put_le16(&rx[3], f->ack_seq);
     for(int a = 0; a < RNR_AXES; a++)
         rnr_put_le32(&rx[9 + a * 8], (uint32_t)f->live[a]);
@@ -321,6 +332,8 @@ static void parse_estop_env (fake_t *f)
     const char *e = getenv("GRBL2MACH_FAKE_ESTOP_MS");
     long long on, off;
 
+    const char *self = getenv("GRBL2MACH_FAKE_ESTOP_SELF");
+    f->estop_self = self && *self == '1';
     f->estop_on_ms = f->estop_off_ms = -1;
     if(e && sscanf(e, "%lld,%lld", &on, &off) == 2 && on >= 0 && off > on) {
         f->estop_on_ms = on;

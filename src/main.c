@@ -71,7 +71,7 @@ static const char *fake_log = NULL;             // -f
 static bool use_usb = false;                    // -u
 static bool speedup_given = false;
 static bool irq_lock_on = true;                 // --no-irq-lock
-static rnr_options_t rnr_opt = { .spindle_out = 1 };  // --rnr-invert, --rnr-out
+static rnr_options_t rnr_opt = { .spindle_out = 1, .estop_in = 1 };  // --rnr-invert, --rnr-out, --rnr-estop-in
 
 // --rnr-out spindle=1,ccw=0,flood=2,mist=0
 static bool parse_rnr_outputs (const char *arg)
@@ -120,6 +120,10 @@ void print_usage(const char* badarg)
       "    --rnr-out <function>=<n>[,...] : GRBL2MACH: controller output OUT<n> (1-4, 0 = none) driven by\n"
       "                         spindle (M3/M4), ccw (M4, when apart from spindle), flood (M8), mist (M7).\n"
       "                         Default spindle=1 (Mach3 Spindle CW on OUT1), coolant on no output.\n"
+      "    --rnr-pins <20 hex digits> : GRBL2MACH: controller input pins (configuration frame bytes 5-14), as\n"
+      "                         Mach3 sends them, e.g. 00730073007300701200. Default all 0 (no pins).\n"
+      "    --rnr-estop-in <n>[low] : GRBL2MACH: controller input IN<n> watched as e-stop (0 = none; \"low\":\n"
+      "                         active low, e.g. 1low). Default 1 (active high, as Mach3's EStop on port 3 pin 1).\n"
 	  "    -d <directory>     : directory to mount as local filing system.\n"
       "    -c<comment_char>   : character to print before each line from grbl.  default = '#'\n"
       "    -n                 : no comments before grbl response lines.\n"
@@ -306,6 +310,35 @@ int main(int argc, char *argv[])
 
             if (!strcmp(argv[0], "--no-irq-lock")) {
                 irq_lock_on = false;
+                continue;
+            }
+
+            if (!strcmp(argv[0], "--rnr-pins") && argc > 1) {
+                argv++; argc--;
+                const char *h = *argv;
+                bool ok = strlen(h) == 2 * sizeof(rnr_opt.pins);
+                for (size_t i = 0; ok && i < sizeof(rnr_opt.pins); i++) {
+                    char byte[3] = { h[2 * i], h[2 * i + 1], 0 }, *end;
+                    rnr_opt.pins[i] = (uint8_t)strtoul(byte, &end, 16);
+                    ok = *end == 0;
+                }
+                if (!ok) {
+                    print_usage(*argv);
+                    exit(-1);
+                }
+                continue;
+            }
+
+            if (!strcmp(argv[0], "--rnr-estop-in") && argc > 1) {
+                argv++; argc--;
+                char *end;
+                unsigned long n = strtoul(*argv, &end, 10);
+                if (end == *argv || n > 16 || (*end && strcmp(end, "low"))) {
+                    print_usage(*argv);
+                    exit(-1);
+                }
+                rnr_opt.estop_in = (uint8_t)n;
+                rnr_opt.estop_in_active_low = *end != 0;
                 continue;
             }
 

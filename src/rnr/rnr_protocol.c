@@ -68,7 +68,7 @@ void rnr_build_positions (uint8_t buf[RNR_OUT_BYTES], uint16_t seq, const int32_
 void rnr_build_configure (uint8_t buf[RNR_OUT_BYTES], uint16_t seq, const rnr_config_t *cfg)
 {
     header(buf, RNR_FRAME_EXTENDED, RnrOp_Configure, seq);
-    // buf[5..14]: limit / home / probe pins, all disabled (0) for now
+    memcpy(&buf[5], cfg->pins, RNR_PIN_BYTES);
     buf[15] = cfg->step_dir_invert;
     buf[16] = cfg->pulse_khz;
     buf[17] = cfg->slice_ms;

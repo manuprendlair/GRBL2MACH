@@ -169,6 +169,7 @@ static int send_configure (rnr_sink_t *s)
 {
     uint8_t buf[RNR_OUT_BYTES];
     rnr_config_t cfg = { .pulse_khz = 100, .slice_ms = SLICE_MS, .step_dir_invert = s->opt.step_dir_invert };
+    memcpy(cfg.pins, s->opt.pins, RNR_PIN_BYTES);
 
     rnr_build_configure(buf, 0, &cfg);
 
@@ -250,16 +251,23 @@ static bool arm (rnr_sink_t *s, const rnr_status_t *st)
 static void on_status (rnr_sink_t *s, const rnr_status_t *st, uint64_t now)
 {
     bool covered = (int16_t)(st->ack_seq - s->seq) >= 0;    // every frame sent so far taken over
-    bool estop_input = (st->fault_flags & RNR_FAULT_ESTOP) != 0;
+    // E-stop input, read by the bridge itself in the raw inputs: the controller stops on its own
+    // only when its configuration frame declares input pins (as Mach3's does). Without that it
+    // just reports the input, and Mach3 is what stops it (EStop frame), so the bridge does too.
+    bool input_pressed = s->opt.estop_in &&
+                          !!(st->inputs & (1u << (s->opt.estop_in - 1))) != s->opt.estop_in_active_low;
+    bool estop_input = (st->fault_flags & RNR_FAULT_ESTOP) != 0 || input_pressed;
     bool armed_seen = s->armed && (int16_t)(st->ack_seq - s->arm_seq) >= 0;
 
-    // The controller stopped by itself on its e-stop input: it dropped its buffer and must be
-    // re-armed. A press shorter than a status period shows only as the disarm.
+    // E-stop: stop the controller at once (it drops its buffer) and re-arm it before the next
+    // motion. A press shorter than a status period may show only as the controller's disarm.
     if(estop_input || (armed_seen && st->state == RnrState_EStop)) {
         if(s->armed) {
+            send_short(s, RnrOp_EStop, 0);
+            outputs_off(s);
             s->estops_seen++;
-            fprintf(stderr, "[rnr] controller e-stop%s: stopped at X=%d Y=%d Z=%d A=%d\n",
-                     estop_input ? "" : " (seen as a disarm)",
+            fprintf(stderr, "[rnr] controller e-stop%s at X=%d Y=%d Z=%d A=%d: e-stop sent\n",
+                     estop_input ? " input" : " (seen as a disarm)",
                      st->live_steps[0], st->live_steps[1], st->live_steps[2], st->live_steps[3]);
             s->armed = false;
             end_motion(s);

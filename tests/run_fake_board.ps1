@@ -162,10 +162,12 @@ function Test-Reset {
     Check ($err -match "position checks after runs: \d+ ok, 0 mismatch") "position check after the extra move"
 }
 
-function Test-EStop {
-    "=== estop: the controller's e-stop input is pressed 500 ms into a move, released 1 s later"
-    $dir = Join-Path $OutDir "estop"; $log = Join-Path $dir "fake.log"
-    $s = Start-Sim "-f `"$log`"" $dir ($Port + 3) @{ GRBL2MACH_FAKE_ESTOP_MS = "500,1500" }
+function Test-EStop([bool]$Self) {
+    $mode = if ($Self) { "the controller stops by itself (Mach3 pin configuration)" } else { "the controller only reports the input (seen on the real board)" }
+    "=== estop: the e-stop input (IN1) is pressed 500 ms into a move, released 1 s later; $mode"
+    $dir = Join-Path $OutDir $(if ($Self) { "estop_self" } else { "estop" }); $log = Join-Path $dir "fake.log"
+    $fakeEnv = @{ GRBL2MACH_FAKE_ESTOP_MS = "500,1500" }; if ($Self) { $fakeEnv.GRBL2MACH_FAKE_ESTOP_SELF = "1" }
+    $s = Start-Sim "-f `"$log`"" $dir ($Port + $(if ($Self) { 5 } else { 3 })) $fakeEnv
     try {
         $spm = Get-StepsPerMm $s
         Invoke-Line $s '$X' | Out-Null
@@ -181,14 +183,17 @@ function Test-EStop {
     } finally { Stop-Sim $s }
     $r = Read-FakeLog $log
     $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
-    $pressed = Select-String -Path $log -Pattern "E-STOP INPUT pressed: halted pos=(-?\d+)" | Select-Object -First 1
-    $haltedX = [int]$pressed.Matches[0].Groups[1].Value
+    $pressed = Select-String -Path $log -Pattern "E-STOP INPUT pressed" | Select-Object -First 1
     $tPress = [double]($pressed.Line.Trim() -split " ")[0]
+    $estop = $r.Frames | Where-Object { $_.op -eq 1 -and $_.t -gt $tPress } | Select-Object -First 1
+    $haltedX = [int]([regex]::Match($estop.rest, "halted pos=(-?\d+)").Groups[1].Value)
+    $delay = [math]::Round($estop.t - $tPress)
     $one = [math]::Round(1 * $spm[0])
     $alarms = ([regex]::Matches($out, 'ALARM:\d+') | ForEach-Object { $_.Value }) -join ", "
     Check ($out -match "ALARM:10") "grblHAL raised ALARM:10 (e-stop); alarms seen: $alarms"
     Check ($whilePressed -match "<Alarm") "grblHAL in Alarm while the input is pressed"
-    Check ($err -match "controller e-stop: stopped at X=$haltedX") "bridge saw the controller e-stop at X=$haltedX"
+    Check ($err -match "controller e-stop input at X=") "bridge saw the e-stop input"
+    Check ($delay -le 120) "bridge sent EStop (0x01) $delay ms after the press, controller halted at X=$haltedX"
     $lateSlices = @($r.Frames | Where-Object { $_.op -eq 4 -and $_.t -gt $tPress -and $_.t -lt $tPress + 1500 }).Count
     Check ($lateSlices -le 20) "slices stopped after the e-stop ($lateSlices sent before the bridge saw it, rejected by the controller)"
     Check ([math]::Round($afterReset[0] * $spm[0]) -eq $haltedX) "grblHAL position after reset = where the controller stopped ($([math]::Round($afterReset[0] * $spm[0])) / $haltedX steps)"
@@ -244,7 +249,7 @@ function Test-Outputs {
 if ($Scenario -in "motion", "all") { Test-Motion }
 if ($Scenario -in "watchdog", "all") { Test-Watchdog }
 if ($Scenario -in "reset", "all") { Test-Reset }
-if ($Scenario -in "estop", "all") { Test-EStop }
+if ($Scenario -in "estop", "all") { Test-EStop $false; Test-EStop $true }
 if ($Scenario -in "outputs", "all") { Test-Outputs }
 
 if ($script:failures -eq 0) { "RESULT: PASS"; exit 0 } else { "RESULT: FAIL ($script:failures)"; exit 1 }
