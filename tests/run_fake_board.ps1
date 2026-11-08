@@ -1,4 +1,4 @@
-# run_fake_board.ps1 - RNR sink tests against the fake controller (GRBL2MACH, plan step C)
+﻿# run_fake_board.ps1 - RNR sink tests against the fake controller (GRBL2MACH, plan step C)
 #
 # Scenarios:
 #   motion   : runs a G-code program, then checks the fake controller log: frame sequence
@@ -18,7 +18,7 @@
 #                       [-GCode "G21 G91 G1 X10 F600"] [-Expect "2500,0,0"] [-OutDir folder] [-Immediate]
 
 param(
-    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "all")] [string]$Scenario = "all",
+    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "home", "probe", "all")] [string]$Scenario = "all",
     [string]$GCode = "G21 G91 G1 X10 F600",
     [string]$Expect = "2500,0,0",
     [string]$OutDir = "$env:TEMP\grbl2mach_fake",
@@ -280,11 +280,80 @@ function Test-Pins {
     }
 }
 
+function Test-Home {
+    "=== home: `$H with one axis per cycle (Z, X, Y), home switches on one input (IN3, active low) with 0.4 mm hysteresis, pull-off 0.5 mm"
+    $dir = Join-Path $OutDir "home"; $log = Join-Path $dir "fake.log"
+    $sw = @(2000, 1500, 1000)          # switch positions, steps (homes at the positive end)
+    $s = Start-Sim "-f `"$log`" --rnr-in xhome=3low,yhome=3low,zhome=3low,probe=2" $dir ($Port + 7) @{ GRBL2MACH_FAKE_HOME = "$($sw[0]),$($sw[1]),$($sw[2]),99999999"; GRBL2MACH_FAKE_HOME_HYST = "120" }
+    try {
+        $spm = Get-StepsPerMm $s
+        foreach ($l in '$22=1', '$23=0', '$44=4', '$45=1', '$46=2', '$24=50', '$25=300', '$27=0.5') { Invoke-Line $s $l | Out-Null }
+        $out = Invoke-Line $s '$H'
+        $homed = Get-MPos (Wait-State $s "Idle" 60000)
+        Invoke-GCode $s "G21 G91 G1 X-1 Y-2 Z-3 F300"
+        $moved = Get-MPos (Wait-State $s "Idle")
+    } finally { Stop-Sim $s }
+    $r = Read-FakeLog $log
+    $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
+    $pull = @(0, 1, 2) | ForEach-Object { [math]::Round(0.5 * $spm[$_]) }
+    $arms = @($r.Frames | Where-Object { $_.op -eq 13 } | ForEach-Object { [int]([regex]::Match($_.rest, "axis=(\d)").Groups[1].Value) })
+    $jogs = @($r.Frames | Where-Object { $_.op -eq 10 }).Count
+    $switches = @(Select-String -Path $log -Pattern "HOME SWITCH").Count
+    $homeFrames = $r.Frames | Where-Object { $_.t -ge ($r.Frames | Where-Object { $_.op -eq 13 } | Select-Object -First 1).t -and $_.t -le ($r.Frames | Where-Object { $_.op -eq 10 } | Select-Object -Last 1).t }
+    "  `$H answered: $(($out -replace '\s+', ' ').Trim()); ArmHome axes: $($arms -join ','); stats: " + (($r.Stats.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join " ")
+    Check ($out -match "(?m)^ok") "`$H completed"
+    Check (($arms -join ",") -eq "2,2,0,0,1,1") "ArmHome (0x0D) for seek and locate, one axis at a time, Z then X then Y"
+    Check ($jogs -eq 6) "pull-offs as jogs (StartJog 0x0A): $jogs"
+    Check ($switches -eq 6) "controller stopped by itself on the switch 6 times (seek and locate per axis): $switches"
+    Check (@($homeFrames | Where-Object { $_.op -eq 4 }).Count -eq 0) "no program slice (0x04) during homing"
+    $exp = @(0, 1, 2) | ForEach-Object { $sw[$_] - $pull[$_] }
+    $fin = @(0, 1, 2) | ForEach-Object { $r.Final[$_] - [math]::Round(@(-1, -2, -3)[$_] * $spm[$_]) }
+    Check (($fin -join ",") -eq ($exp -join ",")) "controller ended homing exactly at switch - pull-off on every axis ($($fin -join ',') steps)"
+    $delta = @(0, 1, 2) | ForEach-Object { [math]::Round(($moved[$_] - $homed[$_]) * $spm[$_]) }
+    $expDelta = (@(0, 1, 2) | ForEach-Object { [math]::Round(@(-1, -2, -3)[$_] * $spm[$_]) }) -join ","
+    Check (($delta -join ",") -eq $expDelta) "move after homing: grblHAL and controller agree ($($delta -join ',') steps)"
+    Check ($r.Stats.rejected -eq 0 -and $r.Stats.seq_errors -eq 0 -and $r.Stats.overflows -eq 0) "no rejected slice, no sequence error"
+    Check ($err -match "mismatch" -and $err -notmatch "POSITION MISMATCH") "no position mismatch ($(([regex]::Match($err, 'position checks[^\r\n]*')).Value))"
+}
+
+function Test-Probe {
+    "=== probe: G38.2 with contact (probe at Z = -2 mm), then without contact (ALARM:5)"
+    $dir = Join-Path $OutDir "probe"; $log = Join-Path $dir "fake.log"
+    $s = Start-Sim "-f `"$log`" --rnr-in probe=2" $dir ($Port + 8) @{ GRBL2MACH_FAKE_PROBE_Z = "-500" }
+    try {
+        $spm = Get-StepsPerMm $s
+        Invoke-Line $s '$X' | Out-Null
+        $prb = Invoke-Line $s "G21 G91 G38.2 Z-10 F100"
+        $atContact = Get-MPos (Wait-State $s "Idle")
+        Invoke-GCode $s "G91 G0 Z5"
+        $up = Get-MPos (Wait-State $s "Idle")
+        Send-Sim $s "G91 G38.2 Z-1 F100`n"
+        $out = ""; for ($i = 0; $i -lt 50 -and $out -notmatch "ALARM:"; $i++) { Start-Sleep -Milliseconds 100; $out += Read-Sim $s }
+        $noContact = Get-MPos (Wait-State $s "Alarm" 5000)
+    } finally { Stop-Sim $s }
+    $r = Read-FakeLog $log
+    $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
+    $zc = [regex]::Match($prb, "\[PRB:[-0-9.]+,[-0-9.]+,([-0-9.]+):(\d)\]")
+    $contacts = @(Select-String -Path $log -Pattern "PROBE CONTACT").Count
+    "  G38.2 answered: $(($prb -replace '\s+', ' ').Trim()); stats: " + (($r.Stats.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join " ")
+    Check (@($r.Frames | Where-Object { $_.op -eq 12 }).Count -eq 2) "ArmProbe (0x0C) sent for each G38.2"
+    Check ($contacts -eq 1) "controller stopped by itself on contact"
+    Check ($zc.Success -and $zc.Groups[2].Value -eq "1" -and [math]::Round([double]$zc.Groups[1].Value * $spm[2]) -eq -500) "probe position from the controller's latch, to the step (PRB Z=$($zc.Groups[1].Value))"
+    Check ([math]::Round($atContact[2] * $spm[2]) -eq -500) "grblHAL position after probing = where the controller stopped (Z=$($atContact[2]))"
+    Check ([math]::Round(($up[2] - $atContact[2]) * $spm[2]) -eq [math]::Round(5 * $spm[2])) "move after probing starts from there"
+    Check ($out -match "ALARM:5") "no contact: ALARM:5 (probe fail, no contact)"
+    Check ([math]::Round($noContact[2] * $spm[2]) -eq $r.Final[2]) "no contact: whole move run, grblHAL and controller agree (Z=$($r.Final[2]) steps)"
+    Check ($r.Stats.rejected -eq 0 -and $r.Stats.seq_errors -eq 0) "no rejected slice, no sequence error"
+    Check ($err -notmatch "POSITION MISMATCH") "no position mismatch ($(([regex]::Match($err, 'position checks[^\r\n]*')).Value))"
+}
+
 if ($Scenario -in "motion", "all") { Test-Motion }
 if ($Scenario -in "watchdog", "all") { Test-Watchdog }
 if ($Scenario -in "reset", "all") { Test-Reset }
 if ($Scenario -in "estop", "all") { Test-EStop $false; Test-EStop $true }
 if ($Scenario -in "outputs", "all") { Test-Outputs }
 if ($Scenario -in "pins", "all") { Test-Pins }
+if ($Scenario -in "home", "all") { Test-Home }
+if ($Scenario -in "probe", "all") { Test-Probe }
 
 if ($script:failures -eq 0) { "RESULT: PASS"; exit 0 } else { "RESULT: FAIL ($script:failures)"; exit 1 }

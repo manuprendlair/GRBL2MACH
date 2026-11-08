@@ -38,13 +38,14 @@
 #include "grbl/system.h"
 #include "grbl/gcode.h"
 #include "grbl/planner.h"
+#include "grbl/machine_limits.h"
 
 #define SLICE_TICKS ((uint64_t)F_CPU / 1000 * SLICE_MS)
 #define HALT_TIMEOUT_MS 200
 
 static slice_sink_t *sink = NULL;
 static slice_t cur;
-static bool open = false;           // a slice is in progress
+static volatile bool open = false;  // a slice is in progress (also read by the core thread: homing_get_state)
 static atomic_bool sink_failed;      // the sink reported an error: slices are dropped, motor fault signalled
 static atomic_bool reset_pending;   // set by the core's on_reset (any thread), handled on the simulator thread
 static on_reset_ptr prev_on_reset = NULL;
@@ -54,6 +55,10 @@ static int32_t idle_offset[N_AXIS]; // sys.position - counted, sampled at rest (
 static atomic_bool resync_busy;     // from a reset until its resync is done: idle_offset is frozen
 static atomic_uint sim_heartbeat;   // incremented on every simulator tick
 static atomic_uint out_state;       // current outputs: flags | spindle_pwm << 16 (set from any thread)
+static atomic_uint phase;           // kind of motion (slice_kind_t) | axis << 8, set by the core's hooks
+static on_homing_rate_set_ptr prev_on_homing_rate_set = NULL;
+static on_homing_completed_ptr prev_on_homing_completed = NULL;
+static home_get_state_ptr prev_homing_get_state = NULL;
 
 // Puts sys.position back where the machine is: machine position + offset sampled at rest.
 // The offset is not taken at the time of the reset: the core adds a step to sys.position one
@@ -83,6 +88,7 @@ static void resync_position (const int32_t machine[SLICE_AXES])
 // thread to drop its slice in progress. Safe from any thread, may be called twice per reset.
 static void stop_machine (void)
 {
+    slicer_set_phase(Slice_Program, 0);
     atomic_store(&resync_busy, true);       // freeze idle_offset until the resync is done
     sink->stop(sink);
     atomic_store(&reset_pending, true);
@@ -139,8 +145,110 @@ static void on_driver_reset (void)
         prev_driver_reset();
 }
 
+void slicer_set_phase (slice_kind_t kind, int axis)
+{
+    atomic_store(&phase, (unsigned int)kind | (unsigned int)(axis & 0xFF) << 8);
+}
+
+// The core reads the home switches. At the end of a pull-off it checks at once that the switch
+// has released, as on a microcontroller where motion and switch are in sync. Here the machine still
+// has up to RNR_LEAD_MS of that motion to run, plus a status period before its inputs are known:
+// wait until it has run it all, else a switch with some hysteresis still reads engaged.
+static home_signals_t homing_get_state (void)
+{
+    if((atomic_load(&phase) & 0xFF) == Slice_HomeJog && !timer[STEPPER_TIMER].enable && sink && sink->wait_idle) {
+        for(int i = 0; i < 100 && open; i++)   // the last slice of the move must reach the sink first
+            platform_sleep(1000);
+        if(!sink->wait_idle(sink, 2000))
+            fprintf(stderr, "[slicer] machine not at rest after a homing pull-off: switch state may be stale\n");
+    }
+
+    return prev_homing_get_state();
+}
+
+// Homing phase starting: seek and locate move towards the switch, pull-off away from it. With one
+// axis, the machine can stop by itself on its switch; with several, the core stops each axis when
+// it sees its switch in the machine's inputs (less precise: status reports come about every 50 ms).
+static void on_homing_rate_set (axes_signals_t axes, coord_data_t *feedrate, homing_mode_t mode)
+{
+    static bool warned = false;
+    int n = 0, axis = 0;
+
+    for(int i = 0; i < SLICE_AXES; i++)
+        if(axes.mask & (1u << i)) {
+            n++;
+            axis = i;
+        }
+
+    if(hal.homing.get_state && hal.homing.get_state != homing_get_state) {
+        prev_homing_get_state = hal.homing.get_state;
+        hal.homing.get_state = homing_get_state;
+    }
+
+    if(n == 1)
+        slicer_set_phase(mode == HomingMode_Pulloff ? Slice_HomeJog : Slice_HomeSeek, axis);
+    else {
+        slicer_set_phase(Slice_Program, 0);
+        if(!warned && mode == HomingMode_Seek) {
+            warned = true;
+            fprintf(stderr, "[slicer] homing several axes at once: switches read from status reports, "
+                             "less precise than one axis per cycle ($44..$46)\n");
+        }
+    }
+
+    if(prev_on_homing_rate_set)
+        prev_on_homing_rate_set(axes, feedrate, mode);
+}
+
+static void on_homing_completed (axes_signals_t cycle, bool success)
+{
+    slicer_set_phase(Slice_Program, 0);
+
+    if(prev_on_homing_completed)
+        prev_on_homing_completed(cycle, success);
+}
+
+// End of a probing cycle (core thread, before the core syncs its planner to sys.position): the
+// machine stopped by itself on contact, where the core has not seen it yet (status reports come
+// about every 50 ms). Put sys.position where the machine is and the probe position where it touched.
+void slicer_probe_end (void)
+{
+    int32_t machine[SLICE_AXES], latched[SLICE_AXES];
+    bool contact = false;
+
+    if((atomic_load(&phase) & 0xFF) != Slice_Probe)
+        return;
+    slicer_set_phase(Slice_Program, 0);
+
+    if(!sink || !sink->get_probe_result)
+        return;
+
+    atomic_store(&resync_busy, true);
+    if(sink->get_probe_result(sink, machine, latched, &contact, 1000)) {
+        for(int i = 0; i < SLICE_AXES && i < N_AXIS; i++) {
+            sys.position[i] = machine[i] + idle_offset[i];
+            counted[i] = machine[i];
+            if(contact)
+                sys.probe_position[i] = latched[i] + idle_offset[i];
+        }
+        if(contact)
+            fprintf(stderr, "[slicer] probe position from the machine: X%d Y%d Z%d steps\n",
+                     sys.probe_position[0], sys.probe_position[1], sys.probe_position[2]);
+    } else
+        fprintf(stderr, "[slicer] machine position unknown after probing: not resynced\n");
+    atomic_store(&resync_busy, false);
+}
+
 void slicer_attach_core (void)
 {
+    if(grbl.on_homing_rate_set != on_homing_rate_set) {
+        prev_on_homing_rate_set = grbl.on_homing_rate_set;
+        grbl.on_homing_rate_set = on_homing_rate_set;
+    }
+    if(grbl.on_homing_completed != on_homing_completed) {
+        prev_on_homing_completed = grbl.on_homing_completed;
+        grbl.on_homing_completed = on_homing_completed;
+    }
     if(grbl.on_reset != on_core_reset) {
         prev_on_reset = grbl.on_reset;
         grbl.on_reset = on_core_reset;
@@ -166,6 +274,13 @@ bool slicer_estop (void)
     slice_sink_t *s = sink;
 
     return s && s->estop_active && s->estop_active(s);
+}
+
+bool slicer_get_inputs (sink_inputs_t *in)
+{
+    slice_sink_t *s = sink;
+
+    return s && s->get_inputs && s->get_inputs(s, in);
 }
 
 // The machine stopped on its own e-stop input: tell the core like a control input interrupt
@@ -218,6 +333,18 @@ static void emit (void)
     }
 }
 
+// Starts a slice: it belongs to the kind of motion in progress
+static void open_slice (uint32_t index)
+{
+    unsigned int p = atomic_load(&phase);
+
+    memset(&cur, 0, sizeof(cur));
+    cur.index = index;
+    cur.kind = (uint8_t)p;
+    cur.axis = (uint8_t)(p >> 8);
+    open = true;
+}
+
 static void advance (void)
 {
     uint32_t idx = (uint32_t)(sim.masterclock / SLICE_TICKS);
@@ -231,11 +358,16 @@ static void advance (void)
     }
 
     if(!open) {
-        if(motion) {
-            memset(&cur, 0, sizeof(cur));
-            cur.index = idx;
-            open = true;
-        } else if(!atomic_load(&resync_busy)) {
+        if(motion)
+            open_slice(idx);
+        else if(!atomic_load(&resync_busy)) {
+            // A homing or probing move cut short by the machine (switch, contact): the steps it
+            // dropped are in counted. The machine is at rest now: take its position.
+            int32_t machine[SLICE_AXES];
+            if(sink->take_resync && sink->take_resync(sink, machine)) {
+                for(int i = 0; i < SLICE_AXES; i++)
+                    counted[i] = machine[i];
+            }
             // At rest every pulse has gone out: sys.position - counted is exact here. It changes
             // only when the core overwrites sys.position (homing), and is resampled after that.
             for(int i = 0; i < N_AXIS && i < SLICE_AXES; i++)
@@ -249,8 +381,7 @@ static void advance (void)
     while(open && cur.index < idx) {
         emit();
         uint32_t next = cur.index + 1;
-        memset(&cur, 0, sizeof(cur));
-        cur.index = next;
+        open_slice(next);
         open = motion;
     }
 }
@@ -262,10 +393,16 @@ void slicer_step (uint32_t step_bits, uint32_t dir_bits)
 
     advance();
 
-    if(!open) {     // pulse outside of a declared motion: open a slice anyway
-        memset(&cur, 0, sizeof(cur));
-        cur.index = (uint32_t)(sim.masterclock / SLICE_TICKS);
-        open = true;
+    if(!open)       // pulse outside of a declared motion: open a slice anyway
+        open_slice((uint32_t)(sim.masterclock / SLICE_TICKS));
+    else {
+        // The kind of motion changed within the slice (homing seek -> pull-off): the slice so far
+        // belongs to the previous move
+        unsigned int p = atomic_load(&phase);
+        if(cur.kind != (uint8_t)p || cur.axis != (uint8_t)(p >> 8)) {
+            emit();
+            open_slice(cur.index);
+        }
     }
 
     for(int i = 0; i < SLICE_AXES && i < N_AXIS; i++) {

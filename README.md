@@ -69,8 +69,22 @@ proprietary and is **not** distributed here.
     without the PC; tested on the real board: with no e-stop declared it only reported the input and
     kept moving. The bridge also watches it in the raw inputs and sends the board's e-stop frame at
     once, like Mach3. grblHAL raises ALARM:10; the board is re-armed before the next move, once the
-    input is released and grblHAL reset. Home, probe and limit inputs are declared but not used yet
-    (homing and probing through the board come with roadmap step 5).
+    input is released and grblHAL reset. Home, limit and probe inputs are passed to grblHAL
+    (`Pn:` in the status report), polarity applied.
+  - Homing (`$H`) and probing (`G38.2`, `G38.3`) are grblHAL's own cycles, configured with its
+    usual settings (`$22` to `$27`, `$44` to `$46`...). The bridge only sends each phase to the
+    board the way Mach3 does: a homing move towards the switch of one axis is armed on the board
+    (frame `0x0D`), which stops by itself exactly on the switch; pull-offs are jogs (`0x0A`); a
+    probing move is armed with `0x0C`, the board stops by itself on contact and latches the position,
+    which replaces grblHAL's own (late by up to a status period). The slices grblHAL still sends
+    after the stop are dropped. A homing cycle with several axes at once works too, but each switch
+    is then seen through status reports (about 50 ms late, plus the bridge's lead): one axis per
+    cycle is more precise, and required anyway when switches share an input. `G38.4`/`G38.5`
+    (probing away) are handled by grblHAL alone, with the same latency. At the end of a pull-off,
+    grblHAL checks that the switch has released: the bridge makes that check wait until the board
+    has actually run the pull-off (it is up to about 0.1 s behind), else a switch with some
+    hysteresis still reads engaged (ALARM:8, seen on the reference machine). Set `$27` (pull-off)
+    above the switch hysteresis.
   - A 500 ms status watchdog or USB loss is reported as a motor fault (ALARM:17) and disarms the
     board.
   - Spindle and coolant: grblHAL's spindle (M3/M4, S) and coolant (M7/M8) drive the board's PWM
@@ -156,8 +170,8 @@ per axis, outputs bitmask: 1 spindle, 2 counter-clockwise, 4 flood, 8 mist; spin
 
 > `-u` has had **two short hardware tests** (connection, small moves, reset, e-stop input): frames
 > identical to Mach3's (short reports go out as 9-byte transfers), step counts exact, e-stop input
-> stopping the board by itself once declared in the configuration frame. Homing and probing do not
-> use the board's inputs yet.
+> stopping the board by itself once declared in the configuration frame, home and probe inputs seen
+> by grblHAL. Homing and probing through the board are tested against the fake controller only.
 
 `--rnr-in` declares the board's inputs as Mach3's *Ports & Pins > Input Signals* page does (port 3
 pin n = IN n): `x+`, `x-`, `xhome` (same for `y`, `z`, `a`), `probe` and `estop`, each `=<n>` (0 = not
@@ -215,6 +229,11 @@ The fake controller behaves like the real board as seen in the Mach3 captures (s
 - `outputs`: M3 S12000, a move, M8, a move, M5 M9: spindle PWM and outputs must switch before the
   first slice, between the two runs once the first move has run, and after the last one; every
   slice must carry the outputs.
+- `home`: `$H` with one axis per cycle (Z, X, Y) and the three home switches on one input, as on
+  the reference machine, with 0.48 mm switch hysteresis for a 0.5 mm pull-off: `0x0D` per seek and locate, pull-offs as jogs, the board stopping on each
+  switch, ending exactly at switch minus pull-off; grblHAL and board agree afterwards;
+- `probe`: `G38.2` with contact (probe position = the board's latch, to the step; grblHAL resynced
+  to where the board stopped) and without contact (ALARM:5, whole move run).
 - `pins`: the configuration frame's input bytes computed from `--rnr-in` must equal the frames Mach3
   sent for the same settings (15 variants captured on the real board).
 
@@ -256,7 +275,8 @@ powershell -File tests\run_fake_board.ps1 -Scenario all
 3. RNR USB sink: written and tested against the fake controller. Next: first hardware tests (drivers
    off, then small moves without a tool, far from the limits).
 4. ~~USB captures of Mach3 driving the same machine; bridge aligned on them.~~ Done.
-5. Homing and probing using the controller's hardware latches.
+5. Homing and probing using the controller's hardware stop and latch: done against the fake
+   controller; next, on the reference machine.
 6. ~~Spindle and outputs.~~ Done (against the fake controller). Mach3 XML profile importer.
 
 ## Safety

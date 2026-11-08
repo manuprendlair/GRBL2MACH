@@ -204,6 +204,14 @@ static void stepperPulseStartDelayed (stepper_t *stepper)
 static limit_signals_t limitsGetState()
 {
     limit_signals_t signals = {0};
+    sink_inputs_t in;
+
+    // GRBL2MACH: the machine's inputs, polarity already applied by the sink (--rnr-in). Home
+    // switches and limit switches of an axis are one signal for the core, as on most grbl boards.
+    if(slicer_get_inputs(&in)) {
+        signals.min.mask = in.home | in.limit_pos | in.limit_neg;
+        return signals;
+    }
 
     signals.min.value = gpio[LIMITS_PORT0].state.value;
 
@@ -283,6 +291,13 @@ static control_signals_t systemGetState (void)
 
 static void probeConfigureInvertMask (bool is_probe_away, bool probing)
 {
+    // GRBL2MACH: probing towards the probe: the machine stops by itself on contact. At the end of
+    // the cycle, take its position and the position where it touched.
+    if(probing)
+        slicer_set_phase(is_probe_away ? Slice_Program : Slice_Probe, 0);
+    else
+        slicer_probe_end();
+
   probe_invert = settings.probe.invert_probe_pin;
 
   if (is_probe_away)
@@ -295,6 +310,13 @@ probe_state_t probeGetState (void)
     probe_state_t state = {0};
 
     state.value = mcu_gpio_get(&gpio[PROBE_PORT], PROBE_MASK);
+
+    // GRBL2MACH: the machine's probe input, polarity applied by the sink (--rnr-in)
+    sink_inputs_t in;
+    if(slicer_get_inputs(&in)) {
+        state.connected = On;
+        state.triggered = in.probe;
+    }
 
     state.triggered ^= probe_invert;
 

@@ -28,11 +28,28 @@ typedef struct {
     uint16_t spindle_pwm;       // spindle speed in 1/SLICE_PWM_PERIOD of the maximum speed ($30)
 } slice_outputs_t;
 
+// What the motion is for: the sink may drive the machine differently (a controller that stops
+// by itself on a home switch or a probe contact). The core tells the slicer.
+typedef enum {
+    Slice_Program = 0,  // G0/G1/G2... and anything else
+    Slice_HomeSeek,     // homing move towards the switch of one axis (seek or locate)
+    Slice_HomeJog,      // homing pull-off (or move of a homing cycle with several axes)
+    Slice_Probe         // G38.2 / G38.3: towards the probe
+} slice_kind_t;
+
 typedef struct {
     uint32_t index;             // slice number since start; slice starts at index * SLICE_MS (simulated time)
     int32_t  steps[SLICE_AXES]; // signed steps per axis to execute during the slice
     slice_outputs_t out;        // outputs while the slice runs
+    uint8_t  kind;              // slice_kind_t
+    uint8_t  axis;              // Slice_HomeSeek, Slice_HomeJog: axis 0..3
 } slice_t;
+
+// Machine inputs as the sink reads them, polarity applied: bit a (X, Y, Z, A) set = triggered
+typedef struct {
+    uint8_t home, limit_pos, limit_neg;
+    bool probe;
+} sink_inputs_t;
 
 typedef enum {
     Sink_Ok = 0,    // slice accepted
@@ -68,8 +85,22 @@ struct slice_sink {
     // state; this call tells the sink about it when no motion follows (outputs at rest). The sink
     // applies it once every slice pushed before it has run. Optional. Thread-safe.
     void (*set_outputs)(slice_sink_t *sink, slice_outputs_t out);
+    // Current state of the machine's home, limit and probe inputs. Returns false while unknown.
+    // Optional (NULL: the simulator's own inputs are used). Thread-safe.
+    bool (*get_inputs)(slice_sink_t *sink, sink_inputs_t *in);
+    // After a homing or probing move that the machine cut short by itself (switch, contact), the
+    // slices it dropped make the slicer's step count run ahead. Once the machine is at rest, returns
+    // true once with its position, in steps. Optional. Thread-safe.
+    bool (*take_resync)(slice_sink_t *sink, int32_t position[SLICE_AXES]);
+    // End of a probing move: waits up to timeout_ms until the machine is at rest and returns its
+    // position and whether it touched (then *contact = true and latched = position at contact).
+    // Returns false if unknown (no such feature, link lost, timeout). Optional. Thread-safe.
+    bool (*get_probe_result)(slice_sink_t *sink, int32_t position[SLICE_AXES], int32_t latched[SLICE_AXES],
+                              bool *contact, uint32_t timeout_ms);
+    // Waits up to timeout_ms until every slice pushed so far has run and the machine is at rest,
+    // with inputs read after that. Returns false on timeout or fault. Optional. Thread-safe.
+    bool (*wait_idle)(slice_sink_t *sink, uint32_t timeout_ms);
     void *ctx;
-    // To come with the controller: limit and probe inputs, homing/probe arming, latched positions.
 };
 
 // File sink (CSV): dry run without hardware.

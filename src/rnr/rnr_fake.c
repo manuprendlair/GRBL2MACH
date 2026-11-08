@@ -13,6 +13,10 @@
   - slices received while not armed are rejected (counted);
   - hardware e-stop input (IN1): stops at once, drops the buffer, state 0, fault flag 0x20
     while the input is active; re-arming is needed after release;
+  - homing run (ArmHome, axis in byte 5, state 4) and probing run (ArmProbe, state 5) execute
+    JogSlices and stop by themselves when the home switch of the axis / the probe triggers
+    (position clamped to the switch, buffer dropped, back to ready); a probe contact latches
+    the four positions in rx[13 + 8a]. JogSlices received while ready are ignored (counted);
   - a status report every 50 ms, like the real board.
 
   Every frame received is logged with a timestamp. The log ends with statistics
@@ -22,6 +26,12 @@
   Environment (times in ms after the first slice):
     GRBL2MACH_FAKE_SILENT_MS=<n>         stop reporting (watchdog test)
     GRBL2MACH_FAKE_ESTOP_MS=<on>,<off>   press the e-stop input at <on>, release at <off>
+    GRBL2MACH_FAKE_HOME=<x>,<y>,<z>,<a>  home switches: axis a triggered at live[a] >= <a> steps
+                                         (homes at the positive end); wired to the inputs the
+                                         configuration frame declares
+    GRBL2MACH_FAKE_HOME_HYST=<n>         home switch hysteresis: once triggered, released only
+                                         <n> steps below its trigger position (default 0)
+    GRBL2MACH_FAKE_PROBE_Z=<z>           probe triggered at live Z <= <z> steps
   The e-stop input is IN1, active high. As the real board, the fake one stops by itself on it only
   when the configuration frame declares it (byte 13, high nibble = 1); otherwise it only reports it.
 
@@ -62,6 +72,16 @@ typedef struct {
     uint64_t first_slice_us;
     int64_t silent_ms, estop_on_ms, estop_off_ms;
     bool estop_self;    // e-stop input declared in Configure: stops by itself on it (else only reports it)
+    // inputs declared in Configure (pin 0 = none) and switch positions (steps)
+    uint8_t home_pin[RNR_AXES], probe_pin;
+    bool home_low[RNR_AXES], probe_low;
+    bool has_home[RNR_AXES], has_probe;
+    int32_t home_pos[RNR_AXES], probe_z;
+    int32_t home_hyst;              // a triggered switch releases only that far below its trigger point
+    bool home_on[RNR_AXES];
+    int home_axis;                  // axis of the homing run
+    int32_t latched[RNR_AXES];      // positions at the last probe contact
+    int ignored, homes, probes;
 } fake_t;
 
 static double ms (fake_t *f, uint64_t t)
@@ -80,7 +100,48 @@ static void set_outputs (fake_t *f, uint64_t now, uint8_t outputs)
 
 static bool running (fake_t *f)
 {
-    return f->state == RnrState_Jog || f->state == RnrState_Program || f->state == RnrState_Ending;
+    return f->state == RnrState_Jog || f->state == RnrState_Program || f->state == RnrState_Ending ||
+            f->state == RnrState_Homing || f->state == RnrState_Probing;
+}
+
+static bool home_switch (fake_t *f, int a)
+{
+    if(!f->has_home[a])
+        return false;
+    if(f->live[a] >= f->home_pos[a])
+        f->home_on[a] = true;
+    else if(f->live[a] < f->home_pos[a] - f->home_hyst)
+        f->home_on[a] = false;
+
+    return f->home_on[a];
+}
+
+static bool probe_switch (fake_t *f)
+{
+    return f->has_probe && f->live[2] <= f->probe_z;
+}
+
+// Raw inputs IN1..IN12 as the board reports them: at rest IN3 and IN4 high (active low switches)
+static uint16_t raw_inputs (fake_t *f)
+{
+    uint16_t in = 0x000C | (f->estop_input ? 0x0001 : 0);
+
+    for(int a = 0; a < RNR_AXES; a++)
+        if(f->home_pin[a] && home_switch(f, a))
+            in = (uint16_t)(f->home_low[a] ? in & ~(1u << (f->home_pin[a] - 1)) : in | (1u << (f->home_pin[a] - 1)));
+    if(f->probe_pin && probe_switch(f))
+        in = (uint16_t)(f->probe_low ? in & ~(1u << (f->probe_pin - 1)) : in | (1u << (f->probe_pin - 1)));
+
+    return in;
+}
+
+// Homing / probing run: the board stops by itself on the switch, exactly where it triggers
+static void stop_on_switch (fake_t *f, uint64_t t, const char *what)
+{
+    fprintf(f->log, "%10.3f %s: halted pos=%d,%d,%d,%d dropped=%d\n", ms(f, t), what,
+             f->live[0], f->live[1], f->live[2], f->live[3], f->count);
+    f->state = RnrState_Ready;
+    f->count = 0;
 }
 
 // Executes the slices that are due at time now.
@@ -90,8 +151,34 @@ static void run_until (fake_t *f, uint64_t now)
         if(running(f)) {
             if(f->count) {
                 fake_slice_t *s = &f->buf[f->head];
+                int ha = f->home_axis;
+                if(f->state == RnrState_Homing && f->home_pin[ha] && home_switch(f, ha)) {
+                    f->homes++;
+                    stop_on_switch(f, f->next_exec, "HOME SWITCH");   // already on the switch
+                    f->next_exec += f->slice_us;
+                    continue;
+                }
                 for(int a = 0; a < RNR_AXES; a++)
                     f->live[a] += s->steps[a];
+                if((f->state == RnrState_Homing && f->home_pin[ha] && home_switch(f, ha)) ||
+                    (f->state == RnrState_Probing && f->probe_pin && probe_switch(f))) {
+                    // stops on the step that closes the switch
+                    bool home = f->state == RnrState_Homing;
+                    if(home) {
+                        f->live[ha] = f->home_pos[ha];
+                        f->homes++;
+                    } else {
+                        f->live[2] = f->probe_z;
+                        memcpy(f->latched, f->live, sizeof(f->latched));
+                        f->probes++;
+                    }
+                    f->head = (f->head + 1) % BUFFER_SLICES;
+                    f->count--;
+                    f->executed++;
+                    stop_on_switch(f, f->next_exec, home ? "HOME SWITCH" : "PROBE CONTACT");
+                    f->next_exec += f->slice_us;
+                    continue;
+                }
                 set_outputs(f, f->next_exec, s->outputs);
                 f->head = (f->head + 1) % BUFFER_SLICES;
                 f->count--;
@@ -186,7 +273,8 @@ static int fake_write (rnr_transport_t *t, const uint8_t b[RNR_OUT_BYTES])
         case RnrOp_EndOfMotion:
             fprintf(f->log, " outputs=0x%02X", b[5]);
             new_outputs = b[5];
-            if(op == RnrOp_EndOfMotion && (f->state == RnrState_Jog || f->state == RnrState_Program)) {
+            if(op == RnrOp_EndOfMotion && (f->state == RnrState_Jog || f->state == RnrState_Program ||
+                                               f->state == RnrState_Homing || f->state == RnrState_Probing)) {
                 if(f->count)
                     fprintf(f->log, " (%d slices still buffered)", f->count);
                 f->state = f->count ? RnrState_Ending : RnrState_Ready;
@@ -207,6 +295,19 @@ static int fake_write (rnr_transport_t *t, const uint8_t b[RNR_OUT_BYTES])
             }
             break;
 
+        case RnrOp_ArmHome:
+        case RnrOp_ArmProbe:
+            if(op == RnrOp_ArmHome)
+                fprintf(f->log, " axis=%u", b[5]);
+            if(f->state == RnrState_Ready) {
+                f->state = op == RnrOp_ArmHome ? RnrState_Homing : RnrState_Probing;
+                f->home_axis = b[5] & 3;
+                f->next_exec = now + f->slice_us;
+                f->idle_in_run = 0;
+            } else
+                fprintf(f->log, " IGNORED (state %u)", f->state);
+            break;
+
         case RnrOp_SetPositions:
             for(int a = 0; a < RNR_AXES; a++)
                 if(b[21] & (1 << a))
@@ -222,6 +323,12 @@ static int fake_write (rnr_transport_t *t, const uint8_t b[RNR_OUT_BYTES])
             if(b[17])
                 f->slice_us = b[17] * 1000u;
             f->estop_self = (b[13] >> 4) == 1 && !(b[14] & 0x20);    // e-stop declared on IN1, active high
+            for(int a = 0; a < RNR_AXES; a++) {
+                f->home_pin[a] = b[6 + 2 * a] & 0x0F;
+                f->home_low[a] = (b[6 + 2 * a] & 0x40) != 0;
+            }
+            f->probe_pin = b[13] & 0x0F;
+            f->probe_low = (b[14] & 0x10) != 0;
             break;
 
         case RnrOp_GcodeSlice:
@@ -242,7 +349,10 @@ static int fake_write (rnr_transport_t *t, const uint8_t b[RNR_OUT_BYTES])
                 }
                 f->state = RnrState_Program;
             }
-            if(!running(f)) {
+            if(op == RnrOp_JogSlice && f->state == RnrState_Ready) {
+                f->ignored++;       // as the real board after a home switch or probe contact
+                fprintf(f->log, " IGNORED (ready)");
+            } else if(!running(f)) {
                 f->rejected++;
                 fprintf(f->log, " REJECTED (state %u)", f->state);
             } else if(f->count == BUFFER_SLICES) {
@@ -308,7 +418,9 @@ static int fake_read (rnr_transport_t *t, uint8_t rx[RNR_IN_BYTES], uint32_t tim
     for(int a = 0; a < RNR_AXES; a++)
         rnr_put_le32(&rx[9 + a * 8], (uint32_t)f->live[a]);
     rx[41] = f->outputs;
-    rnr_put_le16(&rx[42], 0x000C | (f->estop_input ? 0x0001 : 0));
+    for(int a = 0; a < RNR_AXES; a++)
+        rnr_put_le32(&rx[13 + a * 8], (uint32_t)f->latched[a]);
+    rnr_put_le16(&rx[42], raw_inputs(f));
     rnr_put_le16(&rx[44], (uint16_t)((now - f->t0) / 1000u));
 
     return RNR_IO_OK;
@@ -319,8 +431,9 @@ static void fake_close (rnr_transport_t *t)
     fake_t *f = t->ctx;
 
     run_until(f, rnr_now_us());
-    fprintf(f->log, "# frames=%d executed=%d max_depth=%d starved=%d rejected=%d overflows=%d seq_errors=%d still_buffered=%d estops=%d\n",
-             f->frames, f->executed, f->max_depth, f->starved, f->rejected, f->overflows, f->seq_errors, f->count, f->estops);
+    fprintf(f->log, "# frames=%d executed=%d max_depth=%d starved=%d rejected=%d overflows=%d seq_errors=%d still_buffered=%d estops=%d ignored=%d homes=%d probes=%d\n",
+             f->frames, f->executed, f->max_depth, f->starved, f->rejected, f->overflows, f->seq_errors, f->count, f->estops,
+             f->ignored, f->homes, f->probes);
     fprintf(f->log, "# final position X=%d Y=%d Z=%d A=%d state=%u\n", f->live[0], f->live[1], f->live[2], f->live[3], f->state);
     fclose(f->log);
     free(f);
@@ -357,6 +470,22 @@ rnr_transport_t *rnr_fake_open (const char *log_path)
     f->state = RnrState_EStop;  // like a controller that has just been powered
     f->silent_ms = silent ? atoll(silent) : -1;
     parse_estop_env(f);
+    const char *h = getenv("GRBL2MACH_FAKE_HOME"), *pz = getenv("GRBL2MACH_FAKE_PROBE_Z");
+    long x, y, z, aa;
+    if(h && sscanf(h, "%ld,%ld,%ld,%ld", &x, &y, &z, &aa) == 4) {
+        long v[RNR_AXES] = { x, y, z, aa };
+        for(int a = 0; a < RNR_AXES; a++) {
+            f->home_pos[a] = (int32_t)v[a];
+            f->has_home[a] = true;
+        }
+    }
+    const char *hy = getenv("GRBL2MACH_FAKE_HOME_HYST");
+    if(hy)
+        f->home_hyst = (int32_t)atol(hy);
+    if(pz) {
+        f->probe_z = (int32_t)atol(pz);
+        f->has_probe = true;
+    }
     fprintf(f->log, "# GRBL2MACH fake RNR controller log (time in ms)\n");
 
     t->name = "fake";

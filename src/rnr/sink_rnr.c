@@ -24,6 +24,11 @@
               once the motion before it has run, not RNR_LEAD_MS early
     reset   : Cancel: stops at once, drops the buffer, stays armed
     fault   : EStop (watchdog, USB, write failure): disarms
+    homing  : one axis per move: ArmHome(axis) + JogSlices; the controller stops by itself
+              on the axis' home switch (state 4 -> 1) and ignores the slices still to come,
+              which the bridge then drops. Pull-off: StartJog(axis) + JogSlices + EndOfMotion
+    probing : ArmProbe + JogSlices; the controller stops by itself on contact and latches the
+              four positions (rx[13 + 8a]), handed over to the core at the end of the cycle
     e-stop  : the controller stops by itself on its e-stop input (state 0,
               fault flag 0x20) and must be re-armed: reported as e-stop
 
@@ -66,7 +71,15 @@ typedef struct {
     bool halted;                // the controller has taken the stop and reported its position since
     int32_t halted_pos[RNR_AXES];
     bool estop_input;           // the controller reports its e-stop input active
+    bool inputs_known;          // status.inputs comes from the controller
     slice_outputs_t latest;     // outputs last set by the core
+    // Homing / probing move that the controller cut short by itself (switch, contact): its
+    // remaining slices are dropped and the switch is reported to the core until the next move
+    bool cut_active;
+    uint8_t cut_kind, cut_axis;
+    bool resync_pending;        // the slicer's step count must be reset from the controller (take_resync)
+    bool probe_contact;         // the last probing move ended on a contact
+    bool idle_shared;           // nothing queued, no run open, every frame taken over, controller ready
     uint64_t estop_until;       // e-stop seen as a disarm only: reported until then
     char fault_msg[160];
 
@@ -81,7 +94,10 @@ typedef struct {
     uint8_t outputs;            // OUT1..OUT4 last sent
     uint16_t pwm;               // spindle PWM duty last sent
     bool outputs_change;        // the run must close: the next slice switches an output
-    uint32_t slices_sent, estops_seen;
+    bool kind_change;           // the run must close: the next slice is for another kind of move
+    uint8_t run_kind, run_axis; // slice_kind_t and axis of the open run
+    uint16_t run_arm_seq;       // sequence number of the frame that opened the run
+    uint32_t slices_sent, estops_seen, dropped_after_cut;
     bool awaiting_halt;         // stop handled, waiting for a status report that covers it
     uint16_t halt_seq;
     // Position check after each run: controller counters must equal start + steps sent
@@ -251,14 +267,19 @@ static bool arm (rnr_sink_t *s, const rnr_status_t *st)
     return true;
 }
 
+// True when the input is used and triggered (polarity applied)
+static bool input_on (const rnr_input_t *in, uint16_t raw)
+{
+    return in->pin && !!(raw & (1u << (in->pin - 1))) != in->active_low;
+}
+
 static void on_status (rnr_sink_t *s, const rnr_status_t *st, uint64_t now)
 {
     bool covered = (int16_t)(st->ack_seq - s->seq) >= 0;    // every frame sent so far taken over
-    // E-stop input, read by the bridge itself in the raw inputs: the controller stops on its own
-    // only when its configuration frame declares input pins (as Mach3's does). Without that it
-    // just reports the input, and Mach3 is what stops it (EStop frame), so the bridge does too.
-    const rnr_input_t *e = &s->opt.inputs.estop;
-    bool input_pressed = e->pin && !!(st->inputs & (1u << (e->pin - 1))) != e->active_low;
+    // E-stop input, also read by the bridge itself in the raw inputs: the controller stops on its
+    // own only when its configuration frame declares it; otherwise it just reports the input. As
+    // Mach3, the bridge sends an EStop frame either way.
+    bool input_pressed = input_on(&s->opt.inputs.estop, st->inputs);
     bool estop_input = (st->fault_flags & RNR_FAULT_ESTOP) != 0 || input_pressed;
     bool armed_seen = s->armed && (int16_t)(st->ack_seq - s->arm_seq) >= 0;
 
@@ -283,7 +304,40 @@ static void on_status (rnr_sink_t *s, const rnr_status_t *st, uint64_t now)
         }
     }
 
+    if(!s->inputs_known || st->inputs != s->status.inputs)
+        fprintf(stderr, "[rnr] inputs IN1..IN12: %c%c%c%c %c%c%c%c %c%c%c%c (0x%04X)\n",
+                 '0' + (st->inputs & 1), '0' + (st->inputs >> 1 & 1), '0' + (st->inputs >> 2 & 1), '0' + (st->inputs >> 3 & 1),
+                 '0' + (st->inputs >> 4 & 1), '0' + (st->inputs >> 5 & 1), '0' + (st->inputs >> 6 & 1), '0' + (st->inputs >> 7 & 1),
+                 '0' + (st->inputs >> 8 & 1), '0' + (st->inputs >> 9 & 1), '0' + (st->inputs >> 10 & 1), '0' + (st->inputs >> 11 & 1),
+                 st->inputs);
+
+    // Homing or probing move: the controller has stopped by itself on the switch / the contact
+    // (back to ready while the run is open). The slices still to come for this move are dropped.
+    if(s->run_open && (s->run_kind == Slice_HomeSeek || s->run_kind == Slice_Probe) &&
+        (int16_t)(st->ack_seq - s->run_arm_seq) >= 0 && st->state == RnrState_Ready) {
+        bool probe = s->run_kind == Slice_Probe;
+        fprintf(stderr, "[rnr] %s%c: controller stopped at X=%d Y=%d Z=%d A=%d\n",
+                 probe ? "probe contact" : "home switch ", probe ? ' ' : "XYZA"[s->run_axis & 3],
+                 st->live_steps[0], st->live_steps[1], st->live_steps[2], st->live_steps[3]);
+        s->run_open = false;
+        s->kind_change = false;
+        s->busy_until = 0;
+        s->check_pending = false;
+        rnr_mutex_lock(&s->lock);
+        s->cut_active = true;
+        s->cut_kind = s->run_kind;
+        s->cut_axis = s->run_axis;
+        // homing: the slicer resets its step count at rest (take_resync); probing: the end of the
+        // probing cycle does it, together with the core's position (get_probe_result)
+        if(probe)
+            s->probe_contact = true;
+        else
+            s->resync_pending = true;
+        rnr_mutex_unlock(&s->lock);
+    }
+
     rnr_mutex_lock(&s->lock);
+    s->inputs_known = true;
     s->status = *st;
     s->estop_input = estop_input;
     if(s->awaiting_halt && covered) {
@@ -371,13 +425,26 @@ static void io_thread (void *arg)
                 break;  // safety limit on unacknowledged frames
 
             slice_t slice;
+            bool dropped = false;
             rnr_mutex_lock(&s->lock);
             bool got = s->qcount > 0 && !s->estop_input;
-            if(got)
+            if(got) {
                 slice = s->queue[s->qhead];
+                if(s->cut_active && slice.kind == s->cut_kind && slice.axis == s->cut_axis) {
+                    // the rest of a move the controller has cut short: it would ignore it anyway
+                    s->qhead = (s->qhead + 1) % RNR_QUEUE;
+                    s->qcount--;
+                    dropped = true;
+                } else
+                    s->cut_active = false;  // next move: the inputs alone tell the switch state again
+            }
             rnr_mutex_unlock(&s->lock);
             if(!got)
                 break;
+            if(dropped) {
+                s->dropped_after_cut++;
+                continue;
+            }
 
             if(!s->run_open && !(slice.steps[0] | slice.steps[1] | slice.steps[2] | slice.steps[3])) {
                 // Empty slice with no run open (the core wakes the steppers for a block without
@@ -389,6 +456,12 @@ static void io_thread (void *arg)
                 }
                 rnr_mutex_unlock(&s->lock);
                 s->first_queued = 0;    // the prefill delay starts with the first real slice
+                break;
+            }
+
+            if(s->run_open && (slice.kind != s->run_kind || slice.axis != s->run_axis)) {
+                // another kind of move (homing phase, probing, program): it needs its own run
+                s->kind_change = true;
                 break;
             }
 
@@ -405,6 +478,9 @@ static void io_thread (void *arg)
                 set_fault(s, "cannot arm the controller", false);
                 break;
             }
+            if(!s->run_open && slice.kind != Slice_Program &&
+                !(st.state == RnrState_Ready && (int16_t)(st.ack_seq - s->seq) >= 0))
+                break;  // the controller takes ArmHome / StartJog / ArmProbe only when ready
             if(!s->run_open && (apply_outputs(s, slice.out) != RNR_IO_OK)) {
                 set_fault(s, "output write failed", false);
                 break;
@@ -432,10 +508,20 @@ static void io_thread (void *arg)
                 s->first_queued = 0;
                 memcpy(s->run_start, st.live_steps, sizeof(s->run_start));
                 memset(s->run_sent, 0, sizeof(s->run_sent));
+                s->run_kind = slice.kind;
+                s->run_axis = slice.axis;
+                rnr_opcode_t op = slice.kind == Slice_HomeSeek ? RnrOp_ArmHome :
+                                  slice.kind == Slice_HomeJog ? RnrOp_StartJog :
+                                  slice.kind == Slice_Probe ? RnrOp_ArmProbe : 0;
+                if(op && send_short(s, op, slice.kind == Slice_Probe ? 0 : slice.axis) != RNR_IO_OK) {
+                    set_fault(s, "write failed", false);
+                    break;
+                }
+                s->run_arm_seq = s->seq;
             }
 
             uint8_t buf[RNR_OUT_BYTES];
-            rnr_build_slice(buf, RnrOp_GcodeSlice, 0, slice.steps, s->outputs);
+            rnr_build_slice(buf, slice.kind == Slice_Program ? RnrOp_GcodeSlice : RnrOp_JogSlice, 0, slice.steps, s->outputs);
             if(send_frame(s, buf) != RNR_IO_OK) {
                 set_fault(s, "slice write failed", false);
                 break;
@@ -453,10 +539,11 @@ static void io_thread (void *arg)
         slice_outputs_t latest = s->latest;
         bool blocked = s->blocked;
         rnr_mutex_unlock(&s->lock);
-        if(s->run_open && (empty || s->outputs_change) && now > s->busy_until + (uint64_t)REST_MS * 1000u &&
+        if(s->run_open && (empty || s->outputs_change || s->kind_change) && now > s->busy_until + (uint64_t)REST_MS * 1000u &&
             (int16_t)(st.ack_seq - s->last_slice_seq) >= 0) {
             send_short(s, RnrOp_EndOfMotion, s->outputs);
             s->run_open = false;
+            s->kind_change = false;
             s->outputs_change = false;
             s->check_pending = true;
             s->check_seq = s->seq;
@@ -473,8 +560,10 @@ static void io_thread (void *arg)
                 set_fault(s, "output write failed", false);
         }
 
+        bool covered = (int16_t)(st.ack_seq - s->seq) >= 0;
         rnr_mutex_lock(&s->lock);
         s->run_open_shared = s->run_open;
+        s->idle_shared = s->qcount == 0 && !s->run_open && covered && st.state == RnrState_Ready;
         rnr_mutex_unlock(&s->lock);
     }
 }
@@ -517,6 +606,9 @@ static void rnr_stop (slice_sink_t *sink)
     rnr_mutex_lock(&s->lock);
     s->stop_request = true;
     s->blocked = true;
+    s->cut_active = false;
+    s->resync_pending = false;
+    s->probe_contact = false;
     s->halted = false;
     s->qcount = 0;
     rnr_mutex_unlock(&s->lock);
@@ -562,6 +654,99 @@ static void rnr_set_outputs (slice_sink_t *sink, slice_outputs_t out)
     rnr_mutex_unlock(&s->lock);
 }
 
+static bool rnr_wait_idle (slice_sink_t *sink, uint32_t timeout_ms)
+{
+    rnr_sink_t *s = sink->ctx;
+    uint64_t deadline = rnr_now_us() + (uint64_t)timeout_ms * 1000u;
+    bool idle = false, give_up = false;
+
+    while(!idle && !give_up && rnr_now_us() < deadline) {
+        rnr_mutex_lock(&s->lock);
+        idle = s->idle_shared && !s->stop_request;
+        give_up = s->fault || s->link_lost || s->blocked;
+        rnr_mutex_unlock(&s->lock);
+        if(!idle && !give_up)
+            rnr_sleep_ms(2);
+    }
+
+    return idle;
+}
+
+static bool rnr_take_resync (slice_sink_t *sink, int32_t position[SLICE_AXES])
+{
+    rnr_sink_t *s = sink->ctx;
+
+    rnr_mutex_lock(&s->lock);
+    bool ok = s->resync_pending && s->idle_shared && !s->stop_request;
+    if(ok) {
+        s->resync_pending = false;
+        for(int a = 0; a < SLICE_AXES; a++)
+            position[a] = a < RNR_AXES ? s->status.live_steps[a] : 0;
+    }
+    rnr_mutex_unlock(&s->lock);
+
+    return ok;
+}
+
+static bool rnr_get_probe_result (slice_sink_t *sink, int32_t position[SLICE_AXES], int32_t latched[SLICE_AXES],
+                                   bool *contact, uint32_t timeout_ms)
+{
+    rnr_sink_t *s = sink->ctx;
+    uint64_t deadline = rnr_now_us() + (uint64_t)timeout_ms * 1000u;
+    bool ok = false;
+
+    while(true) {
+        rnr_mutex_lock(&s->lock);
+        ok = s->idle_shared && !s->stop_request && !s->fault;
+        if(ok) {
+            *contact = s->probe_contact;
+            s->probe_contact = false;
+            s->resync_pending = false;
+            for(int a = 0; a < SLICE_AXES; a++) {
+                position[a] = a < RNR_AXES ? s->status.live_steps[a] : 0;
+                latched[a] = a < RNR_AXES ? s->status.latched_steps[a] : 0;
+            }
+        }
+        bool give_up = s->fault || s->link_lost;
+        rnr_mutex_unlock(&s->lock);
+        if(ok || give_up || rnr_now_us() >= deadline)
+            break;
+        rnr_sleep_ms(2);
+    }
+
+    return ok;
+}
+
+static bool rnr_get_inputs (slice_sink_t *sink, sink_inputs_t *in)
+{
+    rnr_sink_t *s = sink->ctx;
+    const rnr_inputs_t *cfg = &s->opt.inputs;
+
+    rnr_mutex_lock(&s->lock);
+    bool known = s->inputs_known;
+    uint16_t raw = s->status.inputs;
+    rnr_mutex_unlock(&s->lock);
+
+    memset(in, 0, sizeof(*in));
+    for(int a = 0; a < RNR_AXES; a++) {
+        in->home |= (uint8_t)(input_on(&cfg->home[a], raw) << a);
+        in->limit_pos |= (uint8_t)(input_on(&cfg->limit_pos[a], raw) << a);
+        in->limit_neg |= (uint8_t)(input_on(&cfg->limit_neg[a], raw) << a);
+    }
+    in->probe = input_on(&cfg->probe, raw);
+    rnr_mutex_lock(&s->lock);
+    if(s->cut_active) {
+        // the controller stopped on it: it is triggered, whatever the next status says
+        if(s->cut_kind == Slice_HomeSeek)
+            in->home |= (uint8_t)(1u << s->cut_axis);
+        else if(s->cut_kind == Slice_Probe)
+            in->probe = true;
+    }
+    rnr_mutex_unlock(&s->lock);
+
+    return known;
+}
+
 static bool rnr_estop_active (slice_sink_t *sink)
 {
     rnr_sink_t *s = sink->ctx;
@@ -596,8 +781,8 @@ static void rnr_close (slice_sink_t *sink)
     // Leave the controller disarmed, spindle and outputs off
     send_short(s, RnrOp_EStop, 0);
     outputs_off(s);
-    fprintf(stderr, "[rnr] closed: %u slices sent, %u controller e-stops, position checks after runs: %u ok, %u mismatch\n",
-             s->slices_sent, s->estops_seen, s->checks_ok, s->checks_bad);
+    fprintf(stderr, "[rnr] closed: %u slices sent, %u controller e-stops, %u slices dropped after a switch or contact, position checks after runs: %u ok, %u mismatch\n",
+             s->slices_sent, s->estops_seen, s->dropped_after_cut, s->checks_ok, s->checks_bad);
 
     s->t->close(s->t);
     rnr_mutex_destroy(&s->lock);
@@ -662,6 +847,10 @@ slice_sink_t *sink_rnr_open (rnr_transport_t *t, const rnr_options_t *opt)
     sink->close = rnr_close;
     sink->estop_active = rnr_estop_active;
     sink->set_outputs = rnr_set_outputs;
+    sink->get_inputs = rnr_get_inputs;
+    sink->take_resync = rnr_take_resync;
+    sink->wait_idle = rnr_wait_idle;
+    sink->get_probe_result = rnr_get_probe_result;
     sink->ctx = s;
 
     return sink;
