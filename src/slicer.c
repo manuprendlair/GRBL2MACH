@@ -53,6 +53,7 @@ static int32_t counted[SLICE_AXES]; // steps counted since start: the machine po
 static int32_t idle_offset[N_AXIS]; // sys.position - counted, sampled at rest (see advance())
 static atomic_bool resync_busy;     // from a reset until its resync is done: idle_offset is frozen
 static atomic_uint sim_heartbeat;   // incremented on every simulator tick
+static atomic_uint out_state;       // current outputs: flags | spindle_pwm << 16 (set from any thread)
 
 // Puts sys.position back where the machine is: machine position + offset sampled at rest.
 // The offset is not taken at the time of the reset: the core adds a step to sys.position one
@@ -198,6 +199,10 @@ static void emit (void)
     if(atomic_load(&sink_failed))
         return;
 
+    unsigned int o = atomic_load(&out_state);
+    cur.out.flags = (uint8_t)o;
+    cur.out.spindle_pwm = (uint16_t)(o >> 16);
+
     while((status = sink->push(sink, &cur)) == Sink_Full) {
         platform_sleep(1000);   // back-pressure: simulated time waits for the machine
         if(atomic_load(&reset_pending))
@@ -293,4 +298,37 @@ void slicer_close (void)
 
     sink->close(sink);
     sink = NULL;
+}
+
+// Output changes come from the core thread (spindle, coolant) or from the stepper interrupt
+// (laser mode PWM): each one updates its part of the state and tells the sink.
+static void update_outputs (uint8_t flags_mask, uint8_t flags, bool set_pwm, uint16_t pwm)
+{
+    unsigned int o = atomic_load(&out_state), n;
+
+    do {
+        n = (o & ~(unsigned int)flags_mask) | (flags & flags_mask);
+        if(set_pwm)
+            n = (n & 0xFFFFu) | ((unsigned int)pwm << 16);
+    } while(!atomic_compare_exchange_weak(&out_state, &o, n));
+
+    slice_sink_t *s = sink;
+    if(n != o && s && s->set_outputs)
+        s->set_outputs(s, (slice_outputs_t){ .flags = (uint8_t)n, .spindle_pwm = (uint16_t)(n >> 16) });
+}
+
+void slicer_set_spindle (bool on, bool ccw, uint16_t pwm)
+{
+    update_outputs(SLICE_OUT_SPINDLE | SLICE_OUT_SPINDLE_CCW,
+                    (on ? SLICE_OUT_SPINDLE : 0) | (on && ccw ? SLICE_OUT_SPINDLE_CCW : 0), true, on ? pwm : 0);
+}
+
+void slicer_set_spindle_pwm (uint16_t pwm)
+{
+    update_outputs(0, 0, true, pwm);
+}
+
+void slicer_set_coolant (bool flood, bool mist)
+{
+    update_outputs(SLICE_OUT_FLOOD | SLICE_OUT_MIST, (flood ? SLICE_OUT_FLOOD : 0) | (mist ? SLICE_OUT_MIST : 0), false, 0);
 }

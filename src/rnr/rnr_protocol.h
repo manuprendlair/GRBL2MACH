@@ -24,6 +24,7 @@
 #define RNR_OUT_BYTES 27    // PC -> controller, report ID included
 #define RNR_IN_BYTES  49    // controller -> PC, report ID included
 #define RNR_AXES      4
+#define RNR_PWM_PERIOD 1000 // SpindlePwm period: Mach3 always sends 1000
 
 #define RNR_FRAME_SHORT    0x02 // report ID 2: 8 data bytes
 #define RNR_FRAME_EXTENDED 0x03 // report ID 3: 26 data bytes
@@ -91,6 +92,7 @@ void rnr_build_short (uint8_t buf[RNR_OUT_BYTES], rnr_opcode_t op, uint16_t seq,
 void rnr_build_slice (uint8_t buf[RNR_OUT_BYTES], rnr_opcode_t op, uint16_t seq, const int32_t steps[RNR_AXES], uint8_t outputs);
 void rnr_build_positions (uint8_t buf[RNR_OUT_BYTES], uint16_t seq, const int32_t steps[RNR_AXES], uint8_t axis_mask);
 void rnr_build_configure (uint8_t buf[RNR_OUT_BYTES], uint16_t seq, const rnr_config_t *cfg);
+void rnr_build_pwm (uint8_t buf[RNR_OUT_BYTES], uint16_t seq, uint16_t duty);  // SpindlePwm: duty in 1/RNR_PWM_PERIOD
 bool rnr_parse_status (const uint8_t *rx, int len, rnr_status_t *status);
 
 // Helpers shared with the fake controller

@@ -10,12 +10,14 @@
 #              must not execute the slices that were still queued and must stay armed.
 #   estop    : the controller's own e-stop input during a move: grblHAL must raise ALARM:10, resync
 #              to where the controller stopped and re-arm it for the next move after a reset.
+#   outputs  : M3 / M8 / M5 M9 around two moves: spindle PWM and outputs switched in step with the
+#              motion (before the first slice, between the runs, after the last one), slices carry them.
 #
-# Usage: powershell -File tests\run_fake_board.ps1 [-Scenario motion|watchdog|reset|estop|all]
+# Usage: powershell -File tests\run_fake_board.ps1 [-Scenario motion|watchdog|reset|estop|outputs|all]
 #                       [-GCode "G21 G91 G1 X10 F600"] [-Expect "2500,0,0"] [-OutDir folder] [-Immediate]
 
 param(
-    [ValidateSet("motion", "watchdog", "reset", "estop", "all")] [string]$Scenario = "all",
+    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "all")] [string]$Scenario = "all",
     [string]$GCode = "G21 G91 G1 X10 F600",
     [string]$Expect = "2500,0,0",
     [string]$OutDir = "$env:TEMP\grbl2mach_fake",
@@ -70,7 +72,7 @@ function Test-Motion {
     $expectedSpan = ($slices.Count - 1) * 5
 
     "  slices sent: $($slices.Count), over $([math]::Round($span)) ms (real time: $expectedSpan ms), stats: " + (($r.Stats.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join " ")
-    Check (($ops[0..3] -join ",") -eq "15,1,3,9") "connect sequence Configure, EStop, SetOutputs, SetPositions"
+    Check (($ops[0..4] -join ",") -eq "15,1,14,3,9") "connect sequence Configure, EStop, SpindlePwm, SetOutputs, SetPositions"
     $firstSlice = [array]::IndexOf($ops, 4)
     Check (($ops[($firstSlice - 4)..($firstSlice - 1)] -join ",") -eq "7,2,9,15") "arm like Mach3 before the first slice: PreReset, ClearEStop, SetPositions, Configure"
     Check (@($r.Frames | Where-Object { $_.op -in 5, 10 }).Count -eq 0) "program run made of GcodeSlice frames only (no StartJog, no JogSlice)"
@@ -198,9 +200,51 @@ function Test-EStop {
     Check ($err -match "position checks after runs: [1-9]\d* ok, 0 mismatch") "position check after the extra move"
 }
 
+function Test-Outputs {
+    "=== outputs: M3 S12000, move, M8, move, M5 M9 (spindle on OUT1, flood on OUT2, `$30=24000)"
+    $dir = Join-Path $OutDir "outputs"; $log = Join-Path $dir "fake.log"
+    $s = Start-Sim "-f `"$log`" --rnr-out spindle=1,flood=2" $dir ($Port + 4)
+    try {
+        $spm = Get-StepsPerMm $s
+        Invoke-Line $s '$30=24000' | Out-Null
+        Invoke-Line $s '$X' | Out-Null
+        Invoke-GCode $s "G21 G91;M3 S12000;G1 X5 F600;M8;G1 X5;M5 M9"
+        Wait-State $s "Idle" | Out-Null
+        Start-Sleep -Milliseconds 300       # outputs at rest are switched once the last move has run
+    } finally { Stop-Sim $s }
+    $r = Read-FakeLog $log
+    $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
+    $five = [math]::Round(5 * $spm[0])
+    $ops = $r.Frames | ForEach-Object { $_.op }
+    $changes = @(Select-String -Path $log -Pattern "OUTPUTS 0x([0-9A-F]{2}) -> 0x([0-9A-F]{2}) pwm=(\d+) pos=(-?\d+),.* buffered=(\d+)" | ForEach-Object {
+        $g = $_.Matches[0].Groups; [pscustomobject]@{ from = $g[1].Value; to = $g[2].Value; pwm = [int]$g[3].Value; x = [int]$g[4].Value; buffered = [int]$g[5].Value } })
+    $slices = @($r.Frames | Where-Object { $_.op -eq 4 })
+    $firstSlice = [array]::IndexOf($ops, 4)
+    $before = @($r.Frames[0..($firstSlice - 1)])
+    $pwmOn = @($before | Where-Object { $_.op -eq 14 -and $_.rest -match "pwm=500/1000" })
+    $outOn = @($before | Where-Object { $_.op -eq 3 -and $_.rest -match "outputs=0x01" })
+
+    Check (($ops[0..4] -join ",") -eq "15,1,14,3,9") "connect sequence Configure, EStop, SpindlePwm(0), SetOutputs(0), SetPositions"
+    Check ($pwmOn.Count -eq 1 -and $outOn.Count -eq 1 -and $pwmOn[0].seq -lt $outOn[0].seq) "M3 S12000: SpindlePwm 500/1000 then SetOutputs 0x01, before the first slice"
+    $first = @($slices | Where-Object { $_.rest -match "out=0x01 " }); $second = @($slices | Where-Object { $_.rest -match "out=0x03 " })
+    Check ($first.Count + $second.Count -eq $slices.Count) "every slice carries the outputs ($($first.Count) with 0x01, $($second.Count) with 0x03, $($slices.Count) slices)"
+    $sum1 = ($first | ForEach-Object { $_.d[0] } | Measure-Object -Sum).Sum; $sum2 = ($second | ForEach-Object { $_.d[0] } | Measure-Object -Sum).Sum
+    Check ($sum1 -eq $five -and $sum2 -eq $five) "first move ran with the spindle only, second one with spindle and flood ($sum1 / $sum2 steps)"
+    $m8 = @($changes | Where-Object { $_.from -eq "01" -and $_.to -eq "03" })
+    Check ($m8.Count -eq 1 -and $m8[0].x -eq $five -and $m8[0].buffered -eq 0) "M8 switched once the first move had run (X=$($m8[0].x), $($m8[0].buffered) slices buffered)"
+    $iM8 = [array]::IndexOf(@($r.Frames | ForEach-Object { "$($_.op)$($_.rest)" -match "^3 .*outputs=0x03" }), $true)
+    Check ($iM8 -gt 0 -and $r.Frames[$iM8 - 1].op -eq 6) "the run was closed (EndOfMotion) before SetOutputs 0x03"
+    $off = $changes[-1]
+    Check ($off.to -eq "00" -and $off.x -eq 2 * $five -and $off.buffered -eq 0 -and $off.pwm -eq 0) "M5 M9: spindle PWM 0 and outputs off once the last move had run (X=$($off.x), pwm=$($off.pwm))"
+    Check ($changes[0].from -eq "00" -and $changes[0].to -eq "01" -and $changes[0].x -eq 0) "spindle started before any motion"
+    Check ($r.Stats.starved -eq 0 -and $r.Stats.rejected -eq 0 -and $r.Stats.seq_errors -eq 0) "no underrun, no rejected slice, no sequence error"
+    Check ($err -match "position checks after runs: 2 ok, 0 mismatch") "position check after each of the two runs"
+}
+
 if ($Scenario -in "motion", "all") { Test-Motion }
 if ($Scenario -in "watchdog", "all") { Test-Watchdog }
 if ($Scenario -in "reset", "all") { Test-Reset }
 if ($Scenario -in "estop", "all") { Test-EStop }
+if ($Scenario -in "outputs", "all") { Test-Outputs }
 
 if ($script:failures -eq 0) { "RESULT: PASS"; exit 0 } else { "RESULT: FAIL ($script:failures)"; exit 1 }

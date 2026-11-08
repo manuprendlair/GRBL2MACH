@@ -13,11 +13,15 @@
   is only a safety limit.
 
   Frame sequence, as Mach3 drives the controller (USB captures):
-    connect : Configure, EStop, SetOutputs(0), SetPositions(0)
+    connect : Configure, EStop, SpindlePwm(0), SetOutputs(0), SetPositions(0)
     arm     : PreReset, ClearEStop, SetPositions(current), Configure
               (before the first motion and after any e-stop)
     run     : GcodeSlice..., then EndOfMotion(outputs) once all slices ran;
               the controller goes Program (6) -> Ending (7) -> Ready (1)
+    outputs : at rest, SpindlePwm(duty) then SetOutputs(OUT1..OUT4); during a run every
+              slice carries the outputs (byte 25). The core changes outputs between
+              moves only: a run is closed before an output switches, so that it switches
+              once the motion before it has run, not RNR_LEAD_MS early
     reset   : Cancel: stops at once, drops the buffer, stays armed
     fault   : EStop (watchdog, USB, write failure): disarms
     e-stop  : the controller stops by itself on its e-stop input (state 0,
@@ -62,6 +66,7 @@ typedef struct {
     bool halted;                // the controller has taken the stop and reported its position since
     int32_t halted_pos[RNR_AXES];
     bool estop_input;           // the controller reports its e-stop input active
+    slice_outputs_t latest;     // outputs last set by the core
     uint64_t estop_until;       // e-stop seen as a disarm only: reported until then
     char fault_msg[160];
 
@@ -73,7 +78,9 @@ typedef struct {
     uint64_t first_queued;      // PC time at which slices were first seen queued with no run open (0: none)
     uint64_t last_status;
     uint16_t last_slice_seq;
-    uint8_t outputs;
+    uint8_t outputs;            // OUT1..OUT4 last sent
+    uint16_t pwm;               // spindle PWM duty last sent
+    bool outputs_change;        // the run must close: the next slice switches an output
     uint32_t slices_sent, estops_seen;
     bool awaiting_halt;         // stop handled, waiting for a status report that covers it
     uint16_t halt_seq;
@@ -98,6 +105,64 @@ static int send_short (rnr_sink_t *s, rnr_opcode_t op, uint8_t arg5)
     rnr_build_short(buf, op, 0, arg5, 0);
 
     return send_frame(s, buf);
+}
+
+static int send_pwm (rnr_sink_t *s, uint16_t duty)
+{
+    uint8_t buf[RNR_OUT_BYTES];
+
+    rnr_build_pwm(buf, 0, duty > RNR_PWM_PERIOD ? RNR_PWM_PERIOD : duty);
+    s->pwm = duty;
+
+    return send_frame(s, buf);
+}
+
+static uint8_t out_bit (uint8_t n)
+{
+    return n >= 1 && n <= 4 ? (uint8_t)(1u << (n - 1)) : 0;
+}
+
+// Core outputs -> controller outputs OUT1..OUT4
+static uint8_t map_outputs (const rnr_sink_t *s, uint8_t flags)
+{
+    uint8_t out = 0;
+
+    if(flags & SLICE_OUT_SPINDLE)
+        out |= out_bit((flags & SLICE_OUT_SPINDLE_CCW) && s->opt.spindle_ccw_out ? s->opt.spindle_ccw_out : s->opt.spindle_out);
+    if(flags & SLICE_OUT_FLOOD)
+        out |= out_bit(s->opt.flood_out);
+    if(flags & SLICE_OUT_MIST)
+        out |= out_bit(s->opt.mist_out);
+
+    return out;
+}
+
+// Switches the outputs while no run is open: spindle speed first, then the outputs, as Mach3
+// does on M3 and M5.
+static int apply_outputs (rnr_sink_t *s, slice_outputs_t out)
+{
+    int r = RNR_IO_OK;
+    uint8_t outputs = map_outputs(s, out.flags);
+
+    if(out.spindle_pwm != s->pwm)
+        r = send_pwm(s, out.spindle_pwm);
+    if(r == RNR_IO_OK && outputs != s->outputs) {
+        s->outputs = outputs;
+        r = send_short(s, RnrOp_SetOutputs, outputs);
+    }
+
+    return r;
+}
+
+// Spindle stopped and every output off (fault, exit), whatever the core has asked for
+static void outputs_off (rnr_sink_t *s)
+{
+    if(s->pwm)
+        send_pwm(s, 0);
+    if(s->outputs) {
+        s->outputs = 0;
+        send_short(s, RnrOp_SetOutputs, 0);
+    }
 }
 
 static int send_configure (rnr_sink_t *s)
@@ -256,6 +321,7 @@ static void io_thread (void *arg)
         if(fault && s->armed) {
             // Faults disarm the controller: it must not run anything until the bridge restarts
             send_short(s, RnrOp_EStop, 0);
+            outputs_off(s);
             s->armed = false;
             end_motion(s);
         } else if(stop) {
@@ -296,8 +362,51 @@ static void io_thread (void *arg)
             slice_t slice;
             rnr_mutex_lock(&s->lock);
             bool got = s->qcount > 0 && !s->estop_input;
-            if(got) {
+            if(got)
                 slice = s->queue[s->qhead];
+            rnr_mutex_unlock(&s->lock);
+            if(!got)
+                break;
+
+            if(!s->run_open && !(slice.steps[0] | slice.steps[1] | slice.steps[2] | slice.steps[3])) {
+                // Empty slice with no run open (the core wakes the steppers for a block without
+                // motion, e.g. M5 or M9 in a program): it would open a run for nothing
+                rnr_mutex_lock(&s->lock);
+                if(s->qcount > 0) {
+                    s->qhead = (s->qhead + 1) % RNR_QUEUE;
+                    s->qcount--;
+                }
+                rnr_mutex_unlock(&s->lock);
+                s->first_queued = 0;    // the prefill delay starts with the first real slice
+                break;
+            }
+
+            uint8_t outputs = map_outputs(s, slice.out.flags);
+            if(s->run_open && outputs != s->outputs) {
+                // An output switches between two moves (M3, M5, M8...: the core waits for the end of
+                // motion before it changes them). Close the run and switch once every slice before
+                // has run, so that the spindle does not start or stop RNR_LEAD_MS early.
+                s->outputs_change = true;
+                break;
+            }
+
+            if(!s->armed && !arm(s, &st)) {
+                set_fault(s, "cannot arm the controller", false);
+                break;
+            }
+            if(!s->run_open && (apply_outputs(s, slice.out) != RNR_IO_OK)) {
+                set_fault(s, "output write failed", false);
+                break;
+            }
+            if(slice.out.spindle_pwm != s->pwm && send_pwm(s, slice.out.spindle_pwm) != RNR_IO_OK) {
+                // speed change during a run (S word, laser mode): sent ahead of its slice
+                set_fault(s, "spindle PWM write failed", false);
+                break;
+            }
+
+            rnr_mutex_lock(&s->lock);
+            got = s->qcount > 0;    // stop() may have emptied the queue meanwhile
+            if(got) {
                 s->qhead = (s->qhead + 1) % RNR_QUEUE;
                 s->qcount--;
             }
@@ -305,10 +414,6 @@ static void io_thread (void *arg)
             if(!got)
                 break;
 
-            if(!s->armed && !arm(s, &st)) {
-                set_fault(s, "cannot arm the controller", false);
-                break;
-            }
             if(!s->run_open) {
                 // The first program slice opens the run. The controller is at rest between runs:
                 // its counters are the run's start point.
@@ -319,7 +424,7 @@ static void io_thread (void *arg)
             }
 
             uint8_t buf[RNR_OUT_BYTES];
-            rnr_build_slice(buf, RnrOp_GcodeSlice, 0, slice.steps, 0);
+            rnr_build_slice(buf, RnrOp_GcodeSlice, 0, slice.steps, s->outputs);
             if(send_frame(s, buf) != RNR_IO_OK) {
                 set_fault(s, "slice write failed", false);
                 break;
@@ -329,22 +434,32 @@ static void io_thread (void *arg)
             s->last_slice_seq = s->seq;
             s->slices_sent++;
             s->busy_until = (s->busy_until > now ? s->busy_until : now) + SLICE_US;
-            if(slice.outputs != s->outputs) {
-                s->outputs = slice.outputs;
-                send_short(s, RnrOp_SetOutputs, s->outputs);
-            }
         }
 
         // Close the run once the controller has run out of slices
         rnr_mutex_lock(&s->lock);
         bool empty = s->qcount == 0;
+        slice_outputs_t latest = s->latest;
+        bool blocked = s->blocked;
         rnr_mutex_unlock(&s->lock);
-        if(s->run_open && empty && now > s->busy_until + (uint64_t)REST_MS * 1000u &&
+        if(s->run_open && (empty || s->outputs_change) && now > s->busy_until + (uint64_t)REST_MS * 1000u &&
             (int16_t)(st.ack_seq - s->last_slice_seq) >= 0) {
             send_short(s, RnrOp_EndOfMotion, s->outputs);
             s->run_open = false;
+            s->outputs_change = false;
             s->check_pending = true;
             s->check_seq = s->seq;
+        }
+
+        // Outputs at rest (M3 without motion, M5 at the end of a program): applied once the
+        // controller has run every slice
+        if(!s->run_open && empty && !s->estop_input &&
+            (map_outputs(s, latest.flags) != s->outputs || latest.spindle_pwm != s->pwm)) {
+            if(map_outputs(s, latest.flags) && !s->armed && (blocked || !arm(s, &st))) {
+                if(!blocked)
+                    set_fault(s, "cannot arm the controller", false);
+            } else if(apply_outputs(s, latest) != RNR_IO_OK)
+                set_fault(s, "output write failed", false);
         }
 
         rnr_mutex_lock(&s->lock);
@@ -427,6 +542,15 @@ static bool rnr_get_halted_position (slice_sink_t *sink, int32_t position[SLICE_
     return halted;
 }
 
+static void rnr_set_outputs (slice_sink_t *sink, slice_outputs_t out)
+{
+    rnr_sink_t *s = sink->ctx;
+
+    rnr_mutex_lock(&s->lock);
+    s->latest = out;
+    rnr_mutex_unlock(&s->lock);
+}
+
 static bool rnr_estop_active (slice_sink_t *sink)
 {
     rnr_sink_t *s = sink->ctx;
@@ -458,8 +582,9 @@ static void rnr_close (slice_sink_t *sink)
     rnr_mutex_unlock(&s->lock);
     rnr_thread_join(s->thread);
 
-    // Leave the controller disarmed
+    // Leave the controller disarmed, spindle and outputs off
     send_short(s, RnrOp_EStop, 0);
+    outputs_off(s);
     fprintf(stderr, "[rnr] closed: %u slices sent, %u controller e-stops, position checks after runs: %u ok, %u mismatch\n",
              s->slices_sent, s->estops_seen, s->checks_ok, s->checks_bad);
 
@@ -494,6 +619,8 @@ slice_sink_t *sink_rnr_open (rnr_transport_t *t, const rnr_options_t *opt)
     if(r == RNR_IO_OK)
         r = send_short(s, RnrOp_EStop, 0);
     if(r == RNR_IO_OK)
+        r = send_pwm(s, 0);
+    if(r == RNR_IO_OK)
         r = send_short(s, RnrOp_SetOutputs, 0);
     if(r == RNR_IO_OK)
         r = send_positions(s, zero);
@@ -523,6 +650,7 @@ slice_sink_t *sink_rnr_open (rnr_transport_t *t, const rnr_options_t *opt)
     sink->get_halted_position = rnr_get_halted_position;
     sink->close = rnr_close;
     sink->estop_active = rnr_estop_active;
+    sink->set_outputs = rnr_set_outputs;
     sink->ctx = s;
 
     return sink;

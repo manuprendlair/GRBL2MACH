@@ -1,7 +1,7 @@
 /*
   sink_file.c - "file" slice sink (CSV)
 
-  One line per slice: index, start time (s), dX, dY, dZ, dA, outputs.
+  One line per slice: index, start time (s), dX, dY, dZ, dA, output flags, spindle PWM.
   Always accepts (no back-pressure): used for dry runs without hardware
   and for regression tests.
 
@@ -32,8 +32,8 @@ static sink_status_t file_push (slice_sink_t *sink, const slice_t *s)
         return Sink_Ok;
     }
 
-    if(fprintf(c->f, "%u,%.3f,%d,%d,%d,%d,%u\n", s->index, s->index * (SLICE_MS / 1000.0),
-                s->steps[0], s->steps[1], s->steps[2], s->steps[3], s->outputs) < 0)
+    if(fprintf(c->f, "%u,%.3f,%d,%d,%d,%d,%u,%u\n", s->index, s->index * (SLICE_MS / 1000.0),
+                s->steps[0], s->steps[1], s->steps[2], s->steps[3], s->out.flags, s->out.spindle_pwm) < 0)
         return Sink_Error;
 
     for(int i = 0; i < SLICE_AXES; i++)
@@ -92,7 +92,7 @@ slice_sink_t *sink_file_open (const char *path)
         return NULL;
     }
 
-    fprintf(c->f, "# GRBL2MACH %d ms step slices\n# index,t_s,dx,dy,dz,da,out\n", SLICE_MS);
+    fprintf(c->f, "# GRBL2MACH %d ms step slices\n# index,t_s,dx,dy,dz,da,out,pwm\n", SLICE_MS);
 
     sink->name = "file";
     sink->push = file_push;

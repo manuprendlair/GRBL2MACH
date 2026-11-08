@@ -71,7 +71,29 @@ static const char *fake_log = NULL;             // -f
 static bool use_usb = false;                    // -u
 static bool speedup_given = false;
 static bool irq_lock_on = true;                 // --no-irq-lock
-static rnr_options_t rnr_opt = {0};             // --rnr-invert
+static rnr_options_t rnr_opt = { .spindle_out = 1 };  // --rnr-invert, --rnr-out
+
+// --rnr-out spindle=1,ccw=0,flood=2,mist=0
+static bool parse_rnr_outputs (const char *arg)
+{
+    char buf[128], *save = NULL;
+
+    snprintf(buf, sizeof(buf), "%s", arg);
+    for(char *item = strtok_r(buf, ",", &save); item; item = strtok_r(NULL, ",", &save)) {
+        char *eq = strchr(item, '=');
+        if(!eq || eq[1] < '0' || eq[1] > '4' || eq[2])
+            return false;
+        *eq = 0;
+        uint8_t n = (uint8_t)(eq[1] - '0');
+        if(!strcmp(item, "spindle")) rnr_opt.spindle_out = n;
+        else if(!strcmp(item, "ccw")) rnr_opt.spindle_ccw_out = n;
+        else if(!strcmp(item, "flood")) rnr_opt.flood_out = n;
+        else if(!strcmp(item, "mist")) rnr_opt.mist_out = n;
+        else return false;
+    }
+
+    return true;
+}
 
 void print_usage(const char* badarg)
 {
@@ -95,6 +117,9 @@ void print_usage(const char* badarg)
       "    --no-irq-lock      : GRBL2MACH: let simulated interrupts run concurrently with the core (upstream behaviour).\n"
       "    --rnr-invert <hex> : GRBL2MACH: controller step/dir inversion byte (bits 0-3: step active low X..A,\n"
       "                         bits 4-7: direction inverted X..A; Mach3 example 0x8F). Default 0.\n"
+      "    --rnr-out <function>=<n>[,...] : GRBL2MACH: controller output OUT<n> (1-4, 0 = none) driven by\n"
+      "                         spindle (M3/M4), ccw (M4, when apart from spindle), flood (M8), mist (M7).\n"
+      "                         Default spindle=1 (Mach3 Spindle CW on OUT1), coolant on no output.\n"
 	  "    -d <directory>     : directory to mount as local filing system.\n"
       "    -c<comment_char>   : character to print before each line from grbl.  default = '#'\n"
       "    -n                 : no comments before grbl response lines.\n"
@@ -281,6 +306,15 @@ int main(int argc, char *argv[])
 
             if (!strcmp(argv[0], "--no-irq-lock")) {
                 irq_lock_on = false;
+                continue;
+            }
+
+            if (!strcmp(argv[0], "--rnr-out") && argc > 1) {
+                argv++; argc--;
+                if (!parse_rnr_outputs(*argv)) {
+                    print_usage(*argv);
+                    exit(-1);
+                }
                 continue;
             }
 

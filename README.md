@@ -26,7 +26,7 @@ GRBL2MACH replaces the simulated hardware with the USB controller.
 | USB IDs | VID `0xA720`, PID `0xF803` ("RobotAndRobot.com", "RNR ECO MOTION 2.0") |
 | Interface | USB HID, report IDs 2 (8 bytes) and 3 (26 bytes) out, 1 (48 bytes) in; status about every 50 ms |
 | Axes | X, Y, Z, A, up to 100 kHz step rate |
-| Principle | the PC plans, the controller executes: every 5 ms the PC sends a "slice" of signed steps per axis; outputs OUT1..OUT4 are set by separate frames |
+| Principle | the PC plans, the controller executes: every 5 ms the PC sends a "slice" of signed steps per axis; outputs OUT1..OUT4 ride in the slices during motion and in separate frames at rest; spindle speed is a PWM frame |
 
 Protocol information comes from static analysis of the vendor's Mach3 plugin, from the
 specification published by [BreakoutCNC](https://github.com/rolanddd-hu/BreakoutCNC), and from USB
@@ -68,6 +68,11 @@ proprietary and is **not** distributed here.
     grblHAL reset.
   - A 500 ms status watchdog or USB loss is reported as a motor fault (ALARM:17) and disarms the
     board.
+  - Spindle and coolant: grblHAL's spindle (M3/M4, S) and coolant (M7/M8) drive the board's PWM
+    frame and outputs OUT1..OUT4 (`--rnr-out`). As grblHAL changes them between moves only, a run is
+    closed before an output switches, and the switch goes out once the motion before it has run (not
+    75 ms early). During a run, every slice carries the outputs, like Mach3. The PWM duty is
+    `S / $30` in 1/1000, like Mach3 (S12000 with `$30=24000` = 500/1000).
 - **Position resync**: the simulator runs a little ahead of the machine (queued slices). After a
   reset, grblHAL's position is set back to where the board actually stopped (its step counters plus
   the offset between grblHAL and the counted steps, sampled at rest), before any new command runs.
@@ -116,12 +121,18 @@ grblHAL_sim -f <log file>      drive a fake RNR controller (tests), logging ever
 grblHAL_sim -l <address>       address to listen on with -p (default 127.0.0.1)
 grblHAL_sim --no-irq-lock      let simulated interrupts run concurrently with the core (upstream)
 grblHAL_sim --rnr-invert <hex> step/direction inversion sent to the controller (default 0)
+grblHAL_sim --rnr-out spindle=1,ccw=0,flood=0,mist=0   controller outputs (default: spindle on OUT1)
 ```
 
 `--rnr-invert` takes the same values as Mach3's *Ports & Pins > Motor Outputs* page: bits 0-3 make
 the step pulse active low on X, Y, Z, A ("Step Low Active"), bits 4-7 invert the direction of X, Y,
 Z, A ("Dir LowActive"). Example: step low active on all four axes, A direction inverted: `0x8F`.
 **Use the same values as your Mach3 profile**: a wrong step polarity can lose steps.
+
+`--rnr-out` assigns OUT1..OUT4 (0 = none) to: `spindle` (on with M3 or M4), `ccw` (M4, when the
+spindle has a separate counter-clockwise output; 0 = same as `spindle`), `flood` (M8) and `mist`
+(M7), as in Mach3's *Ports & Pins > Output Signals* and *Spindle Setup* pages. Set `$30` (maximum
+spindle speed) to the speed reached at 100 % PWM.
 
 `-o`, `-u` and `-f` are mutually exclusive. With `-u` or `-f`, the simulation runs at 1.05 x real
 time unless `-t` is given; slice back-pressure then locks it to the machine.
@@ -132,8 +143,8 @@ Example: listen on TCP port 23023 and write slices to `slices.csv`:
 grblHAL_sim -n -p 23023 -o slices.csv
 ```
 
-Each CSV line is `index,t_s,dx,dy,dz,da,out` (slice number, start time in seconds, signed steps
-per axis, outputs bitmask). The last line gives the totals.
+Each CSV line is `index,t_s,dx,dy,dz,da,out,pwm` (slice number, start time in seconds, signed steps
+per axis, outputs bitmask: 1 spindle, 2 counter-clockwise, 4 flood, 8 mist; spindle PWM in 1/1000). The last line gives the totals.
 
 > `-u` has **not been tested on real hardware yet**. The controller's limit, home and probe inputs
 > are not configured yet (all disabled in the configuration frame); its e-stop input (IN1) works
@@ -169,6 +180,9 @@ The fake controller behaves like the real board as seen in the Mach3 captures (s
   move right after the reset, the move must start from the resynced position);
 - `estop`: the board's e-stop input is pressed during a move: grblHAL must raise ALARM:10, resync
   to where the board stopped, and re-arm it for the next move once released and reset.
+- `outputs`: M3 S12000, a move, M8, a move, M5 M9: spindle PWM and outputs must switch before the
+  first slice, between the two runs once the first move has run, and after the last one; every
+  slice must carry the outputs.
 
 ```
 powershell -File tests\run_fake_board.ps1 -Scenario all
@@ -193,6 +207,11 @@ powershell -File tests\run_fake_board.ps1 -Scenario all
   upstream; the submodule will go back to grblHAL/core once it is merged.
 - The frame sequence follows USB captures of Mach3; the bridge itself has not been captured on the
   real board yet (to compare frame by frame, including the 9-byte short reports).
+- Spindle and outputs follow the Mach3 captures (PWM frame, outputs frame, outputs byte in every
+  slice) but have only been tested against the fake controller. No spindle ramp or spin-down delay
+  is added by the bridge (Mach3 waits 1 s before switching OUT1 off after M5); use grblHAL's own
+  spindle delay settings if needed. Changing `$30` now takes effect at once (the upstream simulator
+  only applied it after a restart).
 - Feed hold: grblHAL decelerates in the slices it sends, like Mach3. The board's "stop jog" frame,
   which drops its buffer, is not used yet (it would make holds and jog cancels react faster).
 
@@ -204,7 +223,7 @@ powershell -File tests\run_fake_board.ps1 -Scenario all
    off, then small moves without a tool, far from the limits).
 4. ~~USB captures of Mach3 driving the same machine; bridge aligned on them.~~ Done.
 5. Homing and probing using the controller's hardware latches.
-6. Mach3 XML profile importer, spindle and outputs.
+6. ~~Spindle and outputs.~~ Done (against the fake controller). Mach3 XML profile importer.
 
 ## Safety
 

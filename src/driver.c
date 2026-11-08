@@ -301,10 +301,13 @@ probe_state_t probeGetState (void)
     return state;
 }
 
+static uint_fast16_t spindleGetPWM (spindle_ptrs_t *spindle, float rpm);
+
 // Start or stop spindle
 static void spindleSetState (spindle_ptrs_t *spindle, spindle_state_t state, float rpm)
 {
     mcu_gpio_set(&gpio[SPINDLE_PORT], state.value ^ settings.pwm_spindle.invert.mask, SPINDLE_MASK);
+    slicer_set_spindle(state.on, state.ccw, (uint16_t)spindleGetPWM(spindle, rpm));   // GRBL2MACH
 }
 
 // Variable spindle control functions
@@ -312,17 +315,28 @@ static void spindleSetState (spindle_ptrs_t *spindle, spindle_state_t state, flo
 // Sets spindle speed
 static void spindle_set_speed (spindle_ptrs_t *spindle, uint_fast16_t pwm_value)
 {
+    slicer_set_spindle_pwm((uint16_t)pwm_value);   // GRBL2MACH
 }
 
 static uint_fast16_t spindleGetPWM (spindle_ptrs_t *spindle, float rpm)
 {
-    return 0; //spindle_compute_pwm_value(&spindle_pwm, rpm, false);
+    // GRBL2MACH: duty cycle in 1/SLICE_PWM_PERIOD of the maximum speed ($30), like Mach3 (S12000
+    // with a 24000 rpm spindle = 500/1000)
+    float max = settings.pwm_spindle.rpm_max;
+
+    if(rpm <= 0.0f || max <= 0.0f)
+        return 0;
+    if(rpm < settings.pwm_spindle.rpm_min)
+        rpm = settings.pwm_spindle.rpm_min;
+
+    return rpm >= max ? SLICE_PWM_PERIOD : (uint_fast16_t)(rpm * SLICE_PWM_PERIOD / max);
 }
 
 // Start or stop spindle
 static void spindleSetStateVariable (spindle_ptrs_t *spindle, spindle_state_t state, float rpm)
 {
     mcu_gpio_set(&gpio[SPINDLE_PORT], state.value ^ settings.pwm_spindle.invert.mask, SPINDLE_MASK);
+    slicer_set_spindle(state.on, state.ccw, (uint16_t)spindleGetPWM(spindle, rpm));   // GRBL2MACH
 }
 
 // Returns spindle state in a spindle_state_t variable
@@ -342,9 +356,12 @@ static bool spindleConfig (spindle_ptrs_t *spindle)
 
 	static spindle_pwm_t spindle_pwm;
 
+    spindle->context.pwm = &spindle_pwm;
 	spindle_precompute_pwm_values(spindle, &spindle_pwm, &settings.pwm_spindle, 1000000);
 
-//    spindle_update_caps(spindle, spindle->cap.variable ? &spindle_pwm : NULL);
+    // GRBL2MACH: copies the new speed range ($30, $31) to the enabled spindle, as hardware drivers
+    // do: without it, $30 only took effect after a restart
+    spindle_update_caps(spindle, spindle->cap.variable ? &spindle_pwm : NULL);
 
     return true;
 }
@@ -352,6 +369,7 @@ static bool spindleConfig (spindle_ptrs_t *spindle)
 static void coolantSetState (coolant_state_t mode)
 {
     mcu_gpio_set(&gpio[COOLANT_PORT], mode.value ^ settings.coolant.invert.mask, COOLANT_MASK);
+    slicer_set_coolant(mode.flood, mode.mist);    // GRBL2MACH
 }
 
 static coolant_state_t coolantGetState (void)

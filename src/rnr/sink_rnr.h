@@ -14,6 +14,9 @@ typedef struct {
     // Configure frame byte 15: bits 0-3 = step pulse active low X..A, bits 4-7 = direction
     // inverted X..A (Mach3: "Step Low Active" / "Dir LowActive" in Ports & Pins > Motor Outputs)
     uint8_t step_dir_invert;
+    // Controller output (1..4 = OUT1..OUT4, 0 = none) driven by: spindle on, spindle on in
+    // counter-clockwise (0: same output as spindle_out), flood coolant, mist coolant
+    uint8_t spindle_out, spindle_ccw_out, flood_out, mist_out;
 } rnr_options_t;
 
 // Takes ownership of the transport (closed on failure or by sink->close).

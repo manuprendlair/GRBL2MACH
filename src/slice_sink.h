@@ -16,10 +16,22 @@
 #define SLICE_AXES 4    // X, Y, Z, A: the four axes of the RNR controller
 #define SLICE_MS   5    // slice duration (the RNR controller executes one slice every 5 ms, as Mach3 configures it)
 
+// Machine outputs as the core sets them; each sink maps them to its own outputs.
+#define SLICE_OUT_SPINDLE     0x01  // spindle on (M3 or M4)
+#define SLICE_OUT_SPINDLE_CCW 0x02  // spindle turning counter-clockwise (M4)
+#define SLICE_OUT_FLOOD       0x04  // flood coolant (M8)
+#define SLICE_OUT_MIST        0x08  // mist coolant (M7)
+#define SLICE_PWM_PERIOD      1000  // spindle_pwm unit: duty cycle in 1/1000 (0 = off, 1000 = max speed)
+
+typedef struct {
+    uint8_t  flags;             // SLICE_OUT_xxx
+    uint16_t spindle_pwm;       // spindle speed in 1/SLICE_PWM_PERIOD of the maximum speed ($30)
+} slice_outputs_t;
+
 typedef struct {
     uint32_t index;             // slice number since start; slice starts at index * SLICE_MS (simulated time)
     int32_t  steps[SLICE_AXES]; // signed steps per axis to execute during the slice
-    uint8_t  outputs;           // outputs OUT1..OUT4 (bit 0 = OUT1)
+    slice_outputs_t out;        // outputs while the slice runs
 } slice_t;
 
 typedef enum {
@@ -52,6 +64,10 @@ struct slice_sink {
     // True while the machine reports an emergency stop of its own (hardware e-stop input).
     // Optional (NULL: no such input). Thread-safe.
     bool (*estop_active)(slice_sink_t *sink);
+    // The core changed the outputs (spindle, coolant). Slices pushed from now on carry the new
+    // state; this call tells the sink about it when no motion follows (outputs at rest). The sink
+    // applies it once every slice pushed before it has run. Optional. Thread-safe.
+    void (*set_outputs)(slice_sink_t *sink, slice_outputs_t out);
     void *ctx;
     // To come with the controller: limit and probe inputs, homing/probe arming, latched positions.
 };

@@ -51,10 +51,10 @@ void rnr_build_short (uint8_t buf[RNR_OUT_BYTES], rnr_opcode_t op, uint16_t seq,
 void rnr_build_slice (uint8_t buf[RNR_OUT_BYTES], rnr_opcode_t op, uint16_t seq, const int32_t steps[RNR_AXES], uint8_t outputs)
 {
     header(buf, RNR_FRAME_EXTENDED, op, seq);
-    // buf[5..8]: slice header, always 0 in the Mach3 captures
+    // buf[5..8]: Mach3 puts the G-code line number there (0-based; 0 in MDI): left at 0
     for(int a = 0; a < RNR_AXES; a++)
         rnr_put_le32(&buf[9 + a * 4], (uint32_t)steps[a]);
-    buf[25] = outputs;  // always 0 in the Mach3 captures (outputs go through SetOutputs / EndOfMotion)
+    buf[25] = outputs;  // OUT1..OUT4 while the slice runs (Mach3: 0x01 in every slice while the spindle turns)
 }
 
 void rnr_build_positions (uint8_t buf[RNR_OUT_BYTES], uint16_t seq, const int32_t steps[RNR_AXES], uint8_t axis_mask)
@@ -94,4 +94,11 @@ bool rnr_parse_status (const uint8_t *rx, int len, rnr_status_t *s)
     s->mpg = rnr_get_le16(&rx[46]) >> 2;
 
     return true;
+}
+
+void rnr_build_pwm (uint8_t buf[RNR_OUT_BYTES], uint16_t seq, uint16_t duty)
+{
+    header(buf, RNR_FRAME_SHORT, RnrOp_SpindlePwm, seq);
+    rnr_put_le16(&buf[5], duty);
+    rnr_put_le16(&buf[7], RNR_PWM_PERIOD);
 }

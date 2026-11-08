@@ -38,6 +38,7 @@
 
 typedef struct {
     int32_t steps[RNR_AXES];
+    uint8_t outputs;
 } fake_slice_t;
 
 typedef struct {
@@ -52,6 +53,7 @@ typedef struct {
     bool seq_started;
     int32_t live[RNR_AXES];
     uint8_t outputs;
+    uint16_t pwm;
     // statistics
     int max_depth, rejected, seq_errors, overflows, starved, executed, frames, estops;
     int idle_in_run;    // empty periods since the last executed slice of the open run
@@ -62,6 +64,15 @@ typedef struct {
 static double ms (fake_t *f, uint64_t t)
 {
     return (t - f->t0) / 1000.0;
+}
+
+// Output changes are logged when they take effect, with the position at that time
+static void set_outputs (fake_t *f, uint64_t now, uint8_t outputs)
+{
+    if(outputs != f->outputs)
+        fprintf(f->log, "%10.3f OUTPUTS 0x%02X -> 0x%02X pwm=%u pos=%d,%d,%d,%d buffered=%d\n", ms(f, now), f->outputs, outputs,
+                 f->pwm, f->live[0], f->live[1], f->live[2], f->live[3], f->count);
+    f->outputs = outputs;
 }
 
 static bool running (fake_t *f)
@@ -78,6 +89,7 @@ static void run_until (fake_t *f, uint64_t now)
                 fake_slice_t *s = &f->buf[f->head];
                 for(int a = 0; a < RNR_AXES; a++)
                     f->live[a] += s->steps[a];
+                set_outputs(f, f->next_exec, s->outputs);
                 f->head = (f->head + 1) % BUFFER_SLICES;
                 f->count--;
                 f->executed++;
@@ -130,6 +142,7 @@ static int fake_write (rnr_transport_t *t, const uint8_t b[RNR_OUT_BYTES])
     f->last_seq = seq;
     f->ack_seq = seq;   // acknowledged once buffered
 
+    int new_outputs = -1;     // SetOutputs / EndOfMotion: applied after the frame is logged
     fprintf(f->log, "%10.3f op=0x%02X seq=%u flags=0x%02X", ms(f, now), op, seq, b[2]);
 
     switch(op) {
@@ -165,12 +178,17 @@ static int fake_write (rnr_transport_t *t, const uint8_t b[RNR_OUT_BYTES])
         case RnrOp_SetOutputs:
         case RnrOp_EndOfMotion:
             fprintf(f->log, " outputs=0x%02X", b[5]);
-            f->outputs = b[5];
+            new_outputs = b[5];
             if(op == RnrOp_EndOfMotion && (f->state == RnrState_Jog || f->state == RnrState_Program)) {
                 if(f->count)
                     fprintf(f->log, " (%d slices still buffered)", f->count);
                 f->state = f->count ? RnrState_Ending : RnrState_Ready;
             }
+            break;
+
+        case RnrOp_SpindlePwm:
+            f->pwm = rnr_get_le16(&b[5]);
+            fprintf(f->log, " pwm=%u/%u", f->pwm, rnr_get_le16(&b[7]));
             break;
 
         case RnrOp_StartJog:
@@ -200,7 +218,10 @@ static int fake_write (rnr_transport_t *t, const uint8_t b[RNR_OUT_BYTES])
             fake_slice_t s;
             for(int a = 0; a < RNR_AXES; a++)
                 s.steps[a] = rnr_get_le32(&b[9 + a * 4]);
+            s.outputs = b[25];
             fprintf(f->log, " d=%d,%d,%d,%d", s.steps[0], s.steps[1], s.steps[2], s.steps[3]);
+            if(s.outputs)
+                fprintf(f->log, " out=0x%02X", s.outputs);
             if(!f->first_slice_us)
                 f->first_slice_us = now;
             if(op == RnrOp_GcodeSlice && (f->state == RnrState_Ready || f->state == RnrState_Ending)) {
@@ -235,6 +256,8 @@ static int fake_write (rnr_transport_t *t, const uint8_t b[RNR_OUT_BYTES])
             break;
     }
     fprintf(f->log, " state=%u\n", f->state);
+    if(new_outputs >= 0)
+        set_outputs(f, now, (uint8_t)new_outputs);
 
     return RNR_IO_OK;
 }

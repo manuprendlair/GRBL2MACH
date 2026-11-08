@@ -20,5 +20,9 @@ void slicer_close (void);                         // sends the current slice and
 void slicer_attach_core (void);                   // hooks the core's reset event (call once the core is initialised)
 bool slicer_motor_fault (void);                   // true while the sink has failed (reported as the motor fault signal)
 bool slicer_estop (void);                         // true while the machine reports an e-stop (reported as the e-stop signal); any thread
+// Outputs set by the core (any thread): stamped on every slice and passed to the sink
+void slicer_set_spindle (bool on, bool ccw, uint16_t pwm); // pwm: 0..SLICE_PWM_PERIOD
+void slicer_set_spindle_pwm (uint16_t pwm);           // speed change only (laser mode, S word)
+void slicer_set_coolant (bool flood, bool mist);
 
 #endif
