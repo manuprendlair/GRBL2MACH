@@ -196,7 +196,7 @@ void print_usage(const char* badarg)
 
 void print_version(void)
 {
-    printf("grblHAL simulator\n"
+    printf("GRBL2MACH: grblHAL core driving an RNR Eco Motion USB controller (based on the grblHAL simulator)\n"
       "  Build type : %s\n"
       "  Compiler   : %s\n"
       "  Target     : %s\n"

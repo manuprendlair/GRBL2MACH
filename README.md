@@ -156,19 +156,19 @@ GRBL2MACH adds these options to the simulator (all other options are described i
 [README.simulator.md](README.simulator.md)):
 
 ```
-grblHAL_sim -o <slice file>    write 5 ms step slices (CSV) to a file
-grblHAL_sim -u                 drive the RNR Eco Motion USB controller (needs MACH3.xml, see below)
-grblHAL_sim -f <log file>      drive a fake RNR controller (tests), logging every frame
-grblHAL_sim -l <address>       address to listen on with -p (default 127.0.0.1)
-grblHAL_sim --no-irq-lock      let simulated interrupts run concurrently with the core (upstream)
-grblHAL_sim --mach3 <file>     the machine's Mach3 profile (default: MACH3.xml next to the program)
+grbl2mach -o <slice file>    write 5 ms step slices (CSV) to a file
+grbl2mach -u                 drive the RNR Eco Motion USB controller (needs MACH3.xml, see below)
+grbl2mach -f <log file>      drive a fake RNR controller (tests), logging every frame
+grbl2mach -l <address>       address to listen on with -p (default 127.0.0.1)
+grbl2mach --no-irq-lock      let simulated interrupts run concurrently with the core (upstream)
+grbl2mach --mach3 <file>     the machine's Mach3 profile (default: MACH3.xml next to the program)
 
 options overriding what the Mach3 profile describes (trials, tests):
-grblHAL_sim --rnr-invert <hex> step/direction inversion sent to the controller (default 0)
-grblHAL_sim --rnr-out spindle=1,ccw=0,flood=0,mist=0   controller outputs (default: spindle on OUT1)
-grblHAL_sim --rnr-in xhome=3low,...,probe=2            controller inputs (as Mach3's Input Signals page)
-grblHAL_sim --rnr-estop-in <n>[low]                    e-stop input (default 1: IN1 active high)
-grblHAL_sim --rnr-pins <20 hex digits>                 input bytes copied from a Mach3 capture instead
+grbl2mach --rnr-invert <hex> step/direction inversion sent to the controller (default 0)
+grbl2mach --rnr-out spindle=1,ccw=0,flood=0,mist=0   controller outputs (default: spindle on OUT1)
+grbl2mach --rnr-in xhome=3low,...,probe=2            controller inputs (as Mach3's Input Signals page)
+grbl2mach --rnr-estop-in <n>[low]                    e-stop input (default 1: IN1 active high)
+grbl2mach --rnr-pins <20 hex digits>                 input bytes copied from a Mach3 capture instead
 ```
 
 `--rnr-invert` takes the same values as Mach3's *Ports & Pins > Motor Outputs* page: bits 0-3 make
@@ -187,7 +187,7 @@ time unless `-t` is given; slice back-pressure then locks it to the machine.
 Example: listen on TCP port 23023 and write slices to `slices.csv`:
 
 ```
-grblHAL_sim -n -p 23023 -o slices.csv
+grbl2mach -n -p 23023 -o slices.csv
 ```
 
 Each CSV line is `index,t_s,dx,dy,dz,da,out,pwm` (slice number, start time in seconds, signed steps
@@ -224,7 +224,7 @@ connect over TCP (`-p`). Piping commands into stdin does not work.
 ## Machine profile (Mach3 XML)
 
 GRBL2MACH takes the machine's description from its **Mach3 profile**: the `.xml` file Mach3 keeps
-in its folder (for example `C:\Mach3\MACH3_CNCX.xml`). **Copy it next to `grblHAL_sim` and name it
+in its folder (for example `C:\Mach3\MACH3_CNCX.xml`). **Copy it next to `grbl2mach` and name it
 `MACH3.xml`** (or give its path with `--mach3`). Driving the real controller (`-u`) is refused
 without it; the fake controller (`-f`) uses one only with `--mach3`. The copy is GRBL2MACH's own:
 it is never looked for in Mach3's folder, and providing it is the user's responsibility.
@@ -285,6 +285,9 @@ no Mach3 and nothing to install: open the page (double-click it), open the `.xml
   mapping, Multi-Step Speed).
 - Saving replaces only the values changed: every other byte stays as it was, so Mach3 can still
   read the file. Keep the original as a backup. Ctrl+S saves; dark theme, light on request.
+- Chrome and Edge save where you choose, starting in the folder of the opened file. Firefox does
+  not let a web page choose: the file goes to the Downloads folder (or set Firefox to always ask
+  where to save files).
 
 `node tests/mach3_editor_test.js [profile.xml]` checks the editor's core: an unchanged profile is
 saved byte for byte, edits touch nothing else, and its GRBL2MACH view equals what the bridge

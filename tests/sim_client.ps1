@@ -1,11 +1,11 @@
 # sim_client.ps1 - helpers shared by the GRBL2MACH tests (dot-source this file)
 #
-# Start-Sim starts grblHAL_sim with the given extra arguments, connects over TCP and returns a
+# Start-Sim starts grbl2mach with the given extra arguments, connects over TCP and returns a
 # session object. Invoke-GCode sends lines and waits for "ok"; Wait-Idle polls the status report;
 # Stop-Sim shuts the simulator down cleanly (Ctrl-F) and waits for it to exit.
 
 # GRBL2MACH_SIM may point to another build of the simulator (for example an instrumented one)
-$script:SimExe = if ($env:GRBL2MACH_SIM) { $env:GRBL2MACH_SIM } else { Join-Path $PSScriptRoot "..\build\grblHAL_sim.exe" }
+$script:SimExe = if ($env:GRBL2MACH_SIM) { $env:GRBL2MACH_SIM } else { Join-Path $PSScriptRoot "..\build\grbl2mach.exe" }
 
 function Start-Sim([string]$SimArgs, [string]$OutDir, [int]$Port, [hashtable]$Env = @{}) {
     New-Item -ItemType Directory -Force $OutDir | Out-Null

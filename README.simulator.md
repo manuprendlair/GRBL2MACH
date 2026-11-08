@@ -1,3 +1,7 @@
+> **GRBL2MACH note.** This is the documentation of the upstream grblHAL Simulator, which GRBL2MACH
+> is built on. Its options still apply. In GRBL2MACH the programs are named `grbl2mach` (was
+> `grblHAL_sim`) and `grbl2mach_validator` (was `grblHAL_validator`); see [README.md](README.md).
+
 # grblHAL SIM 
 
 ## What can you do with grblHAL Sim? 
@@ -35,7 +39,7 @@ $ make
  On Linux, hook it to a fake serial port (/dev/ttygrblHAL) and use it to test your grblHAL interface software:
 
  ``` 
- socat PTY,raw,link=/dev/ttyGRBL,echo=0,group-late=dialout,mode=660 "EXEC:'./grblHAL_sim -n -s step.out -b block.out',pty,raw,echo=0" 
+ socat PTY,raw,link=/dev/ttyGRBL,echo=0,group-late=dialout,mode=660 "EXEC:'./grbl2mach -n -s step.out -b block.out',pty,raw,echo=0" 
  ```
 
  After this command, the simulator is running and has a serial connection to `/dev/ttyGRBL`. 
@@ -66,7 +70,7 @@ brew install cmake socat minicom
 ```
 Follow the same build instructions as on Linux above, then run using:
 ```
-socat -d -d pty,raw,echo=0,link=/tmp/ttyGRBLsim "EXEC:'./grblHAL_sim -n -s step.out -b block.out',pty,raw,echo=0"
+socat -d -d pty,raw,echo=0,link=/tmp/ttyGRBLsim "EXEC:'./grbl2mach -n -s step.out -b block.out',pty,raw,echo=0"
 ```
 
 ## Realtime modifications:
@@ -78,7 +82,7 @@ socat -d -d pty,raw,echo=0,link=/tmp/ttyGRBLsim "EXEC:'./grblHAL_sim -n -s step.
 
 Run 
 ```
-$ grblHAL_validator GCODE_FILE
+$ grbl2mach_validator GCODE_FILE
 ``` 
 to validate that grblHAL will parse your GCODE with no errors.
 

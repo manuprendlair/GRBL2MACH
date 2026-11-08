@@ -1,6 +1,6 @@
 # run_slices.ps1 - dry run of the step slicer (GRBL2MACH, plan step 2)
 #
-# Starts grblHAL_sim with the "file" slice sink (-o), sends a G-code program over TCP,
+# Starts grbl2mach with the "file" slice sink (-o), sends a G-code program over TCP,
 # waits until idle, stops the simulator cleanly (Ctrl-F), then checks the slice file:
 #   - total steps per axis = final position reported by grblHAL (MPos x steps/mm) = expected;
 #   - consecutive slices while moving (no gap);
@@ -18,7 +18,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$sim = Join-Path $PSScriptRoot "..\build\grblHAL_sim.exe"
+$sim = Join-Path $PSScriptRoot "..\build\grbl2mach.exe"
 New-Item -ItemType Directory -Force $OutDir | Out-Null
 $slices = Join-Path $OutDir "slices.csv"
 $eeprom = Join-Path $OutDir "test.eep"

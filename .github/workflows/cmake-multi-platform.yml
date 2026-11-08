@@ -56,5 +56,5 @@ jobs:
       working-directory: ${{ steps.strings.outputs.build-output-dir }}
       shell: bash
       run: |
-        ./grblHAL_validator -h
-        ./grblHAL_sim -h
+        ./grbl2mach_validator -h
+        ./grbl2mach -h

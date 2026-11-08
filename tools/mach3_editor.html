@@ -48,8 +48,12 @@ table { border-collapse: collapse; width: 100%; }
 th, td { border-bottom: 1px solid var(--line); padding: 5px 8px; text-align: left; vertical-align: middle; }
 th { font-weight: 600; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .03em; }
 td.axis { font-weight: 700; width: 40px; }
-input[type=text], input[type=number], select { font: inherit; color: var(--text); background: var(--input); border: 1px solid var(--line); border-radius: 5px; padding: 4px 6px; width: 110px; }
-input[type=number] { text-align: right; }
+input[type=text], input[type=number], select { font: inherit; color: var(--text); background: var(--input); border: 1px solid var(--line); border-radius: 5px; padding: 4px 10px; width: 116px; }
+/* numbers right-aligned with real room on the right; no up/down arrows (values are typed),
+   so the value never sits against the border, in every browser */
+input[type=number] { text-align: right; -moz-appearance: textfield; appearance: textfield; }
+input[type=number]::-webkit-inner-spin-button, input[type=number]::-webkit-outer-spin-button { -webkit-appearance: none; margin: 0; }
+input[type=number]:focus, input[type=text]:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 input[type=checkbox] { width: 16px; height: 16px; }
 .cell { display: inline-flex; align-items: center; gap: 4px; padding: 2px; border-radius: 6px; }
 .cell.changed { background: var(--changed); outline: 1px solid var(--changed-line); }
@@ -87,7 +91,7 @@ footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 2
 <header>
   <h1>Mach3 profile editor</h1>
   <span class="file" id="fileinfo">No profile open</span>
-  <label class="button">Open…<input type="file" id="open" accept=".xml" hidden></label>
+  <button id="openBtn">Open…</button><input type="file" id="open" accept=".xml" hidden>
   <button id="resetAll" disabled>Undo all changes</button>
   <button id="save" class="primary" disabled title="Ctrl+S">Save as MACH3.xml</button>
   <button id="theme" title="Dark / light theme">Light</button>
@@ -97,6 +101,7 @@ footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 2
     <p><strong>Open a Mach3 profile</strong> (the <code>.xml</code> file in Mach3's folder, e.g. <code>C:\Mach3\Mach3Mill.xml</code>)</p>
     <p>Drop it here or use <em>Open…</em>. The file is read and written in your browser only.</p>
     <p>Saving replaces only the values you changed: Mach3 can still read the file. Keep the original as a backup.</p>
+    <p class="hint">Chrome and Edge save where you choose, starting in the folder of the opened file; Firefox saves to your Downloads folder.</p>
     <p class="hint">Changed values are highlighted (↺ puts one back); the <em>Changes</em> tab lists them all. <kbd>Ctrl</kbd>+<kbd>S</kbd> saves.</p>
   </div>
   <div id="editor" hidden>
@@ -458,7 +463,7 @@ function refreshPreview () {
   const v = grbl2machView({ tags: new Map([...profile.tags].map(([k, t]) => [k, { ...t, value: current(k) }])) });
   const hex = (n) => n.toString(16).toUpperCase().padStart(2, "0");
   box.replaceChildren(
-    el("p", { class: "note" }, "What GRBL2MACH will make of this profile (MACH3.xml next to grblHAL_sim): grblHAL settings and the controller's configuration."),
+    el("p", { class: "note" }, "What GRBL2MACH will make of this profile (MACH3.xml next to grbl2mach): grblHAL settings and the controller's configuration."),
     ...v.warnings.map((w) => el("div", { class: "warn" }, w)),
     v.warnings.length ? "" : el("p", { class: "ok" }, "✓ Nothing GRBL2MACH cannot handle."),
     el("h2", {}, "grblHAL settings"),
@@ -548,11 +553,31 @@ document.addEventListener("keydown", (e) => {
 
 async function readFile (file, handle) { openProfile(new Uint8Array(await file.arrayBuffer()), file.name, handle); }
 
-$("#open").addEventListener("change", (e) => e.target.files[0] && readFile(e.target.files[0]));
+// Chrome / Edge: open through the File System Access API, so that saving can start in the folder of
+// the opened file. Other browsers (Firefox): classic file input, and saving goes to downloads.
+const xmlTypes = [{ description: "Mach3 profile", accept: { "application/xml": [".xml"] } }];
+$("#openBtn").addEventListener("click", async () => {
+  if (window.showOpenFilePicker) {
+    try {
+      const [h] = await window.showOpenFilePicker({ types: xmlTypes });
+      await readFile(await h.getFile(), h);
+      return;
+    } catch (err) { if (err.name === "AbortError") return; }
+  }
+  $("#open").click();
+});
+$("#open").addEventListener("change", (e) => { if (e.target.files[0]) readFile(e.target.files[0]); e.target.value = ""; });
 const drop = $("#drop");
 ["dragover", "dragenter"].forEach((t) => document.addEventListener(t, (e) => { e.preventDefault(); drop.classList.add("over"); }));
 ["dragleave", "drop"].forEach((t) => document.addEventListener(t, (e) => { e.preventDefault(); drop.classList.remove("over"); }));
-document.addEventListener("drop", (e) => { const f = e.dataTransfer.files[0]; if (f) readFile(f); });
+document.addEventListener("drop", async (e) => {
+  const item = e.dataTransfer.items && e.dataTransfer.items[0];
+  const f = e.dataTransfer.files[0];
+  let handle = null;
+  // Chrome / Edge: the dropped file's handle, to save next to it
+  if (item && item.getAsFileSystemHandle) { try { handle = await item.getAsFileSystemHandle(); } catch (err) { handle = null; } }
+  if (f) readFile(f, handle && handle.kind === "file" ? handle : null);
+});
 
 $("#resetAll").addEventListener("click", () => { if (confirm("Undo all changes?")) openProfile(profile.bytes, fileName, fileHandle); });
 
@@ -562,14 +587,22 @@ $("#save").addEventListener("click", async () => {
   const blob = new Blob([bytes], { type: "application/xml" });
   if (window.showSaveFilePicker) {
     try {
-      const h = await window.showSaveFilePicker({ suggestedName: "MACH3.xml", types: [{ description: "Mach3 profile", accept: { "application/xml": [".xml"] } }] });
+      // starts in the folder of the opened file when the browser gave its handle
+      const opts = { suggestedName: "MACH3.xml", types: xmlTypes };
+      if (fileHandle) opts.startIn = fileHandle;
+      let h;
+      try { h = await window.showSaveFilePicker(opts); } catch (err) { if (err.name === "AbortError") throw err; delete opts.startIn; h = await window.showSaveFilePicker(opts); }
       const w = await h.createWritable(); await w.write(blob); await w.close();
-      alert(`Saved (${edits.size} values changed). Keep the original file as a backup.`);
+      alert(`Saved as ${h.name} (${edits.size} values changed). Keep the original file as a backup.`);
       return;
     } catch (err) { if (err.name === "AbortError") return; }
   }
   const a = el("a", { href: URL.createObjectURL(blob), download: "MACH3.xml" });
   document.body.append(a); a.click(); a.remove();
+  // Firefox and others: a web page cannot choose the folder, the browser does
+  alert("MACH3.xml was saved by the browser, usually in your Downloads folder: move it next to grbl2mach.\n\n" +
+    "To choose the folder each time in Firefox: Settings > General > Files and Applications > " +
+    "\"Always ask you where to save files\".\n(Chrome and Edge let this page save directly where you choose.)");
 });
 
 window.addEventListener("beforeunload", (e) => { if (edits.size) { e.preventDefault(); e.returnValue = ""; } });

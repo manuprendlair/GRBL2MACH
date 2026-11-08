@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(grblHAL-sim C)
+project(GRBL2MACH C)
 
 add_compile_definitions(F_CPU=16000000)
 #add_compile_definitions(SQUARING_ENABLED=1)
@@ -57,7 +57,7 @@ if(UNIX)
     endif(APPLE)
 endif(UNIX)
 
-add_executable(grblHAL_sim 
+add_executable(grbl2mach 
     ../src/main.c 
     ../src/simulator.c
     ../src/driver.c
@@ -70,7 +70,7 @@ add_executable(grblHAL_sim
     ${platform_SRC}
 )
 
-target_link_libraries(grblHAL_sim PRIVATE
+target_link_libraries(grbl2mach PRIVATE
     m
     grbl
 	sdcard
@@ -78,9 +78,9 @@ target_link_libraries(grblHAL_sim PRIVATE
 )
 
 # Generated build_info.h lands in the build dir.
-target_include_directories(grblHAL_sim PRIVATE ../src ${CMAKE_CURRENT_BINARY_DIR})
+target_include_directories(grbl2mach PRIVATE ../src ${CMAKE_CURRENT_BINARY_DIR})
 
-add_executable(grblHAL_validator
+add_executable(grbl2mach_validator
     ../src/eeprom.c
     ../src/grbl_eeprom_extensions.c
     ../src/validator.c 
@@ -88,7 +88,7 @@ add_executable(grblHAL_validator
     ${platform_SRC}
 )
 
-target_link_libraries(grblHAL_validator PRIVATE 
+target_link_libraries(grbl2mach_validator PRIVATE 
     m
     grbl
     ${platform_LIB}
