@@ -13,9 +13,10 @@ GRBL2MACH replaces the simulated hardware with the USB controller.
 [Mach3 profile editor](https://manuprendlair.github.io/GRBL2MACH/tools/mach3_editor.html)**
 (runs in your browser; the file never leaves your computer).
 
-> **Status: early development.** Tested on one machine (moves, reset, e-stop, homing, probing),
-> not yet in a full session driven by gSender. Use a hardwired e-stop and try it first without a
-> tool. See [Safety](#safety).
+> **Status: early development.** Tested on one machine, driven by gSender 1.6.4: connection,
+> settings (written back to the Mach3 profile), homing, jogs, probing, a full pocket program with
+> feed hold, resume and stop. Not yet used to cut. Use a hardwired e-stop and try it first without
+> a tool. See [Safety](#safety).
 
 ## Goals
 
@@ -201,7 +202,7 @@ per axis, outputs bitmask: 1 spindle, 2 counter-clockwise, 4 flood, 8 mist; spin
 > `-u` has been tested on the reference machine: frames identical to Mach3's (short reports go out
 > as 9-byte transfers), step counts exact, reset, e-stop input stopping the board by itself,
 > homing (`$HZ`, `$H` at Mach3's rates, repeatable to 0.01 mm) and probing (`G38.2`, position
-> latched by the board). Not yet: a full session driven by gSender.
+> latched by the board), and a full session driven by gSender (see [Using gSender](#using-gsender)).
 
 `--rnr-in` declares the board's inputs as Mach3's *Ports & Pins > Input Signals* page does (port 3
 pin n = IN n): `x+`, `x-`, `xhome` (same for `y`, `z`, `a`), `probe` and `estop`, each `=<n>` (0 = not
@@ -225,6 +226,35 @@ changing); the `pins` test checks it against 15 of those frames.
 
 On Windows the console input only reads the keyboard: type commands in the console window, or
 connect over TCP (`-p`). Piping commands into stdin does not work.
+
+## Using gSender
+
+Tested with gSender 1.6.4 on the reference machine.
+
+1. Close Mach3 (it holds the controller). Put your Mach3 profile next to the program as
+   `MACH3.xml` (see [Machine profile](#machine-profile-mach3-xml)).
+2. Start the bridge, listening where gSender looks for an Ethernet grblHAL board (port 23):
+   ```
+   cd <GRBL2MACH>\build
+   grbl2mach.exe -u -p 23 -n
+   ```
+3. In gSender: *Config* > *Connection*: Ethernet IP `127.0.0.1`; then in the connection panel
+   choose *Ethernet* and *Connect*. gSender shows "grblHAL".
+4. Settings changed in gSender's *Config* page are applied by grblHAL and written back to
+   `MACH3.xml` (for those the profile describes). **Do not pick a machine model, *Defaults* or
+   *Flash* at the bottom of that page**: they would load another machine's steps/mm and speeds.
+5. Homing (house button), jogging (short click = one step, held = continuous), probing (console:
+   `G91 G38.2 Z-10 F50`, then `G90`) and programs work as on any grblHAL board.
+
+Notes from the first session:
+- gSender's default jog speed (3000 mm/min) is above most of these machines' maximum rates:
+  grblHAL caps it at `$110`-`$112`; set gSender's jog speeds accordingly.
+- grblHAL takes every corner of a toolpath at a reduced speed (junction deviation `$11`) and
+  accelerates again, where Mach3 in Constant Velocity mode rounds corners without slowing much.
+  Machines with stepper motors prone to low-speed resonance (TB6560 drivers in particular) then
+  cross that speed range much more often. On the reference machine, X lost steps at low speed;
+  the remedies are on the machine side: driver decay mode (mixed), motor current, and a steeper
+  acceleration ramp, which crosses the resonance range faster.
 
 ## Machine profile (Mach3 XML)
 
