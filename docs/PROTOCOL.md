@@ -11,7 +11,8 @@ settings. They were cross-checked against the interoperability notes published b
 vendor plugin (identified below). No vendor code is used or distributed.
 
 **Confidence.** Everything not marked otherwise was **observed** in captures of the reference
-board. Points marked *unconfirmed* come from the BreakoutCNC notes or from the plugin only.
+board. Points marked *unconfirmed* come from the BreakoutCNC notes or from the plugin only. Points
+marked *driven* were also checked by driving the reference board with GRBL2MACH, without Mach3.
 
 ## 1. Hardware and plugin identification
 
@@ -74,7 +75,7 @@ The controller acknowledges a frame in the status report (`rx[3..4]`) as soon as
 | `0x0D` | short | ArmHome | `[5]` axis 0-3 | opens a homing run of one axis (state 4): stops on that axis' home input |
 | `0x0E` | short | SpindlePwm | `[5-6]` duty, `[7-8]` period (always 1000) | spindle PWM, duty/period |
 | `0x0F` | ext. | Configure | see 3.3 | pins, polarities, pulse rate, slice period |
-| `0x10` | short | StopJog | — | drops the buffered slices of a jog; the slices sent after it run (deceleration ramp) |
+| `0x10` | short | StopJog | — | drops the buffered slices of a jog run (state 2); the slices sent after it run (deceleration ramp) (*driven*) |
 
 ### 3.3 Configure (`0x0F`)
 
@@ -110,10 +111,13 @@ Mach3 settings not sent to the board: input debounce, *Index*, *Limit Override*,
 | 25 | outputs OUT1-OUT4 while the slice runs (Mach3: `0x01` in every slice while the spindle turns) |
 | 26 | 0 |
 
-- One slice is executed every slice period (Configure byte 16 / 17: **5 ms** with Mach3).
+- One slice is executed every slice period (Configure byte 16 / 17: **5 ms** with Mach3). The
+  reference board actually takes about 5.02 ms per slice (*driven*).
 - The board buffers at least 100 slices. Mach3 keeps about 0.5 s (≈ 100 slices) ahead of the
   board, after a first burst of 17 to 41 slices sent 1 ms apart.
-- An empty buffer inside a run is not an error: the board waits.
+- An empty buffer inside a run is not an error: the board waits and goes on when slices arrive, in
+  the same run, without any fault reported (*driven*: 10 times in a 4-minute run). The motors stop
+  and restart abruptly, without a ramp: it can be heard on the machine and can lose steps.
 
 ## 4. Status report (controller → PC)
 
@@ -167,6 +171,11 @@ A whole program can be one run (the reference pocket: 99 040 slices, 497 s, one 
 `0x0A` (axis) → state 2, JogSlices (`0x05`). On key release: `0x10` (the board drops its buffer),
 then the deceleration slices, then `0x06` → state 7 → 1.
 
+The steps dropped by `0x10` are never output, so the steps sent no longer tell where the board is:
+once at rest, the host must read the position in the live counters (`rx[9+8a]`), as Mach3 does.
+*Driven* on X, Y and Z, in both directions: deceleration without a jerk, and the position stays
+right (checked against a physical mark after a series of jogs).
+
 ### Stop (Mach3's Stop) and e-stop
 - `0x08`: the board stops at the next slice and drops its buffer (≈ 95 slices with Mach3's lead),
   **stays armed** (state 1).
@@ -174,6 +183,12 @@ then the deceleration slices, then `0x06` → state 7 → 1.
 - E-stop input declared in Configure: the board stops by itself (state 6 → 0, `rx[2]` bit `0x20`)
   before any frame from the PC. Mach3 also sends `0x01` about 25 ms later. After release, state
   stays 0 until arming.
+
+### USB loss (*driven*)
+Unplugging the USB cable shows on the host as a failed read or write. Plugged back, the device
+comes back with its step counters at 0, even when they were not before (seen after homing and a
+jog), so the machine position is lost: the host must configure the board again as at start-up,
+and the machine must be homed.
 
 ### Feed hold
 No special frame: the host decelerates in its own slices, then `0x06`. With Mach3's 0.5 s lead,
@@ -206,13 +221,18 @@ slices all run, then `0x06` → state 7 → 1 and the latch keeps its previous v
 ## 7. Flow control
 
 - The acknowledgement (`rx[3..4]`) follows the frames sent closely: it means "buffered".
-  Pacing on acknowledgements alone lets the host run seconds ahead of the machine; a host should
-  pace slices on its own clock and keep the lead short (GRBL2MACH: 75 ms; Mach3: 0.5 s).
+  Pacing on acknowledgements alone lets the host run seconds ahead of the machine.
+- Pacing on the PC clock alone does not hold either: the board is slightly slower than 5 ms per
+  slice, so its buffer grew by 4 to 7 ms per second of motion (*driven*). GRBL2MACH locates the board
+  in the run from the live counters of each status report, and keeps its lead from that.
+- The lead is a trade-off: a host that falls behind by more than its lead starves the board, while
+  a feed hold only starts after the slices already sent. GRBL2MACH: 150 ms by default; Mach3: 0.5 s.
 - The latency of what the host sees is one status period (≈ 50 ms) plus its lead.
 
 ## 8. Not known yet
 
 - `0x0B` (step / MPG jog), MPG counter, status bytes 5-8 and 48.
 - Status flag `0x10` (limit) and what the board does on a declared limit input during a program.
-- Whether `0x0D` accepts several axes, and homing of A.
+- Whether `0x0D` or `0x0A` accept several axes, and homing of A.
+- What `0x10` does outside a jog run (state 2), for example during a program run (state 6).
 - Flags byte 2 (`0x40` limit override per BreakoutCNC).
