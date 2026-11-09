@@ -25,7 +25,7 @@ GRBL2MACH replaces the simulated hardware with the USB controller.
 
 ## Install on Windows (nothing to compile)
 
-**[Download the installer: GRBL2MACH-0.1.0-setup.exe](https://github.com/manuprendlair/GRBL2MACH/raw/master/release/GRBL2MACH-0.1.0-setup.exe)**
+**[Download the installer: GRBL2MACH-0.1.1-setup.exe](https://github.com/manuprendlair/GRBL2MACH/raw/master/release/GRBL2MACH-0.1.1-setup.exe)**
 (the [release](release) folder holds it).
 
 You need: Windows 10 or 11 (64-bit), a board with the USB IDs given under
@@ -171,7 +171,8 @@ bridge drives the board the way Mach3 does.
   microcontroller) that it is suspended during a handler. A recursive lock restores that: the core
   thread holds it and releases it only at its yield points (main loop pass, delays, clock polling
   while a handler waits); the simulator thread takes it around every handler. If the core thread
-  ever keeps it 250 ms while a handler waits, the lock disables itself and says so.
+  ever keeps it 250 ms while a handler waits, the bridge says so, and during motion it stops the
+  machine and raises ALARM:17: the exclusion is never given up.
   `--no-irq-lock` restores the upstream behaviour. See grblHAL/Simulator issue #28.
 
 ## Building
@@ -448,6 +449,9 @@ The fake controller behaves like the real board as seen in the Mach3 captures (s
   buffer full: status reports still answered at once, and the lines waiting are dropped by a reset.
 - `jog`: a continuous jog of one axis released twice: opened as a jog, buffer dropped, ramp, grblHAL
   and the board agreeing on the position; a jog of two axes runs as before.
+- `stall` (two runs): the core keeps the interrupt lock too long, during a move (board stopped,
+  ALARM:17, the machine can go on after a reset) and at rest (no alarm).
+- `dwell`: a G4 lasts its real duration.
 - `lead`: `--rnr-lead` sets how far ahead the board is kept; values out of range are refused.
 - `long` (6 minutes, not part of `all`): a run of more than 65536 frames, where the 16-bit sequence
   numbers wrap: pacing and checks must hold all along.
@@ -476,6 +480,7 @@ failures are specific to this design. The bridge follows three rules:
 | The bridge's window is closed, Ctrl-C, session ending | Ramp (3 s at most), spindle and coolant off, board disarmed | Start the bridge again |
 | The bridge crashes | Board disarmed and outputs off if the USB thread still runs, no ramp | Check the machine, home |
 | The bridge is killed, the PC hangs or loses power | The board runs what it holds, then stops abruptly. **Its outputs stay as they were: the spindle keeps running.** The board has no watchdog of its own | Hardwired e-stop |
+| The bridge's core stalls during motion (250 ms without giving way) | The board is stopped at once, ALARM:17 and a message in the sender. At rest, only a message in the console | Check the machine, reset, home, restart the job |
 | The PC goes to sleep by itself | Prevented while motion is running or the spindle is on | See below for what cannot be prevented |
 | The PC is overloaded | The bridge runs above normal priority, its USB thread higher still. If it falls about 160 ms behind, the board runs out of motion and stops abruptly (steps may be lost) | Keep the PC free of heavy work during a job, see below |
 
@@ -501,7 +506,10 @@ against the fake controller only, and the crash path has not been exercised.
 
 ## Known limitations
 
-- With `-u` / `-f`, G4 dwells run 5% short (simulation at 1.05 x real time).
+- Against the fake controller, about 1 release of a jog in 15 stops without a deceleration ramp: the
+  core finds its step segment buffer empty at the moment the jog is cancelled (cause not found yet).
+  The machine then stops abruptly at jog speed; the position stays right, it is read back from the
+  board.
 - The position resync after a reset has been exercised on the reference machine after homing, but
   its accuracy has only been measured against the fake controller.
 - Without the interrupt lock (`--no-irq-lock`), the upstream simulator often misses alarm 3

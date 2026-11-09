@@ -51,9 +51,11 @@
 #include "slicer.h"
 #include "mach3.h"
 #include "irq_lock.h"
+#include "rnr/rnr_os.h"
 
 #include "grbl/hal.h"
 #include "grbl/planner.h"
+#include "grbl/system.h"
 
 #ifndef SQUARING_ENABLED
 #define SQUARING_ENABLED 0
@@ -84,6 +86,23 @@ status_code_t mc_rigid_tapping (plan_line_data_t *pl_data, coord_data_t *target,
 
 static void driver_delay_ms (uint32_t ms, void (*callback)(void))
 {
+    // GRBL2MACH: SysTick follows the simulated time, which runs faster than real time when no motion
+    // holds it back, and in bursts: a dwell (many 50 ms delays) would be off by several percent.
+    // With a machine attached and at rest, the blocking delays (dwells, spindle delays) use the PC clock.
+    if(ms && !callback && args.speedup > 1.0f && slicer_enabled() && !timer[STEPPER_TIMER].enable) {
+        // A delay that follows closely the previous one starts where it ended: what the core does
+        // between the steps of a dwell must not add up.
+        static uint64_t last_end = 0;
+        uint64_t now = rnr_now_us();
+        uint64_t end = (now - last_end < 20000u ? last_end : now) + (uint64_t)ms * 1000u;
+        last_end = end;
+        while(rnr_now_us() + 2000u < end)
+            irq_lock_core_sleep();
+        while(rnr_now_us() < end)
+            irq_lock_core_yield(true);
+        return;
+    }
+
     if((delay.ms = ms) > 0) {
         systick_timer.enable = 1;
         if(!(delay.callback = callback))

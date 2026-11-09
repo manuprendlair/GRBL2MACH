@@ -51,6 +51,8 @@
 #include "rnr_os.h"
 
 #define RNR_QUEUE        30     // slices queued in the bridge: more would only delay a feed hold
+#define RNR_CUT_READY_MS 40      // jog being stopped: StopJog goes out once that much of the ramp is ready...
+#define RNR_CUT_WAIT_MS  100     // ...or after that long (the jog may be over, with no ramp to come)
 #define RNR_MAX_UNACKED_EXTRA 25    // beyond the lead: status reports come every ~50 ms, acks lag up to 10 slices
 #define WATCHDOG_MS      500    // no status report for that long = controller lost
 #define REST_MS          50     // margin after the last slice has run before EndOfMotion
@@ -123,6 +125,8 @@ typedef struct {
     uint16_t run_arm_seq;       // sequence number of the frame that opened the run
     bool run_armed;             // the controller has taken that frame (sticky: the 16-bit sequence wraps in a long run)
     bool run_cut;               // StopJog sent in this run: it dropped slices, steps sent no longer tell where the controller is
+    bool cut_pending;           // jog being stopped: StopJog goes out once the start of the ramp is queued
+    uint64_t cut_since;         // PC time of that request
     uint32_t slices_sent, estops_seen, dropped_after_cut;
     bool awaiting_halt;         // stop handled, waiting for a status report that covers it
     uint16_t halt_seq;
@@ -272,6 +276,7 @@ static void end_motion (rnr_sink_t *s)
     s->halt_seq = s->seq;
     s->awaiting_halt = true;
     s->run_open = false;
+    s->cut_pending = false;
     s->first_queued = 0;
     s->check_pending = false;
     s->busy_until = 0;
@@ -642,15 +647,9 @@ static void io_thread (void *arg)
                 fprintf(stderr, "[rnr] stop requested: cancel sent to the controller\n");
             }
             end_motion(s);
-        } else if(stop_jog && s->armed && s->run_open && s->run_kind == Slice_Jog) {
-            // As Mach3 when a jog key is released: the controller drops what it holds and runs the
-            // deceleration slices sent after this. It has nothing left: the pacing restarts from there.
-            send_short(s, RnrOp_StopJog, 0);
-            s->run_cut = true;
-            s->run_done = s->run_slices;
-            s->run_done_time = now;
-            s->run_done_valid = true;
-            s->busy_until = now;
+        } else if(stop_jog && s->armed && s->run_open && s->run_kind == Slice_Jog && !s->run_cut) {
+            s->cut_pending = true;
+            s->cut_since = now;
         }
 
         if(quit)
@@ -663,7 +662,20 @@ static void io_thread (void *arg)
         int queued = s->qcount;
         int prefill_ms = queued && s->queue[s->qhead].kind == Slice_Jog ? s->prefill_jog_ms : s->prefill_ms;
         rnr_mutex_unlock(&s->lock);
-        bool may_send = s->run_open;
+        if(s->cut_pending && (queued >= RNR_CUT_READY_MS / SLICE_MS || now - s->cut_since >= (uint64_t)RNR_CUT_WAIT_MS * 1000u)) {
+            // As Mach3 when a jog key is released: the controller drops what it holds and runs the
+            // deceleration slices sent after this. Sent once the start of the ramp is ready: left
+            // with nothing, the controller would stop dead. The pacing restarts from there.
+            s->cut_pending = false;
+            send_short(s, RnrOp_StopJog, 0);
+            s->run_cut = true;
+            s->run_done = s->run_slices;
+            s->run_done_time = now;
+            s->run_done_valid = true;
+            s->busy_until = now;
+        }
+
+        bool may_send = s->run_open && !s->cut_pending;
         if(!s->run_open && queued) {
             if(!s->first_queued)
                 s->first_queued = now;
@@ -796,6 +808,7 @@ static void io_thread (void *arg)
                 s->run_arm_seq = s->seq;
                 s->run_armed = false;
                 s->run_cut = false;
+                s->cut_pending = false;
             }
 
             uint8_t buf[RNR_OUT_BYTES];
@@ -826,7 +839,7 @@ static void io_thread (void *arg)
         slice_outputs_t latest = s->latest;
         bool blocked = s->blocked;
         rnr_mutex_unlock(&s->lock);
-        if(s->run_open && (empty || s->outputs_change || s->kind_change) && now > s->busy_until + (uint64_t)REST_MS * 1000u &&
+        if(s->run_open && !s->cut_pending && (empty || s->outputs_change || s->kind_change) && now > s->busy_until + (uint64_t)REST_MS * 1000u &&
             (int16_t)(st.ack_seq - s->last_slice_seq) >= 0) {
             send_short(s, RnrOp_EndOfMotion, s->outputs);
             report_run(s);

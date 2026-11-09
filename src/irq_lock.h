@@ -8,9 +8,10 @@
   well-defined points (main loop pass, delays, waiting loops that poll the
   clock); the simulator thread takes it around every handler.
 
-  Safety net: if the core thread keeps the lock for IRQ_LOCK_TIMEOUT_MS while a
-  handler waits, the lock is disabled for good (previous behaviour) and a
-  message is printed, so a missed release point can never freeze the bridge.
+  If the core thread keeps the lock for IRQ_LOCK_TIMEOUT_MS while a handler
+  waits, a message is printed and the timeout handler called, once per wait: the
+  machine must not go on with a core that has stalled. The handler keeps waiting
+  for the lock: the exclusion is never given up.
 
   Part of GRBL2MACH. GPL-3.0-or-later.
 */
@@ -24,6 +25,7 @@
 
 void irq_lock_init (bool enabled);      // before the core thread starts
 bool irq_lock_enabled (void);
+void irq_lock_set_timeout_handler (void (*handler)(void));  // called on the thread of the waiting handler
 
 // Core thread
 void irq_lock_core_start (void);        // first thing on the core thread: takes the lock

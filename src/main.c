@@ -729,7 +729,7 @@ int main(int argc, char *argv[])
         }
         slicer_init(sink);
         // Run the simulation slightly faster than real time: slice back-pressure then locks it to
-        // the machine, and the controller never starves. TODO: dwells (G4) run 5% short this way.
+        // the machine, and the controller never starves. Delays are compensated (driver_delay_ms).
         if (!speedup_given)
             args.speedup = 1.05f;
         // However the program ends, do not leave the controller armed with its spindle on

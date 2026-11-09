@@ -37,6 +37,12 @@ static atomic_bool enabled;
 static atomic_int isr_waiting;      // handlers waiting for the lock
 static bool core_started = false;
 static int core_depth = 0;          // core thread's hold count (touched by the core thread only)
+static void (*timeout_handler)(void) = NULL;
+
+void irq_lock_set_timeout_handler (void (*handler)(void))
+{
+    timeout_handler = handler;
+}
 
 void irq_lock_init (bool on)
 {
@@ -127,14 +133,13 @@ bool irq_lock_isr_enter (void)
 
     atomic_fetch_add(&isr_waiting, 1);
     uint64_t deadline = rnr_now_us() + (uint64_t)IRQ_LOCK_TIMEOUT_MS * 1000u;
+    bool reported = false;
     while(!lock_try()) {
-        if(rnr_now_us() > deadline) {
-            atomic_fetch_sub(&isr_waiting, 1);
-            atomic_store(&enabled, false);
-            fprintf(stderr, "[irq-lock] the core thread kept the lock for %d ms while an interrupt was waiting:\n"
-                             "[irq-lock] lock disabled, interrupts now run concurrently with the core (previous behaviour)\n",
-                     IRQ_LOCK_TIMEOUT_MS);
-            return false;
+        if(!reported && rnr_now_us() > deadline) {
+            reported = true;
+            fprintf(stderr, "[irq-lock] the core thread has kept the lock for %d ms while an interrupt is waiting\n", IRQ_LOCK_TIMEOUT_MS);
+            if(timeout_handler)
+                timeout_handler();
         }
         cpu_yield();
     }

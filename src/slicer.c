@@ -24,6 +24,7 @@
 */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
 
@@ -47,6 +48,7 @@
 #define SAFE_STOP_TIMEOUT_MS 10000  // controlled stop: time allowed for the machine to come to rest
 
 static atomic_bool safe_stop_wanted; // see slicer_safe_stop_poll()
+static atomic_bool core_stalled;     // see on_lock_timeout()
 static slice_sink_t *sink = NULL;
 static slice_t cur;
 static volatile bool open = false;  // a slice is in progress (also read by the core thread: homing_get_state)
@@ -159,6 +161,44 @@ static void on_driver_reset (void)
 void slicer_set_phase (slice_kind_t kind, int axis)
 {
     atomic_store(&phase, (unsigned int)kind | (unsigned int)(axis & 0xFF) << 8);
+}
+
+// Simulator thread, waiting for the interrupt lock: the core has held it far too long. At rest
+// that is harmless (a slow disk while saving settings). During motion the core no longer follows
+// what the machine does: stop the machine now, through the USB thread, which needs no lock.
+// The alarm is raised by slicer_core_poll once the core runs again.
+static void on_lock_timeout (void)
+{
+    if(!sink || !(timer[STEPPER_TIMER].enable || open))
+        return;
+
+    fprintf(stderr, "[slicer] the core stalled during motion: machine stopped\n");
+    atomic_store(&sink_failed, true);   // no slice goes out any more
+    stop_machine();
+    atomic_store(&core_stalled, true);
+}
+
+// Fake controller only (tests): the core keeps the interrupt lock that long, once, during a move
+// or, with GRBL2MACH_FAKE_CORE_STALL_REST, at rest.
+static void test_core_stall (void)
+{
+    static int ms = -1;
+    static bool at_rest;
+    static uint32_t since = 0;
+
+    if(ms < 0) {
+        const char *e = getenv("GRBL2MACH_FAKE_CORE_STALL_MS");
+        ms = e ? atoi(e) : 0;
+        at_rest = getenv("GRBL2MACH_FAKE_CORE_STALL_REST") != NULL;
+    }
+    if(ms && state_get() == (at_rest ? STATE_IDLE : STATE_CYCLE)) {
+        if(!since)
+            since = hal.get_elapsed_ticks();
+        else if(hal.get_elapsed_ticks() - since > 800) {
+            platform_sleep((long)ms * 1000);
+            ms = 0;
+        }
+    }
 }
 
 // A jog of one axis starts: the machine can run it as a jog, and stop it at once (slicer_jog_poll)
@@ -333,6 +373,7 @@ void slicer_attach_core (void)
         prev_on_state_change = grbl.on_state_change;
         grbl.on_state_change = on_state_change;
     }
+    irq_lock_set_timeout_handler(on_lock_timeout);
 }
 
 bool slicer_enabled (void)
@@ -533,6 +574,16 @@ static void check_link (void)
 void slicer_core_poll (void)
 {
     static bool resetting = false;
+
+    test_core_stall();
+
+    if(atomic_exchange(&core_stalled, false)) {
+        // Same alarm as a link loss, but nothing has to come back: the fault is over at once
+        report_message("The bridge stalled during motion: machine stopped, position may be lost, home the machine", Message_Warning);
+        mc_reset();     // reads the motor fault and raises ALARM:17
+        atomic_store(&sink_failed, false);
+        return;
+    }
 
     // A reset under way: wait for its end. Except in the core's critical alarm loop, which only
     // ends on a reset once the motor fault is gone: a reset that came during it (the sender's, while

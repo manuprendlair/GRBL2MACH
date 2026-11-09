@@ -30,6 +30,7 @@ MinVersion=10.0
 OutputDir={#OutDir}
 OutputBaseFilename=GRBL2MACH-{#AppVersion}-setup
 SetupIconFile=grbl2mach.ico
+WizardSmallImageFile=grbl2mach-512.png
 UninstallDisplayIcon={app}\grbl2mach.exe
 LicenseFile=..\COPYING
 Compression=lzma2
