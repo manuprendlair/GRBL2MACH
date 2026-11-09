@@ -33,6 +33,11 @@ void rnr_sleep_ms (uint32_t ms)
     Sleep(ms);
 }
 
+void rnr_keep_awake (bool on)
+{
+    SetThreadExecutionState(on ? ES_CONTINUOUS | ES_SYSTEM_REQUIRED : ES_CONTINUOUS);
+}
+
 static DWORD WINAPI thread_entry (LPVOID p)
 {
     thread_start_t s = *(thread_start_t *)p;
@@ -88,6 +93,11 @@ void rnr_sleep_ms (uint32_t ms)
     struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (long)(ms % 1000) * 1000000L };
 
     nanosleep(&ts, NULL);
+}
+
+void rnr_keep_awake (bool on)
+{
+    (void)on;
 }
 
 static void *thread_entry (void *p)

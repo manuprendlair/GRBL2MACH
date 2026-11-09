@@ -390,6 +390,9 @@ The fake controller behaves like the real board as seen in the Mach3 captures (s
 - `unplug` (three runs): USB unplugged during a move, the board keeping its counters or powered up
   again; and unplugged at rest: ALARM:17 at once, reconnection once plugged back, message to the
   user, grblHAL resynced on the board's counters, unlock and move again.
+- `client` (four runs): the TCP client disappears during a move, cleanly or abruptly: stop on a ramp,
+  spindle off, no alarm, the move does not resume, a new client can go on from there; at rest: no
+  reset; and Ctrl-C during a move: ramp, spindle off, board disarmed.
 - `long` (6 minutes, not part of `all`): a run of more than 65536 frames, where the 16-bit sequence
   numbers wrap: pacing and checks must hold all along.
 
@@ -397,9 +400,48 @@ The fake controller behaves like the real board as seen in the Mach3 captures (s
 powershell -File tests\run_fake_board.ps1 -Scenario all
 ```
 
+## Failures during a job: what to expect
+
+A physical grbl controller keeps its real-time part on the machine. Here it lives on a PC, so some
+failures are specific to this design. The bridge follows three rules:
+
+- Stop on a deceleration ramp whenever the machine can still be commanded, to avoid broken tools and
+  lost steps.
+- Never resume motion by itself. Resuming a job is the sender's and the operator's decision.
+- Do not try to recover when the machine position can no longer be trusted.
+
+| Event | What the bridge does | What you do next |
+|---|---|---|
+| The sender closes, crashes or stops reading its TCP connection, during motion | Feed hold (ramp), then spindle and coolant off and the program flushed. Position and homing are kept. Waits for a new client | Reconnect, restart the job from a line in your sender |
+| The sender goes away at rest | Nothing changes, except a spindle or coolant still on: switched off | Reconnect |
+| The sender freezes but stays connected | As on a physical controller: the buffered moves run and decelerate to a stop, the spindle stays on | Restart the sender |
+| USB unplugged, interference, board silent for 500 ms | ALARM:17. No ramp is possible: the board runs the ~100 ms it holds, then stops abruptly (steps may be lost). Reconnects by itself once the board is back | Check the machine, home, restart the job |
+| The bridge's window is closed, Ctrl-C, session ending | Ramp (3 s at most), spindle and coolant off, board disarmed | Start the bridge again |
+| The bridge crashes | Board disarmed and outputs off if the USB thread still runs, no ramp | Check the machine, home |
+| The bridge is killed, the PC hangs or loses power | The board runs what it holds, then stops abruptly. **Its outputs stay as they were: the spindle keeps running.** The board has no watchdog of its own | Hardwired e-stop |
+| The PC goes to sleep by itself | Prevented while motion is running or the spindle is on | See below for what cannot be prevented |
+| The PC is overloaded | The USB thread runs at high priority. Past about 85 ms without it the board runs out of motion and stops abruptly | Keep the PC free of heavy work during a job |
+
+Before a long job:
+
+- Keep the PC on mains power and set "closing the lid" to do nothing: the bridge cannot prevent a
+  lid-close sleep or a shutdown on an empty battery.
+- Plan around Windows Update: it may restart the PC outside your "active hours".
+- Close heavy applications. Use a short shielded USB cable, routed away from the VFD and spindle wires:
+  interference is the most likely cause of a USB loss in a workshop.
+- Wire a hardwired e-stop. It is the only protection that works in every case above.
+
+Losing the sender (gSender's Disconnect button) and closing the bridge's window during a program have
+been tested on the reference machine, with no tool and the spindle not wired. Ctrl-C has been tested
+against the fake controller only, and the crash path has not been exercised.
+
 ## Known limitations
 
 - With `-u` / `-f`, G4 dwells run 5% short (simulation at 1.05 x real time).
+- After a USB reconnection where the board was also powered off, the fake controller's test fails
+  intermittently: the position shown can be off by about 1 mm until the next homing, and in rare
+  cases the motor fault stays latched and the bridge must be restarted. Always home after a
+  reconnection.
 - The position resync after a reset has only been tested against the fake controller, and not yet
   with homing (which overwrites the core's position).
 - Without the interrupt lock (`--no-irq-lock`), the upstream simulator often misses alarm 3

@@ -27,6 +27,9 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <unistd.h>
+#ifndef WIN32
+#include <sys/socket.h>
+#endif
 
 #include "simulator.h"
 #include "eeprom.h"
@@ -243,15 +246,17 @@ void sim_socket_out (uint8_t data)
     if(data == '\n' || len >= 127) {
 //        if (args.comment_char && !continuation)
 //            fprintf(args.serial_out_file, "%c ", args.comment_char);
+        // GRBL2MACH: the socket is non-blocking: a failed or partial send means the client is gone
+        // or has not read anything for a long time (its buffer is full). Never fatal.
 #ifdef WIN32
         if(sim.socket_fd != INVALID_SOCKET) {
-            if(send(sim.socket_fd, buf, len, 0) == SOCKET_ERROR)
-                exit(-10);
+            if(send(sim.socket_fd, (const char *)buf, len, 0) != len)
+                sim.client_lost("cannot send to it");
         }
 #else
         if(sim.socket_fd) {
-            if(write(sim.socket_fd, buf, len) < 0)
-                exit(-10);
+            if(send(sim.socket_fd, buf, len, MSG_NOSIGNAL) != len)
+                sim.client_lost("cannot send to it");
         }
 #endif
         // don't print comment on next line if we are just printing to avoid buffer overflow

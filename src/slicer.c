@@ -44,7 +44,9 @@
 
 #define SLICE_TICKS ((uint64_t)F_CPU / 1000 * SLICE_MS)
 #define HALT_TIMEOUT_MS 200
+#define SAFE_STOP_TIMEOUT_MS 10000  // controlled stop: time allowed for the machine to come to rest
 
+static atomic_bool safe_stop_wanted; // see slicer_safe_stop_poll()
 static slice_sink_t *sink = NULL;
 static slice_t cur;
 static volatile bool open = false;  // a slice is in progress (also read by the core thread: homing_get_state)
@@ -505,6 +507,86 @@ void slicer_core_poll (void)
         atomic_store(&reconnected, false);
         sys.homed.mask = 0;
         report_message("Controller reconnected: machine position lost, home the machine", Message_Warning);
+    }
+}
+
+void slicer_safe_stop_request (void)
+{
+    if(sink)
+        atomic_store(&safe_stop_wanted, true);
+}
+
+bool slicer_safe_stop_wait (uint32_t timeout_ms)
+{
+    for(uint32_t i = 0; i < timeout_ms && atomic_load(&safe_stop_wanted); i++)
+        platform_sleep(1000);
+
+    return !atomic_load(&safe_stop_wanted);
+}
+
+void slicer_disarm (void)
+{
+    slice_sink_t *s = sink;
+
+    if(s && s->disarm)
+        s->disarm(s, 200);
+}
+
+// Core thread (realtime hook). Same sequence as an operator would follow: feed hold, wait for the
+// machine to be at rest, then reset, which switches the spindle and coolant off and flushes the
+// program. The motion in progress is never resumed: that decision belongs to the sender.
+// At rest with nothing running or queued there is nothing to do: no reset, the modal state stays.
+void slicer_safe_stop_poll (void)
+{
+    static bool holding = false;
+    static uint32_t deadline;
+
+    if(!atomic_load(&safe_stop_wanted) || !sink || (sys.rt_exec_state & EXEC_RESET) || sys.reset_pending)
+        return;
+
+    sys_state_t state = state_get();
+    bool reset = false;
+
+    if(state & STATE_HOMING)
+        return;             // cannot be held; ends by itself, at rest
+
+    if(state == STATE_IDLE)
+        reset = (atomic_load(&out_state) & 0xFF) || plan_get_current_block() ||
+                 (hal.stream.get_rx_buffer_count && hal.stream.get_rx_buffer_count());
+    else if(state & STATE_TOOL_CHANGE)
+        reset = true;       // waiting for the operator: nothing moves
+    else if(!(state & (STATE_ALARM|STATE_ESTOP|STATE_SLEEP|STATE_CHECK_MODE))) {
+        // Cycle, jog, hold, safety door: the machine must come to rest first
+        if(!holding) {
+            holding = true;
+            deadline = hal.get_elapsed_ticks() + SAFE_STOP_TIMEOUT_MS;
+            if(state & (STATE_CYCLE|STATE_JOG)) {
+                fprintf(stderr, "[slicer] controlled stop: feed hold\n");
+                system_set_exec_state_flag(EXEC_FEED_HOLD);
+            }
+            return;
+        }
+        if((int32_t)(hal.get_elapsed_ticks() - deadline) >= 0) {
+            fprintf(stderr, "[slicer] controlled stop: machine not at rest in time, reset\n");
+            reset = true;
+        } else if(!(state & (STATE_CYCLE|STATE_JOG)) && sys.holding_state == Hold_Complete && !timer[STEPPER_TIMER].enable) {
+            // Let the end of the ramp run: a reset drops what the machine has not executed yet.
+            // A hold that is over is not motion: without this flag the reset would raise ALARM:3.
+            for(int i = 0; i < 100 && open; i++)
+                platform_sleep(1000);
+            if(sink->wait_idle)
+                sink->wait_idle(sink, 2000);
+            sys.step_control.execute_hold = Off;
+            reset = true;
+        } else
+            return;
+    }
+
+    holding = false;
+    atomic_store(&safe_stop_wanted, false);
+    if(reset) {
+        fprintf(stderr, "[slicer] controlled stop: spindle and coolant off, program flushed\n");
+        mc_reset();
     }
 }
 

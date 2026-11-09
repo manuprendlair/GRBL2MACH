@@ -104,6 +104,10 @@ struct slice_sink {
     // the machine may have reset meanwhile, its position is unknown. Optional (NULL: the link
     // never fails, or never comes back once lost). Thread-safe.
     bool (*link_ok)(slice_sink_t *sink, uint32_t *generation);
+    // Last resort before the program ends: stops the machine, outputs off, whatever it was doing.
+    // Waits up to timeout_ms for that to be done. Does not take any lock: callable from a crash
+    // handler. Optional. Thread-safe.
+    void (*disarm)(slice_sink_t *sink, uint32_t timeout_ms);
     void *ctx;
 };
 

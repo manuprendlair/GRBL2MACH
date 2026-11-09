@@ -8,6 +8,7 @@
 #define rnr_os_h
 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -21,6 +22,7 @@ typedef pthread_mutex_t rnr_mutex_t;
 
 uint64_t rnr_now_us (void);             // monotonic, microseconds
 void rnr_sleep_ms (uint32_t ms);
+void rnr_keep_awake (bool on);          // while on, the computer does not go to sleep by itself; per thread
 
 int rnr_thread_start (rnr_thread_t *t, void (*fn)(void *), void *arg);   // 0 = ok
 void rnr_thread_join (rnr_thread_t t);

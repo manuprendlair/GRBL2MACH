@@ -45,6 +45,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #include "sink_rnr.h"
 #include "rnr_os.h"
@@ -92,6 +93,7 @@ typedef struct {
     bool idle_shared;           // nothing queued, no run open, every frame taken over, controller ready
     uint64_t estop_until;       // e-stop seen as a disarm only: reported until then
     char fault_msg[160];
+    atomic_bool disarm_request, disarm_done;    // the program is ending (no lock: may come from a crash handler)
 
     // I/O thread only
     uint16_t seq;
@@ -544,10 +546,27 @@ static void io_thread (void *arg)
     rnr_sink_t *s = arg;
     uint8_t rx[RNR_IN_BYTES];
     rnr_status_t st = s->status;
+    bool awake = false;
 
     s->last_status = rnr_now_us();
 
     while(true) {
+
+        // A job in progress must not be stopped by the computer going to sleep
+        bool busy = s->run_open || s->outputs || s->pwm;
+        if(busy != awake)
+            rnr_keep_awake(awake = busy);
+
+        if(atomic_load(&s->disarm_request)) {
+            if(s->t) {
+                send_short(s, RnrOp_EStop, 0);
+                outputs_off(s);
+            }
+            s->armed = false;
+            fprintf(stderr, "[rnr] program ending: controller disarmed, outputs off\n");
+            atomic_store(&s->disarm_done, true);    // the process may end as soon as this is set
+            break;
+        }
 
         if(s->opt.reconnect) {
             rnr_mutex_lock(&s->lock);
@@ -779,6 +798,8 @@ static void io_thread (void *arg)
         s->idle_shared = s->qcount == 0 && !s->run_open && covered && st.state == RnrState_Ready;
         rnr_mutex_unlock(&s->lock);
     }
+
+    rnr_keep_awake(false);
 }
 
 static sink_status_t rnr_push (slice_sink_t *sink, const slice_t *slice)
@@ -1022,6 +1043,16 @@ static void rnr_close (slice_sink_t *sink)
     free(sink);
 }
 
+static void rnr_disarm (slice_sink_t *sink, uint32_t timeout_ms)
+{
+    rnr_sink_t *s = sink->ctx;
+    uint64_t deadline = rnr_now_us() + (uint64_t)timeout_ms * 1000u;
+
+    atomic_store(&s->disarm_request, true);
+    while(!atomic_load(&s->disarm_done) && rnr_now_us() < deadline)
+        rnr_sleep_ms(1);
+}
+
 slice_sink_t *sink_rnr_open (rnr_transport_t *t, const rnr_options_t *opt)
 {
     slice_sink_t *sink = calloc(1, sizeof(slice_sink_t));
@@ -1084,6 +1115,7 @@ slice_sink_t *sink_rnr_open (rnr_transport_t *t, const rnr_options_t *opt)
     sink->wait_idle = rnr_wait_idle;
     sink->get_probe_result = rnr_get_probe_result;
     sink->link_ok = rnr_link_ok;
+    sink->disarm = rnr_disarm;
     sink->ctx = s;
 
     return sink;

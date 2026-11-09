@@ -27,6 +27,7 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <string.h>
+#include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/types.h>
@@ -240,6 +241,28 @@ PLAT_THREAD_FUNC(grbl_main_thread, exit)
     return 0; //NULL;
 }
 
+// GRBL2MACH: the TCP client (sender) is gone, whatever the reason: closed, crashed, or no longer
+// reading. Never fatal, and the simulator thread must keep running: the machine is brought to a
+// controlled stop (slicer_safe_stop_request) and the next client is welcome.
+static void client_lost (const char *why)
+{
+#ifdef WIN32
+    if(sim.socket_fd == INVALID_SOCKET)
+        return;
+    closesocket(sim.socket_fd);
+    sim.socket_fd = INVALID_SOCKET;
+#else
+    if(sim.socket_fd <= 0)
+        return;
+    close(sim.socket_fd);
+    FD_CLR(sim.socket_fd, &rfds);
+    sim.socket_fd = 0;
+#endif
+    fprintf(stderr, "[tcp] client gone (%s)\n", why);
+    if(sim.exit == exit_NO)     // not when it left after asking for a shutdown (Ctrl-F)
+        slicer_safe_stop_request();
+}
+
 #ifdef WIN32
 
 //return char if one available.
@@ -250,7 +273,12 @@ uint8_t sim_socket_in()
     DWORD t = 0;
 
     if(sim.socket_fd == INVALID_SOCKET) {
-        sim.socket_fd = accept(socket_fd, NULL, NULL);
+        // GRBL2MACH: the listening socket is non-blocking: all the simulated interrupts run on
+        // this thread, waiting here for a client would freeze the machine in mid-move
+        SOCKET client = accept(socket_fd, NULL, NULL);
+        if(client == INVALID_SOCKET)
+            return 0;
+        sim.socket_fd = client;
         setsockopt(sim.socket_fd, SOL_SOCKET, SO_RCVTIMEO, (char *)&t, sizeof(t));
         // Disable Nagle: senders (gSender & co) poll with single-byte '?' and
         // responses are small; Nagle + delayed ACK adds up to ~200 ms per line.
@@ -258,13 +286,13 @@ uint8_t sim_socket_in()
         setsockopt(sim.socket_fd, IPPROTO_TCP, TCP_NODELAY, (char *)&nodelay, sizeof(nodelay));
         u_long mode = 1;
         ioctlsocket(sim.socket_fd, FIONBIO, &mode); // set non-blocking
+        sim.greet_client = true;
     } else if((retval = recv(sim.socket_fd, &c, 1, 0)) < 1) {
+        c = 0;
         if(retval == 0)
-            sim.socket_fd = INVALID_SOCKET;
-        else if((retval = WSAGetLastError()) != WSAEWOULDBLOCK) {
-            printf("Fatal: socket error %d\n", retval);
-            exit(-5);
-        }
+            client_lost("disconnected");
+        else if(WSAGetLastError() != WSAEWOULDBLOCK)
+            client_lost("connection reset");
     }
 
     return c;
@@ -317,6 +345,7 @@ uint8_t sim_socket_in()
         int nodelay = 1;
         setsockopt(sim.socket_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
+        sim.greet_client = true;
         accepted = 1;
     }
 
@@ -328,11 +357,11 @@ uint8_t sim_socket_in()
         retval = read(sim.socket_fd, &c, 1);
 
         if(retval == 0) {
-            close(sim.socket_fd);
-            FD_CLR(sim.socket_fd, &rfds);
-            sim.socket_fd = 0;
+            client_lost("disconnected");
             c = 0;
         } else if(retval < 0) {
+            if(errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                client_lost("connection reset");
             c = 0;   // EAGAIN/EWOULDBLOCK: no data available
         }
 //            if(c && c != '?' && c >= ' ')
@@ -344,10 +373,55 @@ uint8_t sim_socket_in()
 
 #endif
 
+#ifdef WIN32
 static void exithandler (int signum)
 {
     eeprom_close();
 }
+#endif
+
+// GRBL2MACH: the program is being closed (Ctrl-C, window closed, session ending): ramp the machine
+// down if there is time, then leave the controller disarmed with its outputs off. Windows gives
+// a closing console 5 s at most.
+#define SHUTDOWN_STOP_MS 3000
+
+static void stop_before_exit (void)
+{
+    slicer_safe_stop_request();
+    slicer_safe_stop_wait(SHUTDOWN_STOP_MS);
+    slicer_disarm();
+    fflush(NULL);
+}
+
+#ifdef WIN32
+
+static BOOL WINAPI console_handler (DWORD type)
+{
+    (void)type;
+    stop_before_exit();
+
+    return FALSE;   // on to the default handler, which ends the process
+}
+
+// Crash: no ramp is possible, the core may be what crashed
+static LONG WINAPI crash_handler (EXCEPTION_POINTERS *info)
+{
+    (void)info;
+    slicer_disarm();
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+#else
+
+static void signal_stop (int signum)
+{
+    stop_before_exit();
+    eeprom_close();
+    _exit(128 + signum);
+}
+
+#endif
 
 void board_init (void)
 {
@@ -643,6 +717,12 @@ int main(int argc, char *argv[])
         // the machine, and the controller never starves. TODO: dwells (G4) run 5% short this way.
         if (!speedup_given)
             args.speedup = 1.05f;
+        // However the program ends, do not leave the controller armed with its spindle on
+        atexit(slicer_disarm);
+#ifdef WIN32
+        SetConsoleCtrlHandler(console_handler, TRUE);
+        SetUnhandledExceptionFilter(crash_handler);
+#endif
     }
 
     // Make sure the output streams are flushed immediately.
@@ -708,7 +788,10 @@ int main(int argc, char *argv[])
             WSACleanup();
             exit(-5);
         }
-        
+
+        u_long listen_nonblocking = 1;      // see sim_socket_in()
+        ioctlsocket(socket_fd, FIONBIO, &listen_nonblocking);
+
         sim.socket_fd = INVALID_SOCKET;
 #else
 
@@ -759,6 +842,7 @@ int main(int argc, char *argv[])
 
         sim.getchar = sim_socket_in;
         sim.putchar = sim_socket_out;
+        sim.client_lost = client_lost;
 
     } else {
         sim.getchar = platform_poll_stdin;
@@ -775,7 +859,12 @@ int main(int argc, char *argv[])
 
     // Do not leave EEPROM file in an inconsistent state on ^C.
     atexit(eeprom_close);
+#ifdef WIN32
     signal(SIGTERM, exithandler);
+#else
+    signal(SIGTERM, signal_stop);
+    signal(SIGINT, signal_stop);
+#endif
 
     // All the stream io and interrupt happen in this thread.
     sim_loop();

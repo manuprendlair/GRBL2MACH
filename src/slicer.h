@@ -24,6 +24,13 @@ bool slicer_get_inputs (sink_inputs_t *in);       // machine home/limit/probe in
 void slicer_set_phase (slice_kind_t kind, int axis); // kind of motion the next slices belong to; any thread
 void slicer_probe_end (void);                     // end of a probing cycle: position and probe position from the machine; core thread
 void slicer_core_poll (void);                     // realtime hook; core thread
+// Controlled stop when nobody is left to supervise the job (sender gone, program closing): feed
+// hold (deceleration ramp, position kept), then spindle and coolant off and the program flushed.
+// Never resumes by itself.
+void slicer_safe_stop_request (void);             // any thread
+bool slicer_safe_stop_wait (uint32_t timeout_ms); // true once it is over; any thread except the core's
+void slicer_safe_stop_poll (void);                // realtime hook; core thread
+void slicer_disarm (void);                        // last resort before the program ends: controller disarmed, outputs off; any thread
 // Outputs set by the core (any thread): stamped on every slice and passed to the sink
 void slicer_set_spindle (bool on, bool ccw, uint16_t pwm); // pwm: 0..SLICE_PWM_PERIOD
 void slicer_set_spindle_pwm (uint16_t pwm);           // speed change only (laser mode, S word)

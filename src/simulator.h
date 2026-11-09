@@ -48,6 +48,8 @@ typedef struct sim_vars {
 #endif
     uint8_t (*getchar)(void);
     void (*putchar)(uint8_t);
+    void (*client_lost)(const char *why);   // GRBL2MACH: TCP client gone (simulator thread)
+    volatile bool greet_client;             // GRBL2MACH: new TCP client, to be sent the welcome message
     sim_hook_fp on_init;
     sim_hook_fp on_tick;
     sim_hook_fp on_byte;

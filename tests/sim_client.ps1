@@ -27,6 +27,26 @@ function Start-Sim([string]$SimArgs, [string]$OutDir, [int]$Port, [hashtable]$En
     return $session
 }
 
+# A new TCP client on a simulator that is already running.
+function Connect-Sim($Process, [int]$Port) {
+    $client = New-Object Net.Sockets.TcpClient("127.0.0.1", $Port)
+    $stream = $client.GetStream(); $stream.ReadTimeout = 200
+    return [pscustomobject]@{ Process = $Process; Client = $client; Stream = $stream; Buffer = (New-Object byte[] 65536) }
+}
+
+# The client goes away: cleanly (FIN), or abruptly (RST), as when a sender crashes.
+function Close-Client($s, [bool]$Abort) {
+    if ($Abort) {
+        $s.Client.Client.LingerState = New-Object Net.Sockets.LingerOption($true, 0)
+    } else {
+        Read-Sim $s | Out-Null
+        $s.Client.Client.Shutdown([Net.Sockets.SocketShutdown]::Send)
+        Start-Sleep -Milliseconds 100
+        Read-Sim $s | Out-Null
+    }
+    $s.Client.Close()
+}
+
 function Read-Sim($s) {
     $o = ""
     try { while ($true) { $n = $s.Stream.Read($s.Buffer, 0, $s.Buffer.Length); if ($n -le 0) { break }; $o += [Text.Encoding]::ASCII.GetString($s.Buffer, 0, $n) } } catch {}

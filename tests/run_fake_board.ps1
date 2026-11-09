@@ -18,7 +18,7 @@
 #                       [-GCode "G21 G91 G1 X10 F600"] [-Expect "2500,0,0"] [-OutDir folder] [-Immediate]
 
 param(
-    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "home", "probe", "mach3", "pace", "jogs", "unplug", "long", "all")] [string]$Scenario = "all",
+    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "home", "probe", "mach3", "pace", "jogs", "unplug", "client", "long", "all")] [string]$Scenario = "all",
     [string]$GCode = "G21 G91 G1 X10 F600",
     [string]$Expect = "2500,0,0",
     [string]$OutDir = "$env:TEMP\grbl2mach_fake",
@@ -502,6 +502,119 @@ function Test-UnplugIdle {
     Check ($null -ne $mpos -and $r.Final[0] -gt 0) "unlocked: Idle again (controller X=$($r.Final[0]))"
 }
 
+# Steps of the slices of the first run (op 0x04), up to its end of motion (op 0x06): the ramp.
+function Get-FirstRunSlices($frames) {
+    $slices = @()
+    foreach ($f in $frames) {
+        if ($f.op -eq 6 -and $slices.Count) { break }
+        if ($f.op -eq 4 -and $f.d) { $slices += $f.d[0] }
+    }
+    return $slices
+}
+
+# The motion must end on a ramp: small last slices, no sudden drop in speed
+function Check-Ramp($slices) {
+    $last = @($slices | Select-Object -Last 60)
+    $maxDrop = 0
+    for ($i = 1; $i -lt $last.Count; $i++) { $maxDrop = [math]::Max($maxDrop, $last[$i - 1] - $last[$i]) }
+    Check ($slices.Count -gt 100 -and ($slices | Measure-Object -Maximum).Maximum -ge 8) "the move was at speed ($($slices.Count) slices)"
+    Check ($last[-1] -le 3 -and $maxDrop -le 2) "stopped on a ramp: last slice $($last[-1]) steps, largest drop between two slices $maxDrop steps"
+}
+
+function Test-ClientLost([bool]$Abort) {
+    $how = if ($Abort) { "crash (connection reset)" } else { "clean disconnection" }
+    "=== client lost during a move, spindle on: $how"
+    $name = if ($Abort) { "client_reset" } else { "client_close" }
+    $dir = Join-Path $OutDir $name; $log = Join-Path $dir "fake.log"; $p = $Port + 16 + [int]$Abort
+    $s = Start-Sim "-f `"$log`"" $dir $p
+    $n = $s
+    try {
+        $spm = Get-StepsPerMm $s
+        Invoke-Line $s '$X' | Out-Null
+        Invoke-GCode $s "M3 S1000; G21 G91 G1 X100 F600"
+        Start-Sleep -Milliseconds 2000
+        Close-Client $s $Abort
+        Start-Sleep -Seconds 3
+        $alive = -not $s.Process.HasExited
+        $n = Connect-Sim $s.Process $p
+        Start-Sleep -Milliseconds 400
+        $greeting = Read-Sim $n
+        $status = Wait-State $n "Idle" 3000
+        $at = Get-MPos $status
+        Start-Sleep -Milliseconds 1500
+        $later = Get-MPos (Wait-State $n "Idle" 3000)
+        Invoke-GCode $n "G21 G91 G1 X5 F600"
+        $moved = Get-MPos (Wait-State $n "Idle" 10000)
+    } finally { Stop-Sim $n }
+    $r = Read-FakeLog $log
+    $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
+    $off = Select-String -Path $log -Pattern "OUTPUTS 0x01 -> 0x00" | Select-Object -First 1
+    Check $alive "the bridge survives"
+    Check ($err -match "\[tcp\] client gone") "the loss is logged"
+    Check-Ramp (Get-FirstRunSlices $r.Frames)
+    Check ($null -ne $off) "spindle switched off"
+    Check ($greeting -match "Grbl") "the new client gets the welcome message"
+    Check ($status -match "<Idle") "next client finds the machine Idle, no alarm"
+    Check ($at[0] -gt 5 -and $at[0] -lt 95 -and $at[0] -eq $later[0]) "the move does not resume: X stays at $($at[0]) mm"
+    Check ([math]::Round(($moved[0] - $at[0]) * $spm[0]) -eq [math]::Round(5 * $spm[0])) "a new move from there: +5 mm"
+    Check ([math]::Round($moved[0] * $spm[0]) -eq $r.Final[0]) "grblHAL and controller agree (controller X=$($r.Final[0]))"
+    Check ($r.Stats.seq_errors -eq 0 -and $r.Stats.rejected -eq 0) "no sequence error, no rejected slice"
+}
+
+function Test-ClientLostIdle {
+    "=== client lost at rest: nothing to do with nothing running; spindle on: switched off"
+    $dir = Join-Path $OutDir "client_idle"; $log = Join-Path $dir "fake.log"; $p = $Port + 18
+    $s = Start-Sim "-f `"$log`"" $dir $p
+    $n = $s
+    try {
+        Invoke-Line $s '$X' | Out-Null
+        Invoke-GCode $s "G91"
+        Close-Client $s $false
+        Start-Sleep -Seconds 1
+        $n = Connect-Sim $s.Process $p
+        Start-Sleep -Milliseconds 400
+        Read-Sim $n | Out-Null
+        $modal = Invoke-Line $n '$G'
+        Invoke-GCode $n "M3 S500"
+        Start-Sleep -Milliseconds 300
+        Close-Client $n $false
+        Start-Sleep -Seconds 1
+        $n = Connect-Sim $s.Process $p
+        Start-Sleep -Milliseconds 400
+        Read-Sim $n | Out-Null
+        $status = Wait-State $n "Idle" 3000
+    } finally { Stop-Sim $n }
+    $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
+    Check ($modal -match "G91") "no reset when nothing was running: the modal state stays (G91)"
+    Check ((Select-String -Path $log -Pattern "OUTPUTS 0x01 -> 0x00" | Measure-Object).Count -ge 1) "spindle on at rest: switched off"
+    Check ($status -match "<Idle") "next client finds the machine Idle"
+    Check ($err -notmatch "feed hold") "no feed hold at rest"
+}
+
+function Test-CtrlC {
+    "=== program closed (Ctrl-C) during a move, spindle on"
+    $dir = Join-Path $OutDir "ctrl_c"; $log = Join-Path $dir "fake.log"
+    $s = Start-Sim "-f `"$log`"" $dir ($Port + 19)
+    try {
+        Invoke-Line $s '$X' | Out-Null
+        Invoke-GCode $s "M3 S1000; G21 G91 G1 X100 F600"
+        Start-Sleep -Milliseconds 2000
+        $helper = Join-Path $PSScriptRoot "send_ctrl_c.ps1"
+        $h = Start-Process powershell -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$helper`" -TargetPid $($s.Process.Id)" -PassThru -Wait -WindowStyle Hidden
+        $exited = $s.Process.WaitForExit(8000)
+    } finally {
+        if (-not $s.Process.HasExited) { Stop-Process $s.Process -Force }
+        $s.Client.Close()
+    }
+    $r = Read-FakeLog $log
+    $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
+    Check ($h.ExitCode -eq 0 -and $exited) "Ctrl-C ends the program"
+    Check-Ramp (Get-FirstRunSlices $r.Frames)
+    Check ((Select-String -Path $log -Pattern "OUTPUTS 0x01 -> 0x00" | Measure-Object).Count -ge 1) "spindle switched off"
+    Check ($err -match "controller disarmed") "controller disarmed before the end"
+    Check (@($r.Frames | Where-Object { $_.op -eq 1 }).Count -ge 1) "e-stop frame sent to the controller"
+}
+
 function Test-Jogs {
     "=== jogs: short Z moves one after the other (step jogs), each new run starting while the last one ends"
     $dir = Join-Path $OutDir "jogs"; $log = Join-Path $dir "fake.log"
@@ -538,6 +651,7 @@ if ($Scenario -in "mach3", "all") { Test-Mach3 }
 if ($Scenario -in "pace", "all") { Test-Pace }
 if ($Scenario -in "jogs", "all") { Test-Jogs }
 if ($Scenario -in "unplug", "all") { Test-Unplug $false; Test-Unplug $true; Test-UnplugIdle }
+if ($Scenario -in "client", "all") { Test-ClientLost $false; Test-ClientLost $true; Test-ClientLostIdle; Test-CtrlC }
 if ($Scenario -eq "long") { Test-Long }     # 6 minutes: not part of "all"
 
 if ($script:failures -eq 0) { "RESULT: PASS"; exit 0 } else { "RESULT: FAIL ($script:failures)"; exit 1 }
