@@ -424,13 +424,16 @@ failures are specific to this design. The bridge follows three rules:
 | The bridge crashes | Board disarmed and outputs off if the USB thread still runs, no ramp | Check the machine, home |
 | The bridge is killed, the PC hangs or loses power | The board runs what it holds, then stops abruptly. **Its outputs stay as they were: the spindle keeps running.** The board has no watchdog of its own | Hardwired e-stop |
 | The PC goes to sleep by itself | Prevented while motion is running or the spindle is on | See below for what cannot be prevented |
-| The PC is overloaded | The USB thread runs at high priority. Past about 85 ms without it the board runs out of motion and stops abruptly | Keep the PC free of heavy work during a job |
+| The PC is overloaded | The bridge runs above normal priority, its USB thread higher still. If it falls about 85 ms behind, the board runs out of motion and stops abruptly (steps may be lost) | Keep the PC free of heavy work during a job, see below |
 
 Before a long job:
 
 - Keep the PC on mains power and set "closing the lid" to do nothing: the bridge cannot prevent a
   lid-close sleep or a shutdown on an empty battery.
 - Plan around Windows Update: it may restart the PC outside your "active hours".
+- On a PC with few cores, enable gSender's lightweight mode (the feather icon of the visualizer). On
+  two cores, it made the difference between a job with audible stalls and a clean one, even before
+  the bridge was optimized. The start of a program is the tightest moment.
 - Close heavy applications. Use a short shielded USB cable, routed away from the VFD and spindle wires:
   interference is the most likely cause of a USB loss in a workshop.
 - Wire a hardwired e-stop. It is the only protection that works in every case above.

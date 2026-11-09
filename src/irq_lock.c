@@ -94,6 +94,26 @@ void irq_lock_core_yield (bool always)
     core_depth = 1;
 }
 
+void irq_lock_core_sleep (void)
+{
+    if(!core_started || !is_core() || (atomic_load(&enabled) && core_depth != 1)) {
+        cpu_yield();
+        return;
+    }
+
+    bool locked = atomic_load(&enabled);
+
+    if(locked) {
+        core_depth = 0;
+        lock_give();
+    }
+    rnr_sleep_ms(1);
+    if(locked) {
+        lock_take();
+        core_depth = 1;
+    }
+}
+
 bool irq_lock_isr_enter (void)
 {
     if(!atomic_load(&enabled))

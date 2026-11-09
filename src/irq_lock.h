@@ -28,6 +28,7 @@ bool irq_lock_enabled (void);
 // Core thread
 void irq_lock_core_start (void);        // first thing on the core thread: takes the lock
 void irq_lock_core_yield (bool always); // lets waiting handlers run; always: also yield the CPU
+void irq_lock_core_sleep (void);        // nothing to do for now: sleeps 1 ms with the lock released
 
 // Around every interrupt handler (any thread)
 bool irq_lock_isr_enter (void);

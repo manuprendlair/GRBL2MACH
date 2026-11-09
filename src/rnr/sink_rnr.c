@@ -132,6 +132,13 @@ typedef struct {
     uint8_t check_kind;
     uint32_t check_slices;
     uint32_t checks_ok, checks_bad;
+    // Timing of the open run, to see how much margin the PC leaves (report_run)
+    uint64_t last_loop;         // PC time of the previous pass of the I/O loop
+    uint64_t worst_gap;         // longest time between two passes
+    uint64_t queue_empty_since; // no slice waiting while the run needed one (0: not waiting)
+    uint64_t worst_wait;        // longest such wait: the simulator threads were late
+    double min_lead;            // fewest slices ahead of the controller, when sending a slice
+    uint32_t underruns;         // times the controller had run out of slices and got more
 } rnr_sink_t;
 
 static int send_frame (rnr_sink_t *s, uint8_t buf[RNR_OUT_BYTES])
@@ -229,6 +236,17 @@ static int send_positions (rnr_sink_t *s, const int32_t steps[RNR_AXES])
     rnr_build_positions(buf, 0, steps, 0x0F);
 
     return send_frame(s, buf);
+}
+
+// One line per run of at least a second: the margin the PC left. The controller stops abruptly
+// when it runs out of slices in the middle of a move.
+static void report_run (rnr_sink_t *s)
+{
+    if(s->run_slices < 200 || s->min_lead > 1e8)
+        return;
+
+    fprintf(stderr, "[rnr] run: %u slices, lead min %.1f slices (%.0f ms), underruns %u, USB thread worst gap %.1f ms, longest wait for motion %.1f ms\n",
+             s->run_slices, s->min_lead, s->min_lead * SLICE_MS, s->underruns, s->worst_gap / 1000.0, s->worst_wait / 1000.0);
 }
 
 static void set_fault (rnr_sink_t *s, const char *msg, bool link_lost)
@@ -552,6 +570,11 @@ static void io_thread (void *arg)
 
     while(true) {
 
+        uint64_t loop_start = rnr_now_us();
+        if(s->run_open && s->last_loop && loop_start - s->last_loop > s->worst_gap)
+            s->worst_gap = loop_start - s->last_loop;
+        s->last_loop = loop_start;
+
         // A job in progress must not be stopped by the computer going to sleep
         bool busy = s->run_open || s->outputs || s->pwm;
         if(busy != awake)
@@ -661,8 +684,16 @@ static void io_thread (void *arg)
                     s->cut_active = false;  // next move: the inputs alone tell the switch state again
             }
             rnr_mutex_unlock(&s->lock);
-            if(!got)
+            if(!got) {
+                if(s->run_open && !s->queue_empty_since)
+                    s->queue_empty_since = now;
                 break;
+            }
+            if(s->queue_empty_since) {
+                if(now - s->queue_empty_since > s->worst_wait)
+                    s->worst_wait = now - s->queue_empty_since;
+                s->queue_empty_since = 0;
+            }
             if(dropped) {
                 s->dropped_after_cut++;
                 continue;
@@ -735,6 +766,11 @@ static void io_thread (void *arg)
                 s->run_done_valid = false;
                 s->run_t0 = now;
                 s->run_axis = slice.axis;
+                s->worst_gap = 0;
+                s->worst_wait = 0;
+                s->queue_empty_since = 0;
+                s->min_lead = 1e9;
+                s->underruns = 0;
                 rnr_opcode_t op = slice.kind == Slice_HomeSeek ? RnrOp_ArmHome :
                                   slice.kind == Slice_HomeJog ? RnrOp_StartJog :
                                   slice.kind == Slice_Probe ? RnrOp_ArmProbe : 0;
@@ -754,6 +790,13 @@ static void io_thread (void *arg)
             }
             for(int a = 0; a < RNR_AXES; a++)
                 s->run_sent[a] += slice.steps[a];
+            if(s->run_done_valid) {
+                double lead = (double)s->run_slices - controller_done(s, now);
+                if(lead < s->min_lead)
+                    s->min_lead = lead;
+                if(lead <= 0.0)
+                    s->underruns++;
+            }
             s->run_slices++;
             memcpy(s->track_cum[s->run_slices % TRACK], s->run_sent, sizeof(s->run_sent));
             s->last_slice_seq = s->seq;
@@ -770,6 +813,7 @@ static void io_thread (void *arg)
         if(s->run_open && (empty || s->outputs_change || s->kind_change) && now > s->busy_until + (uint64_t)REST_MS * 1000u &&
             (int16_t)(st.ack_seq - s->last_slice_seq) >= 0) {
             send_short(s, RnrOp_EndOfMotion, s->outputs);
+            report_run(s);
             s->run_open = false;
             s->kind_change = false;
             s->outputs_change = false;

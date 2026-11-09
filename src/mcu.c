@@ -298,9 +298,15 @@ void simulate_serial_flush (void)
     rx_pending_flush = true;
 }
 
+bool simulate_serial_pending (void)
+{
+    return rx_pending_tail != rx_pending_head;
+}
+
 static inline bool rx_is_realtime (uint8_t c)
 {
-    return c == '?' || c == '!' || c == '~' || c == 0x18 /* reset */ || c == 0x19 /* stop */ || c >= 0x80;
+    return c == '?' || c == '!' || c == '~' || c == 0x18 /* reset */ || c == 0x19 /* stop */ || c >= 0x80 ||
+            c == 0x06 /* Ctrl-F, end of the simulator: must not be dropped with the lines waiting */;
 }
 
 static void rx_deliver (uint8_t c)

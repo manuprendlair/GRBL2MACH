@@ -53,6 +53,7 @@
 #include "irq_lock.h"
 
 #include "grbl/hal.h"
+#include "grbl/planner.h"
 
 #ifndef SQUARING_ENABLED
 #define SQUARING_ENABLED 0
@@ -498,7 +499,14 @@ void sim_process_realtime (uint_fast16_t state)
 
     grbl_print_recent_block(); // on this (grbl) thread, which owns the planner
 
-    irq_lock_core_yield(true); // GRBL2MACH: let pending interrupts run and yield to the simulator thread instead of spinning grbl's main loop at full host speed
+    // GRBL2MACH: let pending interrupts run. With nothing to do (no input to parse, or a full planner
+    // that cannot take it), sleep instead of spinning at full host speed: on a two-core PC, that
+    // spinning takes the CPU from the simulator thread and the sender. Each pass fills the whole
+    // stepper segment buffer, which holds far more than 1 ms of motion.
+    if(plan_check_full_buffer() || (!hal.stream.get_rx_buffer_count() && !simulate_serial_pending()))
+        irq_lock_core_sleep();
+    else
+        irq_lock_core_yield(true);
     slicer_core_poll(); // GRBL2MACH: slicer work on the core thread (reconnection)
     slicer_safe_stop_poll(); // GRBL2MACH: controlled stop (client gone, program closing)
     if(sim.greet_client) { // GRBL2MACH: a new TCP client gets the welcome message, as after a controller reset

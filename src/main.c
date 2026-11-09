@@ -721,6 +721,9 @@ int main(int argc, char *argv[])
         // However the program ends, do not leave the controller armed with its spindle on
         atexit(slicer_disarm);
 #ifdef WIN32
+        // The machine stops abruptly if the bridge falls behind; a sender that falls behind only
+        // slows down the job. Ahead of normal programs, but not above the system's own threads.
+        SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
         SetConsoleCtrlHandler(console_handler, TRUE);
         SetUnhandledExceptionFilter(crash_handler);
 #endif
