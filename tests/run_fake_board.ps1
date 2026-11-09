@@ -478,8 +478,28 @@ function Test-Unplug([bool]$PowerCycle) {
     Check ($out2 -match "MSG:.*reconnected") "user told: $(([regex]::Match($out2, '\[MSG:[^\]]*reconnected[^\]]*\]')).Value)"
     Check ($stateAfter -match "<Alarm") "after the reconnection: Alarm (ALARM:17 cleared by a reset, unlock or home to go on)"
     Check ($moved -eq [math]::Round(5 * $spm[0])) "move after unlocking: grblHAL moved 5 mm ($moved steps)"
-    Check ([math]::Round($mpos[0] * $spm[0]) -eq $r.Final[0]) "grblHAL and controller agree after the reconnection (controller X=$($r.Final[0]))"
+    Check ([math]::Round($mpos[0] * $spm[0]) -eq $r.Final[0]) "grblHAL and controller agree after the reconnection (grblHAL X=$($mpos[0]) mm = $([math]::Round($mpos[0] * $spm[0])) steps, controller X=$($r.Final[0]))"
     Check ($r.Stats.seq_errors -eq 0 -and $r.Stats.rejected -eq 0) "no sequence error, no rejected slice"
+}
+
+function Test-UnplugSoftReset {
+    "=== unplug: soft reset (Ctrl-X) sent while the controller is away, then plugged back"
+    $dir = Join-Path $OutDir "unplug_ctrlx"; $log = Join-Path $dir "fake.log"
+    $s = Start-Sim "-f `"$log`"" $dir ($Port + 22) @{ GRBL2MACH_FAKE_UNPLUG_MS = "300,2300" }
+    try {
+        Invoke-Line $s '$X' | Out-Null
+        Send-Sim $s "G21 G91 G1 X20 F600`n"
+        $out = ""; for ($i = 0; $i -lt 30 -and $out -notmatch "ALARM:17"; $i++) { Start-Sleep -Milliseconds 100; $out += Read-Sim $s }
+        Start-Sleep -Milliseconds 400
+        Send-Sim $s ([string][char]0x18)
+        $out2 = ""; for ($i = 0; $i -lt 50 -and $out2 -notmatch "reconnected"; $i++) { Start-Sleep -Milliseconds 100; $out2 += Read-Sim $s }
+        Start-Sleep -Milliseconds 300; $out2 += Read-Sim $s
+        Invoke-Line $s '$X' | Out-Null
+        $status = ""; try { $status = Wait-State $s "Idle" 3000 } catch { $status = "$_" }
+    } finally { Stop-Sim $s }
+    Check ($out -match "ALARM:17") "unplugged: ALARM:17"
+    Check ($out2 -match "MSG:.*reconnected") "reconnected and user told, in spite of the reset"
+    Check ($status -match "<Idle") "unlocked: Idle ($($status.Substring(0, [math]::Min(50, $status.Length))))"
 }
 
 function Test-UnplugIdle {
@@ -712,7 +732,7 @@ if ($Scenario -in "probe", "all") { Test-Probe }
 if ($Scenario -in "mach3", "all") { Test-Mach3 }
 if ($Scenario -in "pace", "all") { Test-Pace }
 if ($Scenario -in "jogs", "all") { Test-Jogs }
-if ($Scenario -in "unplug", "all") { Test-Unplug $false; Test-Unplug $true; Test-UnplugIdle }
+if ($Scenario -in "unplug", "all") { Test-Unplug $false; Test-Unplug $true; Test-UnplugIdle; Test-UnplugSoftReset }
 if ($Scenario -in "client", "all") { Test-ClientLost $false; Test-ClientLost $true; Test-ClientLostIdle; Test-CtrlC }
 if ($Scenario -in "stop", "all") { Test-StopCommand; Test-InputFull }
 if ($Scenario -eq "long") { Test-Long }     # 6 minutes: not part of "all"

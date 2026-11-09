@@ -410,7 +410,9 @@ static void advance (void)
     if(!open) {
         if(motion)
             open_slice(idx);
-        else if(!atomic_load(&resync_busy)) {
+        else if(!atomic_load(&resync_busy) && !atomic_load(&sink_failed)) {
+            // (Link lost: the motion was cut anywhere, sys.position - counted means nothing until
+            // the position is taken from the machine again.)
             // A homing or probing move cut short by the machine (switch, contact): the steps it
             // dropped are in counted. The machine is at rest now: take its position.
             int32_t machine[SLICE_AXES];
@@ -506,7 +508,12 @@ void slicer_core_poll (void)
 {
     static bool resetting = false;
 
-    if(!atomic_load(&reconnected) || (sys.rt_exec_state & EXEC_RESET) || sys.reset_pending ||
+    // A reset under way: wait for its end. Except in the core's critical alarm loop, which only
+    // ends on a reset once the motor fault is gone: a reset that came during it (the sender's, while
+    // the machine was away) stays pending until this function has cleared the fault.
+    bool reset_under_way = ((sys.rt_exec_state & EXEC_RESET) || sys.reset_pending) && !sys.blocking_event;
+
+    if(!atomic_load(&reconnected) || reset_under_way ||
         state_get() != STATE_ALARM || timer[STEPPER_TIMER].enable)
         return;
 

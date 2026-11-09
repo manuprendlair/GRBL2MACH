@@ -387,9 +387,10 @@ The fake controller behaves like the real board as seen in the Mach3 captures (s
   10 s move its buffer must stay at the bridge's lead (closed-loop pacing), with no underrun.
 - `jogs`: short moves one after the other, each started while the last run ends: no slice
   rejected, a new run is opened only once the board is ready again.
-- `unplug` (three runs): USB unplugged during a move, the board keeping its counters or powered up
-  again; and unplugged at rest: ALARM:17 at once, reconnection once plugged back, message to the
-  user, grblHAL resynced on the board's counters, unlock and move again.
+- `unplug` (four runs): USB unplugged during a move, the board keeping its counters or powered up
+  again; unplugged at rest; and a soft reset sent while it is away: ALARM:17 at once, reconnection
+  once plugged back, message to the user, grblHAL resynced on the board's counters, unlock and move
+  again.
 - `client` (four runs): the TCP client disappears during a move, cleanly or abruptly: stop on a ramp,
   spindle off, no alarm, the move does not resume, a new client can go on from there; at rest: no
   reset; and Ctrl-C during a move: ramp, spindle off, board disarmed.
@@ -442,10 +443,6 @@ against the fake controller only, and the crash path has not been exercised.
 ## Known limitations
 
 - With `-u` / `-f`, G4 dwells run 5% short (simulation at 1.05 x real time).
-- After a USB reconnection where the board was also powered off, the fake controller's test fails
-  intermittently: the position shown can be off by about 1 mm until the next homing, and in rare
-  cases the motor fault stays latched and the bridge must be restarted. Always home after a
-  reconnection.
 - The position resync after a reset has only been tested against the fake controller, and not yet
   with homing (which overwrites the core's position).
 - Without the interrupt lock (`--no-irq-lock`), the upstream simulator often misses alarm 3
