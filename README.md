@@ -25,7 +25,7 @@ GRBL2MACH replaces the simulated hardware with the USB controller.
 
 ## Install on Windows (nothing to compile)
 
-**[Download the installer: GRBL2MACH-0.1.1-setup.exe](https://github.com/manuprendlair/GRBL2MACH/raw/master/release/GRBL2MACH-0.1.1-setup.exe)**
+**[Download the installer: GRBL2MACH-0.1.2-setup.exe](https://github.com/manuprendlair/GRBL2MACH/raw/master/release/GRBL2MACH-0.1.2-setup.exe)**
 (the [release](release) folder holds it).
 
 You need: Windows 10 or 11 (64-bit), a board with the USB IDs given under
@@ -494,7 +494,8 @@ Before a long job:
   limited to two cores; a real low-end PC has not been tried yet.
 - Watch the console during a first job: the bridge prints one `[rnr] run:` line per run of at least
   a second. `underruns` above 0 means the board ran out of motion and stopped abruptly (you can
-  usually hear it); `lead min` is the margin that was left.
+  usually hear it); `lead min` is the margin that was left. `NO RAMP` after a jog, or `STARVED`, means
+  a motion stopped without its deceleration: please report it.
 - Close heavy applications. Use a short shielded USB cable, routed away from the VFD and spindle wires:
   interference is the most likely cause of a USB loss in a workshop.
 - Wire a hardwired e-stop. It is the only protection that works in every case above.
@@ -506,10 +507,6 @@ against the fake controller only, and the crash path has not been exercised.
 
 ## Known limitations
 
-- Against the fake controller, about 1 release of a jog in 15 stops without a deceleration ramp: the
-  core finds its step segment buffer empty at the moment the jog is cancelled (cause not found yet).
-  The machine then stops abruptly at jog speed; the position stays right, it is read back from the
-  board.
 - The position resync after a reset has been exercised on the reference machine after homing, but
   its accuracy has only been measured against the fake controller.
 - Without the interrupt lock (`--no-irq-lock`), the upstream simulator often misses alarm 3

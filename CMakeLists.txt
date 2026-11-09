@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(GRBL2MACH VERSION 0.1.1 LANGUAGES C)
+project(GRBL2MACH VERSION 0.1.2 LANGUAGES C)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -102,6 +102,8 @@ if (WIN32)
     enable_language(RC)
     configure_file(${CMAKE_CURRENT_LIST_DIR}/src/grbl2mach.rc.in ${CMAKE_CURRENT_BINARY_DIR}/grbl2mach.rc @ONLY)
     target_sources(grbl2mach PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/grbl2mach.rc)
+    set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/grbl2mach.rc PROPERTIES
+        OBJECT_DEPENDS ${CMAKE_CURRENT_LIST_DIR}/packaging/grbl2mach.ico)
 endif(WIN32)
 
 target_link_libraries(grbl2mach PRIVATE

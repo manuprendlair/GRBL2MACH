@@ -126,6 +126,7 @@ typedef struct {
     bool run_armed;             // the controller has taken that frame (sticky: the 16-bit sequence wraps in a long run)
     bool run_cut;               // StopJog sent in this run: it dropped slices, steps sent no longer tell where the controller is
     bool cut_pending;           // jog being stopped: StopJog goes out once the start of the ramp is queued
+    uint32_t cut_ramp;          // slices sent after StopJog: the deceleration ramp
     uint64_t cut_since;         // PC time of that request
     uint32_t slices_sent, estops_seen, dropped_after_cut;
     bool awaiting_halt;         // stop handled, waiting for a status report that covers it
@@ -669,6 +670,7 @@ static void io_thread (void *arg)
             s->cut_pending = false;
             send_short(s, RnrOp_StopJog, 0);
             s->run_cut = true;
+            s->cut_ramp = 0;
             s->run_done = s->run_slices;
             s->run_done_time = now;
             s->run_done_valid = true;
@@ -827,6 +829,8 @@ static void io_thread (void *arg)
                     s->underruns++;
             }
             s->run_slices++;
+            if(s->run_cut)
+                s->cut_ramp++;
             memcpy(s->track_cum[s->run_slices % TRACK], s->run_sent, sizeof(s->run_sent));
             s->last_slice_seq = s->seq;
             s->slices_sent++;
@@ -842,6 +846,8 @@ static void io_thread (void *arg)
         if(s->run_open && !s->cut_pending && (empty || s->outputs_change || s->kind_change) && now > s->busy_until + (uint64_t)REST_MS * 1000u &&
             (int16_t)(st.ack_seq - s->last_slice_seq) >= 0) {
             send_short(s, RnrOp_EndOfMotion, s->outputs);
+            if(s->run_cut)
+                fprintf(stderr, "[rnr] jog stopped: ramp of %u slices (%u ms)%s\n", s->cut_ramp, s->cut_ramp * SLICE_MS, s->cut_ramp < 3 ? " - NO RAMP" : "");
             report_run(s);
             s->run_open = false;
             s->kind_change = false;

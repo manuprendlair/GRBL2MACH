@@ -654,6 +654,13 @@ void slicer_jog_poll (void)
     }
 }
 
+void slicer_report_starved (void)
+{
+    static unsigned int count = 0;
+
+    fprintf(stderr, "[slicer] STARVED: the step segment buffer ran empty with motion still planned (%u so far)\n", ++count);
+}
+
 void slicer_safe_stop_request (void)
 {
     if(sink)

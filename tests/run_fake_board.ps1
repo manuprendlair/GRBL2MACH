@@ -740,9 +740,7 @@ function Test-JogCancel {
     }
     Check ($opens -eq 2) "each jog opened as a jog run ($opens)"
     Check ($stops.Count -eq 2) "StopJog sent on each release, buffered slices dropped ($($stops -join ', '))"
-    Check ($badRamp -eq 0) "every ramp sent is a clean ramp ($($withRamp.Count) of $($ramps.Count) releases)"
-    # Known defect, see the README: about 1 release in 15 has no ramp at all
-    if ($withRamp.Count -lt $ramps.Count) { "  note : $($ramps.Count - $withRamp.Count) release(s) without a ramp (known defect)" }
+    Check ($withRamp.Count -eq $ramps.Count -and $badRamp -eq 0) "a clean ramp on every release ($($withRamp.Count) of $($ramps.Count))"
     Check ($ms -lt 2000) "back to Idle in $ms ms (this fake controller's default acceleration makes a 0.85 s ramp)"
     Check ($first[0] -gt 5 -and $first[0] -lt 50) "stopped at X=$($first[0]) mm"
     Check ($mid[0] -eq $later[0]) "does not move any more (X=$($mid[0]) mm)"

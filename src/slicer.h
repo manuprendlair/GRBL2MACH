@@ -30,6 +30,7 @@ void slicer_core_poll (void);                     // realtime hook; core thread
 void slicer_safe_stop_request (void);             // any thread
 bool slicer_safe_stop_wait (uint32_t timeout_ms); // true once it is over; any thread except the core's
 void slicer_safe_stop_poll (void);                // realtime hook; core thread
+void slicer_report_starved (void);                // the step segment buffer ran empty with motion still planned; simulator thread
 void slicer_jog_poll (void);                      // stops a jog at once on the machine when it is cancelled; realtime hook, core thread
 void slicer_disarm (void);                        // last resort before the program ends: controller disarmed, outputs off; any thread
 // Outputs set by the core (any thread): stamped on every slice and passed to the sink

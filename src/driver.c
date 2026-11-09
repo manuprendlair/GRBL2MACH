@@ -55,6 +55,8 @@
 
 #include "grbl/hal.h"
 #include "grbl/planner.h"
+#include "grbl/stepper.h"
+#include "grbl/state_machine.h"
 #include "grbl/system.h"
 
 #ifndef SQUARING_ENABLED
@@ -169,9 +171,16 @@ static void stepperWakeUp (void)
 //    hal.stepper_interrupt_callback();   // start the show
 }
 
+static volatile bool in_stepper_isr = false;
+
 // Disables stepper driver interrupts
 static void stepperGoIdle (bool clear_signals)
 {
+    // GRBL2MACH: the core takes an empty segment buffer for the end of the motion. If motion is still
+    // planned, it is in fact a famine: the machine stops dead and the core drops the rest without an alarm.
+    if(in_stepper_isr && !sys.step_control.end_motion && !sys.step_control.execute_sys_motion && plan_get_current_block())
+        slicer_report_starved();
+
     timer[STEPPER_TIMER].value = 0;
     timer[STEPPER_TIMER].load = 0;
     mcu_timer_enable(STEPPER_TIMER, false);  // disable + keep timer_enabled_mask in sync
@@ -518,6 +527,13 @@ void sim_process_realtime (uint_fast16_t state)
 
     grbl_print_recent_block(); // on this (grbl) thread, which owns the planner
 
+    // GRBL2MACH: refill the step segment buffer before giving way. A cancelled jog or a stop leaves
+    // only two segments in it (fast hold), which the core replaces with its deceleration later in
+    // this pass; the simulated interrupts run in bursts and could use them up meanwhile, and the
+    // machine would stop dead, with no ramp. On a microcontroller the core simply gets there first.
+    if(state_get() & (STATE_CYCLE|STATE_HOLD|STATE_SAFETY_DOOR|STATE_HOMING|STATE_SLEEP|STATE_JOG))
+        st_prep_buffer();
+
     // GRBL2MACH: let pending interrupts run. With nothing to do (no input to parse, or a full planner
     // that cannot take it), sleep instead of spinning at full host speed: on a two-core PC, that
     // spinning takes the CPU from the simulator thread and the sender. Each pass fills the whole
@@ -649,7 +665,9 @@ bool driver_init ()
 // Main stepper driver
 void Stepper_IRQHandler (void)
 {
+    in_stepper_isr = true;
     hal.stepper.interrupt_callback();
+    in_stepper_isr = false;
 }
 
 void Control_IRQHandler (void)
