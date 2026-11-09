@@ -23,6 +23,29 @@ GRBL2MACH replaces the simulated hardware with the USB controller.
 > [issue](https://github.com/manuprendlair/GRBL2MACH/issues) with what worked and what did not. Use
 > a hardwired e-stop and try it first without a tool. See [Safety](#safety).
 
+## Install on Windows (nothing to compile)
+
+**[Download the installer: GRBL2MACH-0.1.0-setup.exe](https://github.com/manuprendlair/GRBL2MACH/raw/master/release/GRBL2MACH-0.1.0-setup.exe)**
+(the [release](release) folder holds it).
+
+You need: Windows 10 or 11 (64-bit), a board with the USB IDs given under
+[Target hardware](#target-hardware), your Mach3 profile (the `.xml` file in your Mach3 folder, for
+example `C:\Mach3\Mach3Mill.xml`) and [gSender](https://sienci.com/gsender/) or another
+GRBL-compatible sender.
+
+1. Run the installer. The installer is not signed: if Windows shows a SmartScreen warning, click
+   *More info*, then *Run anyway*. No administrator rights are needed.
+2. Choose your Mach3 profile when asked. A copy is made; your Mach3 profile is not modified. An update
+   keeps the copy already installed, with the settings you changed since.
+3. Close Mach3 (it holds the controller), plug in the board, and double-click **GRBL2MACH** on the
+   desktop. A window opens and must stay open: closing it stops the bridge.
+4. In gSender: *Config* > *Connection*: Ethernet IP `127.0.0.1`; then in the connection panel choose
+   *Ethernet* and *Connect*. See [Using gSender](#using-gsender).
+
+Wire a hardwired e-stop and start without a tool: see [Safety](#safety) and
+[Failures during a job](#failures-during-a-job-what-to-expect). To remove the program: *Settings* >
+*Apps* in Windows; your profile and settings stay in its folder.
+
 ## Goals
 
 - Use gSender (or Candle, UGS, ...) with a controller that was sold for Mach3 only.
@@ -153,6 +176,9 @@ bridge drives the board the way Mach3 does.
 
 ## Building
 
+Only needed to change the program: see [Install on Windows](#install-on-windows-nothing-to-compile)
+otherwise. `packaging\build_installer.ps1` builds the installer (needs [Inno Setup](https://jrsoftware.org/isinfo.php)).
+
 ### Windows (MinGW-w64)
 
 The simulator targets GCC; MSVC is not supported (the grblHAL core uses GCC extensions and POSIX
@@ -262,7 +288,8 @@ Tested with gSender 1.6.4 on the reference machine.
 
 1. Close Mach3 (it holds the controller). Put your Mach3 profile next to the program as
    `MACH3.xml` (see [Machine profile](#machine-profile-mach3-xml)).
-2. Start the bridge, listening where gSender looks for an Ethernet grblHAL board (port 23):
+2. Start the bridge with its desktop icon if you used the installer. Built from source, start it
+   listening where gSender looks for an Ethernet grblHAL board (port 23):
    ```
    cd <GRBL2MACH>\build
    grbl2mach.exe -u -p 23 -n

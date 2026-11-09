@@ -221,7 +221,7 @@ void print_usage(const char* badarg)
 
 void print_version(void)
 {
-    printf("GRBL2MACH: grblHAL core driving an RNR Eco Motion USB controller (based on the grblHAL simulator)\n"
+    printf("GRBL2MACH " GRBL2MACH_VERSION ": grblHAL core driving an RNR Eco Motion USB controller (based on the grblHAL simulator)\n"
       "  Build type : %s\n"
       "  Compiler   : %s\n"
       "  Target     : %s\n"
@@ -718,7 +718,7 @@ int main(int argc, char *argv[])
             return EXIT_FAILURE;
         }
         if (use_usb) {
-            printf("RNR controller: %s\n", info);
+            printf("GRBL2MACH " GRBL2MACH_VERSION "\nRNR controller: %s\n", info);
             fflush(stdout);
         }
         rnr_opt.reconnect = use_usb ? reconnect_usb : reconnect_fake;

@@ -46,3 +46,6 @@ RnRMotion*.dll
 MACH3.xml
 MACH3.xml.*.bak
 MACH3.xml.tmp
+# GRBL2MACH: the Windows installer is published in release/
+!release/*.exe
+!packaging/build_installer.ps1

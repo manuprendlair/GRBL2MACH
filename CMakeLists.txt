@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(GRBL2MACH C)
+project(GRBL2MACH VERSION 0.1.0 LANGUAGES C)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
@@ -96,6 +96,13 @@ add_executable(grbl2mach
     src/rnr/sink_rnr.c
     ${platform_SRC}
 )
+
+if (WIN32)
+    # GRBL2MACH: icon and version shown by Windows
+    enable_language(RC)
+    configure_file(${CMAKE_CURRENT_LIST_DIR}/src/grbl2mach.rc.in ${CMAKE_CURRENT_BINARY_DIR}/grbl2mach.rc @ONLY)
+    target_sources(grbl2mach PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/grbl2mach.rc)
+endif(WIN32)
 
 target_link_libraries(grbl2mach PRIVATE
     m

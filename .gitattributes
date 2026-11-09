@@ -2,6 +2,11 @@
 * text=auto eol=lf
 
 
+# GRBL2MACH: Windows batch files need CRLF; installers and icons are binary
+*.cmd text eol=crlf
+*.exe binary
+*.ico binary
+
 # Custom for Visual Studio
 *.cs     diff=csharp
 
