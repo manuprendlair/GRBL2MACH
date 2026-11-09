@@ -39,6 +39,8 @@
 #include "grbl/gcode.h"
 #include "grbl/planner.h"
 #include "grbl/machine_limits.h"
+#include "grbl/report.h"
+#include "grbl/state_machine.h"
 
 #define SLICE_TICKS ((uint64_t)F_CPU / 1000 * SLICE_MS)
 #define HALT_TIMEOUT_MS 200
@@ -47,6 +49,7 @@ static slice_sink_t *sink = NULL;
 static slice_t cur;
 static volatile bool open = false;  // a slice is in progress (also read by the core thread: homing_get_state)
 static atomic_bool sink_failed;      // the sink reported an error: slices are dropped, motor fault signalled
+static atomic_bool reconnected;      // the sink is back after a link loss: slicer_core_poll resyncs and clears the fault
 static atomic_bool reset_pending;   // set by the core's on_reset (any thread), handled on the simulator thread
 static on_reset_ptr prev_on_reset = NULL;
 static driver_reset_ptr prev_driver_reset = NULL;
@@ -369,8 +372,8 @@ static void advance (void)
 
     if(atomic_exchange(&reset_pending, false)) {
         open = false;           // drop the slice in progress (its steps are in the resync)
-        // sink_failed stays latched: the sink has no way to recover yet (TODO: reconnect), so the
-        // motor fault keeps grblHAL in ALARM:17 until the bridge is restarted.
+        // sink_failed stays latched until the sink reports its link back (check_link): the motor
+        // fault keeps grblHAL in ALARM:17 meanwhile.
         sink->resume(sink);     // from now on, slices belong to motion started after the reset
     }
 
@@ -431,12 +434,87 @@ void slicer_step (uint32_t step_bits, uint32_t dir_bits)
     }
 }
 
+// Link to the machine (sinks that report it): lost, the core gets a motor fault (ALARM:17) right
+// away, even at rest; back again (reconnected: the machine may have reset), the fault clears and
+// the core thread takes the machine's position (slicer_core_poll). The core stays in alarm: the
+// user unlocks or homes.
+static void check_link (void)
+{
+    static bool known = false;
+    static uint32_t generation;
+    uint32_t g;
+
+    if(!sink->link_ok)
+        return;
+
+    bool ok = sink->link_ok(sink, &g);
+    if(!known) {
+        known = true;
+        generation = g;
+    }
+
+    if(!ok) {
+        if(!atomic_exchange(&sink_failed, true)) {
+            fprintf(stderr, "[slicer] link to the machine lost: motor fault, reset\n");
+            mc_reset();
+        }
+    } else if(g != generation) {
+        generation = g;
+        if(atomic_load(&sink_failed)) {
+            fprintf(stderr, "[slicer] machine reachable again: motor fault cleared\n");
+            atomic_store(&reconnected, true);   // sink_failed is cleared by slicer_core_poll
+        }
+    }
+}
+
+// Core thread (realtime hook). After a reconnection, once the core is at rest in alarm (the reset
+// that followed the loss is over): sys.position is put where the machine's counters say, the
+// motor fault cleared and the core reset again, which it needs to leave a critical alarm (that
+// reset does not go through on_driver_reset). Once it is over, the homed state is dropped (the
+// machine may have run part of the motion, or been powered off) and the user told.
+void slicer_core_poll (void)
+{
+    static bool resetting = false;
+
+    if(!atomic_load(&reconnected) || (sys.rt_exec_state & EXEC_RESET) || sys.reset_pending ||
+        state_get() != STATE_ALARM || timer[STEPPER_TIMER].enable)
+        return;
+
+    if(!resetting) {
+        int32_t machine[SLICE_AXES];
+
+        // Freeze the simulator thread's view (idle_offset, counted) while the position is
+        // replaced. With the interrupt lock, it cannot run meanwhile; without it, let it go round
+        // its loop twice (as on_driver_reset)
+        atomic_store(&resync_busy, true);
+        if(!irq_lock_enabled()) {
+            uint32_t beat = atomic_load(&sim_heartbeat);
+            for(int i = 0; i < HALT_TIMEOUT_MS && atomic_load(&sim_heartbeat) - beat < 2; i++)
+                platform_sleep(1000);
+        }
+        sink->get_position(sink, machine);
+        resync_position(machine);
+        sync_position();
+        atomic_store(&resync_busy, false);
+
+        resetting = true;
+        atomic_store(&sink_failed, false);
+        mc_reset();
+    } else {
+        resetting = false;
+        atomic_store(&reconnected, false);
+        sys.homed.mask = 0;
+        report_message("Controller reconnected: machine position lost, home the machine", Message_Warning);
+    }
+}
+
 void slicer_poll (void)
 {
     atomic_fetch_add(&sim_heartbeat, 1);
 
     if(sink) {
         check_estop();
+        check_link();
         advance();
     }
 }

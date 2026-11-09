@@ -86,6 +86,10 @@ typedef struct {
     bool home_on[RNR_AXES];
     int home_axis;                  // axis of the homing run
     int32_t latched[RNR_AXES];      // positions at the last probe contact
+    int64_t unplug_on_ms, unplug_off_ms;  // GRBL2MACH_FAKE_UNPLUG_MS: USB unplugged then, after the first slice
+    bool unplug_reset;              // GRBL2MACH_FAKE_UNPLUG_RESET: plugging back powers it up again (counters at 0)
+    bool unplugged;
+    int unplugs;
     int ignored, homes, probes;
 } fake_t;
 
@@ -222,10 +226,46 @@ static void update_estop_input (fake_t *f, uint64_t now)
     f->estop_input = active;
 }
 
+// USB unplugged (GRBL2MACH_FAKE_UNPLUG_MS window): the controller stops and drops its buffer, as
+// when the bridge disarms it. Plugged back: optionally powered up again, counters at 0.
+static bool unplugged (fake_t *f, uint64_t now)
+{
+    bool out = f->unplug_on_ms >= 0 && f->first_slice_us &&
+               now >= f->first_slice_us + (uint64_t)f->unplug_on_ms * 1000u &&
+               now < f->first_slice_us + (uint64_t)f->unplug_off_ms * 1000u;
+
+    if(out && !f->unplugged) {
+        run_until(f, now);
+        fprintf(f->log, "%10.3f UNPLUGGED at X=%d Y=%d Z=%d A=%d (%d slices dropped)\n", ms(f, now),
+                 f->live[0], f->live[1], f->live[2], f->live[3], f->count);
+        f->count = 0;
+        f->state = RnrState_EStop;
+        f->unplugs++;
+    } else if(!out && f->unplugged) {
+        if(f->unplug_reset) {
+            memset(f->live, 0, sizeof(f->live));
+            f->outputs = 0;
+            f->pwm = 0;
+        }
+        f->seq_started = false;
+        fprintf(f->log, "%10.3f PLUGGED BACK%s\n", ms(f, now), f->unplug_reset ? " (powered up again: counters at 0)" : "");
+    }
+    f->unplugged = out;
+
+    return out;
+}
+
+bool rnr_fake_plugged (rnr_transport_t *t)
+{
+    return !unplugged(t->ctx, rnr_now_us());
+}
+
 static int fake_write (rnr_transport_t *t, const uint8_t b[RNR_OUT_BYTES])
 {
     fake_t *f = t->ctx;
     uint64_t now = rnr_now_us();
+    if(unplugged(f, now))
+        return RNR_IO_DISCONNECTED;
     uint16_t seq = rnr_get_le16(&b[3]);
     uint8_t op = b[1];
 
@@ -399,6 +439,10 @@ static int fake_read (rnr_transport_t *t, uint8_t rx[RNR_IN_BYTES], uint32_t tim
     uint64_t now = rnr_now_us();
     uint64_t deadline = now + (uint64_t)timeout_ms * 1000u;
 
+    if(unplugged(f, now)) {
+        rnr_sleep_ms(timeout_ms);
+        return RNR_IO_DISCONNECTED;
+    }
     run_until(f, now);
     update_estop_input(f, now);
 
@@ -444,6 +488,8 @@ static void fake_close (rnr_transport_t *t)
     fprintf(f->log, "# frames=%d executed=%d max_depth=%d starved=%d rejected=%d overflows=%d seq_errors=%d still_buffered=%d estops=%d ignored=%d homes=%d probes=%d\n",
              f->frames, f->executed, f->max_depth, f->starved, f->rejected, f->overflows, f->seq_errors, f->count, f->estops,
              f->ignored, f->homes, f->probes);
+    if(f->unplugs)
+        fprintf(f->log, "# unplugs=%d\n", f->unplugs);
     fprintf(f->log, "# final position X=%d Y=%d Z=%d A=%d state=%u\n", f->live[0], f->live[1], f->live[2], f->live[3], f->state);
     fclose(f->log);
     free(f);
@@ -480,6 +526,14 @@ rnr_transport_t *rnr_fake_open (const char *log_path)
     f->state = RnrState_EStop;  // like a controller that has just been powered
     f->silent_ms = silent ? atoll(silent) : -1;
     parse_estop_env(f);
+    const char *up = getenv("GRBL2MACH_FAKE_UNPLUG_MS");
+    long long upon, upoff;
+    f->unplug_on_ms = f->unplug_off_ms = -1;
+    if(up && sscanf(up, "%lld,%lld", &upon, &upoff) == 2 && upon >= 0 && upoff > upon) {
+        f->unplug_on_ms = upon;
+        f->unplug_off_ms = upoff;
+    }
+    f->unplug_reset = getenv("GRBL2MACH_FAKE_UNPLUG_RESET") != NULL;
     const char *h = getenv("GRBL2MACH_FAKE_HOME"), *pz = getenv("GRBL2MACH_FAKE_PROBE_Z");
     long x, y, z, aa;
     if(h && sscanf(h, "%ld,%ld,%ld,%ld", &x, &y, &z, &aa) == 4) {

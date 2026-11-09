@@ -100,6 +100,10 @@ struct slice_sink {
     // Waits up to timeout_ms until every slice pushed so far has run and the machine is at rest,
     // with inputs read after that. Returns false on timeout or fault. Optional. Thread-safe.
     bool (*wait_idle)(slice_sink_t *sink, uint32_t timeout_ms);
+    // State of the link to the machine: false while lost. *generation counts the reconnections:
+    // the machine may have reset meanwhile, its position is unknown. Optional (NULL: the link
+    // never fails, or never comes back once lost). Thread-safe.
+    bool (*link_ok)(slice_sink_t *sink, uint32_t *generation);
     void *ctx;
 };
 

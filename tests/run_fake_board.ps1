@@ -18,7 +18,7 @@
 #                       [-GCode "G21 G91 G1 X10 F600"] [-Expect "2500,0,0"] [-OutDir folder] [-Immediate]
 
 param(
-    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "home", "probe", "mach3", "pace", "jogs", "long", "all")] [string]$Scenario = "all",
+    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "home", "probe", "mach3", "pace", "jogs", "unplug", "long", "all")] [string]$Scenario = "all",
     [string]$GCode = "G21 G91 G1 X10 F600",
     [string]$Expect = "2500,0,0",
     [string]$OutDir = "$env:TEMP\grbl2mach_fake",
@@ -447,6 +447,61 @@ function Test-Long {
     Check ($err -match "position checks after runs: [1-9]\d* ok, 0 mismatch") "position check after the run"
 }
 
+function Test-Unplug([bool]$PowerCycle) {
+    $what = if ($PowerCycle) { "powered up again when plugged back (counters at 0)" } else { "kept powered (counters kept)" }
+    "=== unplug: USB unplugged 300 ms into a move, plugged back 1.5 s later; controller $what"
+    $name = if ($PowerCycle) { "unplug_reset" } else { "unplug" }
+    $dir = Join-Path $OutDir $name; $log = Join-Path $dir "fake.log"
+    $envs = @{ GRBL2MACH_FAKE_UNPLUG_MS = "300,1800" }
+    if ($PowerCycle) { $envs.GRBL2MACH_FAKE_UNPLUG_RESET = "1" }
+    $s = Start-Sim "-f `"$log`"" $dir ($Port + 13 + [int]$PowerCycle) $envs
+    try {
+        $spm = Get-StepsPerMm $s
+        Invoke-Line $s '$X' | Out-Null
+        Send-Sim $s "G21 G91 G1 X20 F600`n"
+        $out = ""; for ($i = 0; $i -lt 40 -and $out -notmatch "ALARM:17"; $i++) { Start-Sleep -Milliseconds 100; $out += Read-Sim $s }
+        $lostAlarm = $out -match "ALARM:17"
+        # plugged back at 1.8 s: the bridge reconnects (next attempt within 1 s) and resets the core
+        $out2 = ""; for ($i = 0; $i -lt 50 -and $out2 -notmatch "reconnected"; $i++) { Start-Sleep -Milliseconds 100; $out2 += Read-Sim $s }
+        Start-Sleep -Milliseconds 300; $out2 += Read-Sim $s
+        $stateAfter = Wait-State $s "Alarm" 3000
+        Invoke-Line $s '$X' | Out-Null
+        $before = Get-MPos (Wait-State $s "Idle" 3000)
+        Invoke-GCode $s "G21 G91 G1 X5 F600"
+        $mpos = Get-MPos (Wait-State $s "Idle" 10000)
+    } finally { Stop-Sim $s }
+    $r = Read-FakeLog $log
+    $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
+    $moved = [math]::Round(($mpos[0] - $before[0]) * $spm[0])
+    Check $lostAlarm "unplugged: grblHAL raised ALARM:17 (motor fault)"
+    Check ($err -match "controller reconnected") "bridge reconnected to the controller once plugged back"
+    Check ($out2 -match "MSG:.*reconnected") "user told: $(([regex]::Match($out2, '\[MSG:[^\]]*reconnected[^\]]*\]')).Value)"
+    Check ($stateAfter -match "<Alarm") "after the reconnection: Alarm (ALARM:17 cleared by a reset, unlock or home to go on)"
+    Check ($moved -eq [math]::Round(5 * $spm[0])) "move after unlocking: grblHAL moved 5 mm ($moved steps)"
+    Check ([math]::Round($mpos[0] * $spm[0]) -eq $r.Final[0]) "grblHAL and controller agree after the reconnection (controller X=$($r.Final[0]))"
+    Check ($r.Stats.seq_errors -eq 0 -and $r.Stats.rejected -eq 0) "no sequence error, no rejected slice"
+}
+
+function Test-UnplugIdle {
+    "=== unplug at rest: USB unplugged with the machine idle, plugged back 1.5 s later"
+    $dir = Join-Path $OutDir "unplug_idle"; $log = Join-Path $dir "fake.log"
+    # times count from the first slice: a 0.1 s move, then unplugged 1 s later
+    $s = Start-Sim "-f `"$log`"" $dir ($Port + 15) @{ GRBL2MACH_FAKE_UNPLUG_MS = "1000,2500" }
+    try {
+        Invoke-Line $s '$X' | Out-Null
+        Invoke-GCode $s "G21 G91 G1 X1 F600"
+        Wait-State $s "Idle" | Out-Null
+        $out = ""; for ($i = 0; $i -lt 30 -and $out -notmatch "ALARM:17"; $i++) { Start-Sleep -Milliseconds 100; $out += Read-Sim $s }
+        $out2 = ""; for ($i = 0; $i -lt 40 -and $out2 -notmatch "reconnected"; $i++) { Start-Sleep -Milliseconds 100; $out2 += Read-Sim $s }
+        Invoke-Line $s '$X' | Out-Null
+        $mpos = Get-MPos (Wait-State $s "Idle" 3000)
+    } finally { Stop-Sim $s }
+    $r = Read-FakeLog $log
+    Check ($out -match "ALARM:17") "unplugged at rest: grblHAL raised ALARM:17 at once (no motion needed to notice)"
+    Check ($out2 -match "MSG:.*reconnected") "reconnected and user told"
+    Check ($null -ne $mpos -and $r.Final[0] -gt 0) "unlocked: Idle again (controller X=$($r.Final[0]))"
+}
+
 function Test-Jogs {
     "=== jogs: short Z moves one after the other (step jogs), each new run starting while the last one ends"
     $dir = Join-Path $OutDir "jogs"; $log = Join-Path $dir "fake.log"
@@ -482,6 +537,7 @@ if ($Scenario -in "probe", "all") { Test-Probe }
 if ($Scenario -in "mach3", "all") { Test-Mach3 }
 if ($Scenario -in "pace", "all") { Test-Pace }
 if ($Scenario -in "jogs", "all") { Test-Jogs }
+if ($Scenario -in "unplug", "all") { Test-Unplug $false; Test-Unplug $true; Test-UnplugIdle }
 if ($Scenario -eq "long") { Test-Long }     # 6 minutes: not part of "all"
 
 if ($script:failures -eq 0) { "RESULT: PASS"; exit 0 } else { "RESULT: FAIL ($script:failures)"; exit 1 }

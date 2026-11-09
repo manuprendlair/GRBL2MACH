@@ -80,10 +80,14 @@ bridge drives the board the way Mach3 does.
   full, the simulator waits (back-pressure), so simulated time never runs ahead of the machine.
   Implementations: **file** (`src/sink_file.c`, CSV) and **RNR controller** (`src/rnr/sink_rnr.c`), which
   talks either to the real board over USB HID or to a **fake controller** used by the tests.
-- **RNR sink**: a dedicated I/O thread reads status reports continuously and sends slices paced by
-  the PC clock, at most 75 ms ahead (Mach3 keeps about 0.5 s ahead). A run starts once 40 ms of
-  motion is queued. The board acknowledges a slice as soon as it has buffered it, so pacing on
-  acknowledgements alone would let the machine run far behind.
+- **RNR sink**: a dedicated I/O thread reads status reports continuously and keeps the board about
+  85 ms ahead (Mach3 keeps about 0.5 s ahead). A run starts once 40 ms of motion is queued. The
+  board acknowledges a slice as soon as it has buffered it, so pacing on acknowledgements alone
+  would let the machine run far behind; pacing on the PC clock alone does not work either: the
+  board runs a slice in about 5.02 ms, and its buffer (so the lag of a jog stop) grew by 4-7 ms
+  per second of motion. The pacing is closed-loop: the bridge estimates how many slices of the run
+  the board has run (in time) and puts that estimate back on the slice whose cumulative steps
+  match the step counters of each status report, whenever that match is unambiguous.
   - Program runs use the same frames as Mach3: arming (pre-reset, clear e-stop, set positions,
     configure), "G-code" slices, then end of motion. After each run, the board's step counters are
     checked against the steps sent.
@@ -112,7 +116,12 @@ bridge drives the board the way Mach3 does.
     hysteresis still reads engaged (ALARM:8, seen on the reference machine). Set `$27` (pull-off)
     above the switch hysteresis.
   - A 500 ms status watchdog or USB loss is reported as a motor fault (ALARM:17) and disarms the
-    board.
+    board, even at rest. The bridge then looks for the board again every second; once it is back
+    (plugged in again, powered up again), the bridge configures it as at start, takes its step
+    counters as the machine position, clears the motor fault and resets grblHAL, which comes back
+    in alarm with the message `Controller reconnected: machine position lost, home the machine`.
+    Home (`$H`), or unlock (`$X`) if you know the machine did not move. The TCP connection of the
+    sender stays open throughout.
   - Spindle and coolant: grblHAL's spindle (M3/M4, S) and coolant (M7/M8) drive the board's PWM
     frame and outputs OUT1..OUT4 (`--rnr-out`). As grblHAL changes them between moves only, a run is
     closed before an output switches, and the switch goes out once the motion before it has run (not
@@ -374,6 +383,15 @@ The fake controller behaves like the real board as seen in the Mach3 captures (s
   profile changed on disk is not overwritten; a missing profile is refused.
 - `pins`: the configuration frame's input bytes computed from `--rnr-in` must equal the frames Mach3
   sent for the same settings (15 variants captured on the real board).
+- `pace`: the fake board runs its slices 1 % slower than 5 ms (the real one: about 0.4 %); over a
+  10 s move its buffer must stay at the bridge's lead (closed-loop pacing), with no underrun.
+- `jogs`: short moves one after the other, each started while the last run ends: no slice
+  rejected, a new run is opened only once the board is ready again.
+- `unplug` (three runs): USB unplugged during a move, the board keeping its counters or powered up
+  again; and unplugged at rest: ALARM:17 at once, reconnection once plugged back, message to the
+  user, grblHAL resynced on the board's counters, unlock and move again.
+- `long` (6 minutes, not part of `all`): a run of more than 65536 frames, where the 16-bit sequence
+  numbers wrap: pacing and checks must hold all along.
 
 ```
 powershell -File tests\run_fake_board.ps1 -Scenario all
@@ -382,8 +400,6 @@ powershell -File tests\run_fake_board.ps1 -Scenario all
 ## Known limitations
 
 - With `-u` / `-f`, G4 dwells run 5% short (simulation at 1.05 x real time).
-- Once the controller is lost (watchdog, USB unplugged), the bridge must be restarted: there is no
-  reconnection yet, and ALARM:17 stays latched until then.
 - The position resync after a reset has only been tested against the fake controller, and not yet
   with homing (which overwrites the core's position).
 - Without the interrupt lock (`--no-irq-lock`), the upstream simulator often misses alarm 3
@@ -422,7 +438,7 @@ powershell -File tests\run_fake_board.ps1 -Scenario all
 - This software is a **second layer** only. Use a hardwired emergency stop that cuts power to the
   stepper drivers.
 - On USB link loss or 500 ms without a status report, the bridge sends an e-stop and grblHAL
-  raises ALARM:17. Thanks to real-time pacing the board never holds more than about 100 ms of
+  raises ALARM:17. Thanks to closed-loop pacing the board never holds more than about 100 ms of
   motion. The board has no watchdog of its own: if the PC freezes, it runs what it holds.
 - The board's e-stop input (IN1 by default) stops it by itself, without the PC, because the bridge
   declares it in the board's configuration; the bridge also stops it (in about 30 ms) as a second

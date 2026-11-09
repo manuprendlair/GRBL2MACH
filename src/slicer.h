@@ -23,6 +23,7 @@ bool slicer_estop (void);                         // true while the machine repo
 bool slicer_get_inputs (sink_inputs_t *in);       // machine home/limit/probe inputs; false: use the simulated ones; any thread
 void slicer_set_phase (slice_kind_t kind, int axis); // kind of motion the next slices belong to; any thread
 void slicer_probe_end (void);                     // end of a probing cycle: position and probe position from the machine; core thread
+void slicer_core_poll (void);                     // realtime hook; core thread
 // Outputs set by the core (any thread): stamped on every slice and passed to the sink
 void slicer_set_spindle (bool on, bool ccw, uint16_t pwm); // pwm: 0..SLICE_PWM_PERIOD
 void slicer_set_spindle_pwm (uint16_t pwm);           // speed change only (laser mode, S word)

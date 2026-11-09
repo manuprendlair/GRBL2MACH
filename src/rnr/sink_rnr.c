@@ -60,6 +60,7 @@
 #define ESTOP_HOLD_MS    300    // an e-stop seen only as a disarm (press shorter than a status period) is held that long
 #define READ_TIMEOUT_MS  2
 #define CONNECT_WAIT_MS  1000
+#define RECONNECT_MS     1000   // link lost: one reconnection attempt that often
 #define SLICE_US         ((uint64_t)SLICE_MS * 1000u)
 #define TRACK            1024   // slices of the open run remembered to locate the controller in it
 
@@ -75,6 +76,7 @@ typedef struct {
     rnr_status_t status;
     bool quit, stop_request, fault, run_open_shared;
     bool link_lost;             // no status any more: the machine position is unknown
+    uint32_t generation;        // reconnections so far (link_ok)
     bool blocked;               // between stop() and resume(): pushed slices are dropped
     bool halted;                // the controller has taken the stop and reported its position since
     int32_t halted_pos[RNR_AXES];
@@ -108,6 +110,7 @@ typedef struct {
     bool run_done_valid;
     uint64_t first_queued;      // PC time at which slices were first seen queued with no run open (0: none)
     uint64_t last_status;
+    uint64_t next_reconnect;    // link lost: PC time of the next reconnection attempt
     uint16_t last_slice_seq;
     uint8_t outputs;            // OUT1..OUT4 last sent
     uint16_t pwm;               // spindle PWM duty last sent
@@ -472,6 +475,70 @@ static void on_status (rnr_sink_t *s, const rnr_status_t *st, uint64_t now)
     }
 }
 
+// Link lost: tries to reach the controller again (at most once per RECONNECT_MS). Once it answers,
+// it gets the same frames as at start (configuration, disarmed, outputs off) and the bridge forgets
+// everything about the motion in progress: the controller may have been powered off or have run
+// part of it. Its counters are taken as they are (the next arming keeps them): the slicer resyncs
+// on them, the core is told the machine position is lost.
+static bool reconnect_link (rnr_sink_t *s, uint64_t now)
+{
+    uint8_t rx[RNR_IN_BYTES];
+    rnr_status_t st;
+    bool got = false;
+
+    if(now < s->next_reconnect)
+        return false;
+    s->next_reconnect = now + (uint64_t)RECONNECT_MS * 1000u;
+
+    if(!s->opt.reconnect(&s->t) || !s->t)
+        return false;
+
+    if(send_configure(s) != RNR_IO_OK || send_short(s, RnrOp_EStop, 0) != RNR_IO_OK ||
+        send_pwm(s, 0) != RNR_IO_OK || send_short(s, RnrOp_SetOutputs, 0) != RNR_IO_OK)
+        return false;
+    for(uint64_t end = rnr_now_us() + CONNECT_WAIT_MS * 1000u; !got && rnr_now_us() < end; ) {
+        int r = s->t->read(s->t, rx, 20);
+        if(r == RNR_IO_DISCONNECTED)
+            return false;
+        got = r == RNR_IO_OK && rnr_parse_status(rx, RNR_IN_BYTES, &st);
+    }
+    if(!got)
+        return false;
+
+    s->armed = false;
+    s->run_open = false;
+    s->awaiting_halt = false;
+    s->check_pending = false;
+    s->busy_until = 0;
+    s->first_queued = 0;
+    s->outputs = 0;
+    s->pwm = 0;
+    s->outputs_change = false;
+    s->kind_change = false;
+    s->last_status = rnr_now_us();
+
+    rnr_mutex_lock(&s->lock);
+    s->fault = false;
+    s->link_lost = false;
+    s->fault_msg[0] = 0;
+    s->qcount = 0;
+    s->status = st;
+    s->inputs_known = true;
+    s->estop_input = (st.fault_flags & RNR_FAULT_ESTOP) != 0;
+    s->cut_active = false;
+    s->probe_contact = false;
+    s->halted = false;
+    s->idle_shared = false;
+    s->resync_pending = false;  // the slicer takes the controller's counters itself (link_ok)
+    s->generation++;
+    rnr_mutex_unlock(&s->lock);
+
+    fprintf(stderr, "[rnr] controller reconnected, at X=%d Y=%d Z=%d A=%d: machine position lost, home the machine\n",
+             st.live_steps[0], st.live_steps[1], st.live_steps[2], st.live_steps[3]);
+
+    return true;
+}
+
 static void io_thread (void *arg)
 {
     rnr_sink_t *s = arg;
@@ -481,6 +548,21 @@ static void io_thread (void *arg)
     s->last_status = rnr_now_us();
 
     while(true) {
+
+        if(s->opt.reconnect) {
+            rnr_mutex_lock(&s->lock);
+            bool lost = s->link_lost, quit = s->quit;
+            if(lost)
+                s->stop_request = false;    // nothing to stop: the controller is out of reach
+            rnr_mutex_unlock(&s->lock);
+            if(lost && !s->armed) {         // (disarmed once: see the fault handling below)
+                if(quit)
+                    break;
+                if(!reconnect_link(s, rnr_now_us()))
+                    rnr_sleep_ms(20);
+                continue;
+            }
+        }
 
         int r = s->t->read(s->t, rx, READ_TIMEOUT_MS);
         uint64_t now = rnr_now_us();
@@ -893,6 +975,18 @@ static bool rnr_estop_active (slice_sink_t *sink)
     return active;
 }
 
+static bool rnr_link_ok (slice_sink_t *sink, uint32_t *generation)
+{
+    rnr_sink_t *s = sink->ctx;
+
+    rnr_mutex_lock(&s->lock);
+    bool ok = !s->link_lost;
+    *generation = s->generation;
+    rnr_mutex_unlock(&s->lock);
+
+    return ok;
+}
+
 static void rnr_close (slice_sink_t *sink)
 {
     rnr_sink_t *s = sink->ctx;
@@ -914,12 +1008,15 @@ static void rnr_close (slice_sink_t *sink)
     rnr_thread_join(s->thread);
 
     // Leave the controller disarmed, spindle and outputs off
-    send_short(s, RnrOp_EStop, 0);
-    outputs_off(s);
+    if(s->t) {
+        send_short(s, RnrOp_EStop, 0);
+        outputs_off(s);
+    }
     fprintf(stderr, "[rnr] closed: %u slices sent, %u controller e-stops, %u slices dropped after a switch or contact, position checks after runs: %u ok, %u mismatch; controller located %u times (%u reports ambiguous)\n",
              s->slices_sent, s->estops_seen, s->dropped_after_cut, s->checks_ok, s->checks_bad, s->track_fixes, s->track_ambiguous);
 
-    s->t->close(s->t);
+    if(s->t)
+        s->t->close(s->t);
     rnr_mutex_destroy(&s->lock);
     free(s);
     free(sink);
@@ -986,6 +1083,7 @@ slice_sink_t *sink_rnr_open (rnr_transport_t *t, const rnr_options_t *opt)
     sink->take_resync = rnr_take_resync;
     sink->wait_idle = rnr_wait_idle;
     sink->get_probe_result = rnr_get_probe_result;
+    sink->link_ok = rnr_link_ok;
     sink->ctx = s;
 
     return sink;

@@ -38,5 +38,7 @@ rnr_transport_t *rnr_hid_open (char *info, size_t info_len);
 // Fake controller for tests: executes slices in real time and logs every frame to log_path.
 // Environment variable GRBL2MACH_FAKE_SILENT_MS makes it stop reporting that long after the first slice.
 rnr_transport_t *rnr_fake_open (const char *log_path);
+// Fake controller only: false while it is unplugged (GRBL2MACH_FAKE_UNPLUG_MS).
+bool rnr_fake_plugged (rnr_transport_t *t);
 
 #endif

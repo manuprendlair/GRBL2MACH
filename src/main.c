@@ -81,6 +81,28 @@ static const char *mach3_path = NULL;           // --mach3
 static bool cli_invert = false, cli_out = false, cli_in = false, cli_estop = false;
 
 // "<n>" or "<n>low": input number (0 = not used, 1..15) and polarity
+// Link to the controller lost (sink_rnr): open it again. USB: the device may come back under
+// another handle once plugged back. Fake controller: back at the end of its unplug window.
+static bool reconnect_usb (rnr_transport_t **t)
+{
+    char info[256] = "";
+
+    if (*t) {
+        (*t)->close(*t);
+        *t = NULL;
+    }
+    if (!(*t = rnr_hid_open(info, sizeof(info))))
+        return false;
+    fprintf(stderr, "[rnr] controller found again: %s\n", info);
+
+    return true;
+}
+
+static bool reconnect_fake (rnr_transport_t **t)
+{
+    return *t && rnr_fake_plugged(*t);
+}
+
 static bool parse_rnr_input (const char *s, rnr_input_t *in)
 {
     char *end;
@@ -610,6 +632,7 @@ int main(int argc, char *argv[])
             printf("RNR controller: %s\n", info);
             fflush(stdout);
         }
+        rnr_opt.reconnect = use_usb ? reconnect_usb : reconnect_fake;
         slice_sink_t *sink = sink_rnr_open(t, &rnr_opt);
         if (!sink) {
             printf("The RNR controller does not answer.\n");

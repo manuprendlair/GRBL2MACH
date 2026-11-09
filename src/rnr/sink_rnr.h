@@ -26,6 +26,10 @@ typedef struct {
     // bytes encoded from inputs
     bool pins_raw;
     uint8_t pins[RNR_PIN_BYTES];
+    // Link lost (unplugged, controller silent): called about once a second until it returns true,
+    // with the transport in use. It may close it (then sets *t = NULL) and open a new one into *t.
+    // NULL: no reconnection, the bridge must be restarted.
+    bool (*reconnect)(rnr_transport_t **t);
 } rnr_options_t;
 
 // Takes ownership of the transport (closed on failure or by sink->close).

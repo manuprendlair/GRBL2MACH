@@ -499,6 +499,7 @@ void sim_process_realtime (uint_fast16_t state)
     grbl_print_recent_block(); // on this (grbl) thread, which owns the planner
 
     irq_lock_core_yield(true); // GRBL2MACH: let pending interrupts run and yield to the simulator thread instead of spinning grbl's main loop at full host speed
+    slicer_core_poll(); // GRBL2MACH: slicer work on the core thread (reconnection)
     on_execute_realtime(state);
 }
 
