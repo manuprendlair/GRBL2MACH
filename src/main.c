@@ -259,6 +259,7 @@ static void client_lost (const char *why)
     sim.socket_fd = 0;
 #endif
     fprintf(stderr, "[tcp] client gone (%s)\n", why);
+    simulate_serial_flush();    // its lines still waiting must not run
     if(sim.exit == exit_NO)     // not when it left after asking for a shutdown (Ctrl-F)
         slicer_safe_stop_request();
 }

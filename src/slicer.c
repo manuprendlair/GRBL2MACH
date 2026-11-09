@@ -119,7 +119,12 @@ static void on_core_reset (void)
 // sys.position back where the machine actually stopped.
 static void on_driver_reset (void)
 {
-    if(sink) {
+    // The stop command (0x19, gSender's Stop button) calls this too, but it is not a reset: the core
+    // goes on and brings the motion to a stop on a ramp. Stopping the machine here would make that
+    // an abrupt stop and leave the core waiting for steppers that no longer run.
+    bool just_a_stop = sys.cancel && !sys.abort && !sys.reset_pending && !(sys.rt_exec_state & EXEC_RESET);
+
+    if(sink && !just_a_stop) {
         int32_t machine[SLICE_AXES];
         uint32_t beat;
 
@@ -155,6 +160,25 @@ void slicer_set_phase (slice_kind_t kind, int axis)
     atomic_store(&phase, (unsigned int)kind | (unsigned int)(axis & 0xFF) << 8);
 }
 
+// Core thread: waits until the last slice has reached the sink and the machine has run everything.
+// The interrupt lock is given up while waiting: the slice can only come from the simulator thread,
+// and keeping the lock that long would make the simulator give up on it for good (irq_lock.c).
+static bool wait_machine_idle (uint32_t timeout_ms)
+{
+    for(int i = 0; i < 100 && open; i++) {
+        platform_sleep(1000);
+        irq_lock_core_yield(true);
+    }
+
+    for(uint32_t waited = 0; waited < timeout_ms && !atomic_load(&sink_failed); waited += 2) {
+        if(sink->wait_idle(sink, 2))
+            return true;
+        irq_lock_core_yield(true);
+    }
+
+    return false;
+}
+
 // The core reads the home switches. At the end of a pull-off it checks at once that the switch
 // has released, as on a microcontroller where motion and switch are in sync. Here the machine still
 // has up to RNR_LEAD_MS of that motion to run, plus a status period before its inputs are known:
@@ -164,9 +188,7 @@ static home_signals_t homing_get_state (void)
     bool pulloff = (atomic_load(&phase) & 0xFF) == Slice_HomeJog, moving = timer[STEPPER_TIMER].enable;
 
     if(pulloff && !moving && sink && sink->wait_idle) {
-        for(int i = 0; i < 100 && open; i++)   // the last slice of the move must reach the sink first
-            platform_sleep(1000);
-        if(!sink->wait_idle(sink, 2000))
+        if(!wait_machine_idle(2000))
             fprintf(stderr, "[slicer] machine not at rest after a homing pull-off: switch state may be stale\n");
     }
 
@@ -246,7 +268,13 @@ void slicer_probe_end (void)
         return;
 
     atomic_store(&resync_busy, true);
-    if(sink->get_probe_result(sink, machine, latched, &contact, 1000)) {
+    bool known = false;
+    for(int waited = 0; waited < 1000 && !known; waited += 2) {     // (lock given up: see wait_machine_idle)
+        known = sink->get_probe_result(sink, machine, latched, &contact, 2);
+        if(!known)
+            irq_lock_core_yield(true);
+    }
+    if(known) {
         for(int i = 0; i < SLICE_AXES && i < N_AXIS; i++) {
             sys.position[i] = machine[i] + idle_offset[i];
             counted[i] = machine[i];
@@ -572,10 +600,8 @@ void slicer_safe_stop_poll (void)
         } else if(!(state & (STATE_CYCLE|STATE_JOG)) && sys.holding_state == Hold_Complete && !timer[STEPPER_TIMER].enable) {
             // Let the end of the ramp run: a reset drops what the machine has not executed yet.
             // A hold that is over is not motion: without this flag the reset would raise ALARM:3.
-            for(int i = 0; i < 100 && open; i++)
-                platform_sleep(1000);
             if(sink->wait_idle)
-                sink->wait_idle(sink, 2000);
+                wait_machine_idle(2000);
             sys.step_control.execute_hold = Off;
             reset = true;
         } else

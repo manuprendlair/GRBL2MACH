@@ -284,6 +284,32 @@ void mcu_gpio_in (gpio_port_t *port, uint16_t pins, uint16_t mask)
     port->state.value = (port->state.value & ~mask) | pins;
 }
 
+// GRBL2MACH: bytes read from the sender, waiting for room in the core's input buffer. Reading
+// them here, rather than leaving them in the socket, lets the realtime commands behind them (on
+// a real controller, an interrupt handles those at once) get through while the buffer is full.
+#define RX_PENDING_SIZE 8192
+static uint8_t rx_pending[RX_PENDING_SIZE];
+static uint_fast16_t rx_pending_head = 0, rx_pending_tail = 0;
+static volatile bool rx_pending_flush = false;
+
+// The lines waiting must not run after a reset or a stop, or once their sender is gone. Any thread.
+void simulate_serial_flush (void)
+{
+    rx_pending_flush = true;
+}
+
+static inline bool rx_is_realtime (uint8_t c)
+{
+    return c == '?' || c == '!' || c == '~' || c == 0x18 /* reset */ || c == 0x19 /* stop */ || c >= 0x80;
+}
+
+static void rx_deliver (uint8_t c)
+{
+    uart.rx_data = c;
+    uart.rx_irq = 1;
+    run_isr(UART_IRQ);
+}
+
 // TODO: move to mcu_master_clock() above
 void simulate_serial (void)
 {
@@ -304,13 +330,34 @@ void simulate_serial (void)
     // byte slot and try again at the next one, no input is lost.
     static uint32_t pulse_seen = 0;
 
-    if(sim.grbl_pulse != pulse_seen && uart.rx_irq_enable && !uart.rx_irq && hal.stream.get_rx_buffer_free() > 100) {
+    if(rx_pending_flush) {
+        rx_pending_flush = false;
+        rx_pending_tail = rx_pending_head;
+    }
+
+    if(!sim.grbl_pulse || !uart.rx_irq_enable || uart.rx_irq)
+        return;
+
+    uint_fast16_t next = (rx_pending_head + 1) % RX_PENDING_SIZE;
+
+    if(next != rx_pending_tail) {
         uint8_t char_in = sim.getchar();
-        if (char_in) {
-            pulse_seen = sim.grbl_pulse;
-            uart.rx_data = char_in;
-            uart.rx_irq = 1;
-            run_isr(UART_IRQ);
+        if(rx_is_realtime(char_in)) {
+            if(char_in == 0x18 || char_in == 0x19)
+                rx_pending_tail = rx_pending_head;
+            rx_deliver(char_in);
+            return;
         }
+        if(char_in) {
+            rx_pending[rx_pending_head] = char_in;
+            rx_pending_head = next;
+        }
+    }
+
+    if(rx_pending_tail != rx_pending_head && sim.grbl_pulse != pulse_seen && hal.stream.get_rx_buffer_free() > 100) {
+        pulse_seen = sim.grbl_pulse;
+        uint8_t char_in = rx_pending[rx_pending_tail];
+        rx_pending_tail = (rx_pending_tail + 1) % RX_PENDING_SIZE;
+        rx_deliver(char_in);
     }
 }

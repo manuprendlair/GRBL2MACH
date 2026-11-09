@@ -393,6 +393,8 @@ The fake controller behaves like the real board as seen in the Mach3 captures (s
 - `client` (four runs): the TCP client disappears during a move, cleanly or abruptly: stop on a ramp,
   spindle off, no alarm, the move does not resume, a new client can go on from there; at rest: no
   reset; and Ctrl-C during a move: ramp, spindle off, board disarmed.
+- `stop` (two runs): the stop command during a move: ramp, spindle off, no alarm; and the input
+  buffer full: status reports still answered at once, and the lines waiting are dropped by a reset.
 - `long` (6 minutes, not part of `all`): a run of more than 65536 frames, where the 16-bit sequence
   numbers wrap: pacing and checks must hold all along.
 
@@ -413,6 +415,7 @@ failures are specific to this design. The bridge follows three rules:
 | Event | What the bridge does | What you do next |
 |---|---|---|
 | The sender closes, crashes or stops reading its TCP connection, during motion | Feed hold (ramp), then spindle and coolant off and the program flushed. Position and homing are kept. Waits for a new client | Reconnect, restart the job from a line in your sender |
+| Stop command from the sender (`0x19`), during motion | The core ramps down, spindle and coolant off, program dropped, back to Idle with position and homing kept | Restart the job from your sender |
 | The sender goes away at rest | Nothing changes, except a spindle or coolant still on: switched off | Reconnect |
 | The sender freezes but stays connected | As on a physical controller: the buffered moves run and decelerate to a stop, the spindle stays on | Restart the sender |
 | USB unplugged, interference, board silent for 500 ms | ALARM:17. No ramp is possible: the board runs the ~100 ms it holds, then stops abruptly (steps may be lost). Reconnects by itself once the board is back | Check the machine, home, restart the job |
@@ -432,7 +435,8 @@ Before a long job:
 - Wire a hardwired e-stop. It is the only protection that works in every case above.
 
 Losing the sender (gSender's Disconnect button) and closing the bridge's window during a program have
-been tested on the reference machine, with no tool and the spindle not wired. Ctrl-C has been tested
+been tested on the reference machine, with no tool and the spindle not wired, as have gSender's Stop
+buttons and Pause / Resume during a program, with the input buffer full. Ctrl-C has been tested
 against the fake controller only, and the crash path has not been exercised.
 
 ## Known limitations

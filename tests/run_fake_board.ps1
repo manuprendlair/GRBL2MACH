@@ -18,7 +18,7 @@
 #                       [-GCode "G21 G91 G1 X10 F600"] [-Expect "2500,0,0"] [-OutDir folder] [-Immediate]
 
 param(
-    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "home", "probe", "mach3", "pace", "jogs", "unplug", "client", "long", "all")] [string]$Scenario = "all",
+    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "home", "probe", "mach3", "pace", "jogs", "unplug", "client", "stop", "long", "all")] [string]$Scenario = "all",
     [string]$GCode = "G21 G91 G1 X10 F600",
     [string]$Expect = "2500,0,0",
     [string]$OutDir = "$env:TEMP\grbl2mach_fake",
@@ -615,6 +615,68 @@ function Test-CtrlC {
     Check (@($r.Frames | Where-Object { $_.op -eq 1 }).Count -ge 1) "e-stop frame sent to the controller"
 }
 
+function Test-StopCommand {
+    "=== stop command (0x19, gSender's Stop button) during a move, spindle on"
+    $dir = Join-Path $OutDir "stop_cmd"; $log = Join-Path $dir "fake.log"
+    $s = Start-Sim "-f `"$log`"" $dir ($Port + 20)
+    try {
+        $spm = Get-StepsPerMm $s
+        Invoke-Line $s '$X' | Out-Null
+        Invoke-GCode $s "M3 S1000; G21 G91 G1 X100 F600"
+        Start-Sleep -Milliseconds 2000
+        Read-Sim $s | Out-Null
+        $t = [Diagnostics.Stopwatch]::StartNew()
+        Send-Sim $s ([string][char]0x19)
+        $status = Wait-State $s "Idle" 5000
+        $ms = $t.ElapsedMilliseconds
+        $at = Get-MPos $status
+        Start-Sleep -Milliseconds 1500
+        $out = Read-Sim $s
+        $later = Get-MPos (Wait-State $s "Idle" 3000)
+        Invoke-GCode $s "G21 G91 G1 X5 F600"
+        $moved = Get-MPos (Wait-State $s "Idle" 10000)
+    } finally { Stop-Sim $s }
+    $r = Read-FakeLog $log
+    Check ($ms -lt 3000) "back to Idle in $ms ms"
+    Check-Ramp (Get-FirstRunSlices $r.Frames)
+    Check ((Select-String -Path $log -Pattern "OUTPUTS 0x01 -> 0x00" | Measure-Object).Count -ge 1) "spindle switched off"
+    Check ($out -notmatch "ALARM") "no alarm"
+    Check ($at[0] -eq $later[0]) "the motion does not resume: X stays at $($at[0]) mm"
+    Check ([math]::Round(($moved[0] - $at[0]) * $spm[0]) -eq [math]::Round(5 * $spm[0])) "a new move from there: +5 mm"
+    Check ([math]::Round($moved[0] * $spm[0]) -eq $r.Final[0]) "grblHAL and controller agree (controller X=$($r.Final[0]))"
+}
+
+function Test-InputFull {
+    "=== input buffer full: realtime commands still get through, waiting lines dropped by a reset"
+    $dir = Join-Path $OutDir "input_full"; $log = Join-Path $dir "fake.log"
+    $s = Start-Sim "-f `"$log`"" $dir ($Port + 21)
+    try {
+        Invoke-Line $s '$X' | Out-Null
+        Invoke-GCode $s "G21 G91 F30"
+        # about 100 blocks for the planner, then more than the input buffer holds
+        $text = ""; for ($i = 0; $i -lt 400; $i++) { $text += "G1 X0.10$($i % 10) Y0.1`n" }
+        Send-Sim $s $text
+        Start-Sleep -Milliseconds 1500
+        $slowest = 0
+        for ($i = 0; $i -lt 12; $i++) {
+            Read-Sim $s | Out-Null
+            $t = [Diagnostics.Stopwatch]::StartNew(); Send-Sim $s "?"; $reply = ""
+            while ($reply -notmatch "<\w+\|" -and $t.ElapsedMilliseconds -lt 5000) { $reply += Read-Sim $s }
+            $slowest = [math]::Max($slowest, $t.ElapsedMilliseconds)
+            Start-Sleep -Milliseconds 250
+        }
+        Send-Sim $s ([string][char]0x18)
+        Start-Sleep -Milliseconds 800
+        Read-Sim $s | Out-Null
+        Invoke-Line $s '$X' | Out-Null
+        $at = Get-MPos (Wait-State $s "Idle" 3000)
+        Start-Sleep -Milliseconds 1500
+        $later = Get-MPos (Wait-State $s "Idle" 3000)
+    } finally { Stop-Sim $s }
+    Check ($slowest -lt 1000) "status report while the input is full: $slowest ms at worst"
+    Check ($at[0] -eq $later[0]) "after a reset, the lines that were waiting do not run (X stays at $($at[0]) mm)"
+}
+
 function Test-Jogs {
     "=== jogs: short Z moves one after the other (step jogs), each new run starting while the last one ends"
     $dir = Join-Path $OutDir "jogs"; $log = Join-Path $dir "fake.log"
@@ -652,6 +714,7 @@ if ($Scenario -in "pace", "all") { Test-Pace }
 if ($Scenario -in "jogs", "all") { Test-Jogs }
 if ($Scenario -in "unplug", "all") { Test-Unplug $false; Test-Unplug $true; Test-UnplugIdle }
 if ($Scenario -in "client", "all") { Test-ClientLost $false; Test-ClientLost $true; Test-ClientLostIdle; Test-CtrlC }
+if ($Scenario -in "stop", "all") { Test-StopCommand; Test-InputFull }
 if ($Scenario -eq "long") { Test-Long }     # 6 minutes: not part of "all"
 
 if ($script:failures -eq 0) { "RESULT: PASS"; exit 0 } else { "RESULT: FAIL ($script:failures)"; exit 1 }

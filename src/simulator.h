@@ -86,6 +86,7 @@ void sim_loop (void);
 // Call the stepper interrupt until one block is finished
 // (defined in serial.c)
 void simulate_serial (void);
+void simulate_serial_flush (void); // GRBL2MACH: drops the input waiting for room in the core's buffer
 
 //print serial output to stdout or file
 void sim_serial_out (uint8_t data);

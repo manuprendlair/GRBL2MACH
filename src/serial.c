@@ -72,6 +72,7 @@ static void serialRxFlush (void)
 {
     rxbuffer.tail = rxbuffer.head;
     rxbuffer.overflow = false;
+    simulate_serial_flush();    // GRBL2MACH: and what was waiting to get in
 }
 
 static void serialRxCancel (void)
