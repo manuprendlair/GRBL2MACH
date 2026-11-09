@@ -96,6 +96,9 @@ bridge drives the board the way Mach3 does.
   - Program runs use the same frames as Mach3: arming (pre-reset, clear e-stop, set positions,
     configure), "G-code" slices, then end of motion. After each run, the board's step counters are
     checked against the steps sent.
+  - Jogs of one axis use the same frames as Mach3 (`0x0A`, jog slices). When a jog is stopped, the
+    board is told to drop what it holds (`0x10`) and runs the deceleration slices at once; once it is
+    at rest, grblHAL's position is taken from its step counters.
   - Every grblHAL reset (Ctrl-X, alarm) sends a cancel at once, like Mach3's Stop button: the
     board stops and drops its buffer, but stays armed.
   - Inputs: the board's configuration frame declares its e-stop, probe, home and limit inputs, in
@@ -408,6 +411,8 @@ The fake controller behaves like the real board as seen in the Mach3 captures (s
   reset; and Ctrl-C during a move: ramp, spindle off, board disarmed.
 - `stop` (two runs): the stop command during a move: ramp, spindle off, no alarm; and the input
   buffer full: status reports still answered at once, and the lines waiting are dropped by a reset.
+- `jog`: a continuous jog of one axis released twice: opened as a jog, buffer dropped, ramp, grblHAL
+  and the board agreeing on the position; a jog of two axes runs as before.
 - `long` (6 minutes, not part of `all`): a run of more than 65536 frames, where the 16-bit sequence
   numbers wrap: pacing and checks must hold all along.
 
@@ -480,8 +485,9 @@ against the fake controller only, and the crash path has not been exercised.
   is added by the bridge (Mach3 waits 1 s before switching OUT1 off after M5); use grblHAL's own
   spindle delay settings if needed. Changing `$30` now takes effect at once (the upstream simulator
   only applied it after a restart).
-- Feed hold: grblHAL decelerates in the slices it sends, like Mach3. The board's "stop jog" frame,
-  which drops its buffer, is not used yet (it would make holds and jog cancels react faster).
+- Feed hold during a program: grblHAL decelerates in the slices it sends, like Mach3, after the ones
+  the board already holds. Stopping a jog of one axis is immediate (see below); a jog of several axes
+  at once runs what the board holds first.
 
 ## Roadmap
 

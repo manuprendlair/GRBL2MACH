@@ -34,7 +34,8 @@ typedef enum {
     Slice_Program = 0,  // G0/G1/G2... and anything else
     Slice_HomeSeek,     // homing move towards the switch of one axis (seek or locate)
     Slice_HomeJog,      // homing pull-off (or move of a homing cycle with several axes)
-    Slice_Probe         // G38.2 / G38.3: towards the probe
+    Slice_Probe,        // G38.2 / G38.3: towards the probe
+    Slice_Jog           // $J jog of one axis, which the sink can stop at once (stop_jog)
 } slice_kind_t;
 
 typedef struct {
@@ -104,6 +105,10 @@ struct slice_sink {
     // the machine may have reset meanwhile, its position is unknown. Optional (NULL: the link
     // never fails, or never comes back once lost). Thread-safe.
     bool (*link_ok)(slice_sink_t *sink, uint32_t *generation);
+    // Jog being stopped (Slice_Jog): drops every slice not executed yet, so that the deceleration
+    // slices pushed from now on run at once. The steps dropped make the slicer's count run ahead:
+    // once the machine is at rest, its position must be taken again. Optional. Thread-safe.
+    void (*stop_jog)(slice_sink_t *sink);
     // Last resort before the program ends: stops the machine, outputs off, whatever it was doing.
     // Waits up to timeout_ms for that to be done. Does not take any lock: callable from a crash
     // handler. Optional. Thread-safe.

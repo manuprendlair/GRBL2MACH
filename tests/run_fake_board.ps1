@@ -18,7 +18,7 @@
 #                       [-GCode "G21 G91 G1 X10 F600"] [-Expect "2500,0,0"] [-OutDir folder] [-Immediate]
 
 param(
-    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "home", "probe", "mach3", "pace", "jogs", "unplug", "client", "stop", "long", "all")] [string]$Scenario = "all",
+    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "home", "probe", "mach3", "pace", "jogs", "unplug", "client", "stop", "jog", "long", "all")] [string]$Scenario = "all",
     [string]$GCode = "G21 G91 G1 X10 F600",
     [string]$Expect = "2500,0,0",
     [string]$OutDir = "$env:TEMP\grbl2mach_fake",
@@ -697,6 +697,47 @@ function Test-InputFull {
     Check ($at[0] -eq $later[0]) "after a reset, the lines that were waiting do not run (X stays at $($at[0]) mm)"
 }
 
+function Test-JogCancel {
+    "=== continuous jog of one axis, released: the controller drops what it holds, then the ramp"
+    $dir = Join-Path $OutDir "jog_cancel"; $log = Join-Path $dir "fake.log"
+    $s = Start-Sim "-f `"$log`"" $dir ($Port + 23)
+    try {
+        $spm = Get-StepsPerMm $s
+        Invoke-Line $s '$X' | Out-Null
+        foreach ($i in 1, 2) {
+            Invoke-Line $s '$J=G21G91 X100 F600' | Out-Null
+            Start-Sleep -Milliseconds 1500
+            $t = [Diagnostics.Stopwatch]::StartNew()
+            $s.Stream.Write([byte[]](0x85), 0, 1)      # (not Send-Sim: ASCII has no 0x85)
+            $status = Wait-State $s "Idle" 5000
+            if ($i -eq 1) { $ms = $t.ElapsedMilliseconds; $first = Get-MPos $status }
+            Start-Sleep -Milliseconds 500
+        }
+        $mid = Get-MPos (Wait-State $s "Idle" 3000)
+        Start-Sleep -Milliseconds 800
+        $later = Get-MPos (Wait-State $s "Idle" 3000)
+        # two axes at once: no StopJog, as before
+        Invoke-Line $s '$J=G21G91 X5 Y5 F600' | Out-Null
+        $end = Get-MPos (Wait-State $s "Idle" 8000)
+    } finally { Stop-Sim $s }
+    $r = Read-FakeLog $log
+    $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
+    $opens = @($r.Frames | Where-Object { $_.op -eq 0x0A }).Count
+    $stops = @(Select-String -Path $log -Pattern "op=0x10 .*dropped=(\d+)" | ForEach-Object { [int]$_.Matches[0].Groups[1].Value })
+    $idx = -1; for ($i = 0; $i -lt $r.Frames.Count; $i++) { if ($r.Frames[$i].op -eq 0x10) { $idx = $i; break } }
+    $ramp = @(); if ($idx -ge 0) { for ($i = $idx + 1; $i -lt $r.Frames.Count -and $r.Frames[$i].op -ne 6; $i++) { if ($r.Frames[$i].op -eq 5 -and $r.Frames[$i].d) { $ramp += $r.Frames[$i].d[0] } } }
+    $maxDrop = 0; for ($i = 1; $i -lt $ramp.Count; $i++) { $maxDrop = [math]::Max($maxDrop, $ramp[$i - 1] - $ramp[$i]) }
+    Check ($opens -eq 2) "each jog opened as a jog run ($opens)"
+    Check ($stops.Count -eq 2 -and ($stops | Measure-Object -Minimum).Minimum -gt 5) "StopJog sent on each release, buffered slices dropped ($($stops -join ', '))"
+    Check ($ramp.Count -gt 5 -and $ramp[-1] -le 3 -and $maxDrop -le 2) "the ramp follows ($($ramp.Count) slices, last $($ramp[-1]) steps, largest drop $maxDrop)"
+    Check ($ms -lt 2000) "back to Idle in $ms ms (this fake controller's default acceleration makes a 0.85 s ramp)"
+    Check ($first[0] -gt 5 -and $first[0] -lt 50) "stopped at X=$($first[0]) mm"
+    Check ($mid[0] -eq $later[0]) "does not move any more (X=$($mid[0]) mm)"
+    Check ([math]::Round($end[0] * $spm[0]) -eq $r.Final[0]) "grblHAL and controller agree (grblHAL X=$($end[0]) mm, controller X=$($r.Final[0]))"
+    Check ($err -notmatch "POSITION MISMATCH") "no position mismatch reported"
+    Check ($r.Stats.seq_errors -eq 0 -and $r.Stats.rejected -eq 0) "no sequence error, no rejected slice"
+}
+
 function Test-Jogs {
     "=== jogs: short Z moves one after the other (step jogs), each new run starting while the last one ends"
     $dir = Join-Path $OutDir "jogs"; $log = Join-Path $dir "fake.log"
@@ -735,6 +776,7 @@ if ($Scenario -in "jogs", "all") { Test-Jogs }
 if ($Scenario -in "unplug", "all") { Test-Unplug $false; Test-Unplug $true; Test-UnplugIdle; Test-UnplugSoftReset }
 if ($Scenario -in "client", "all") { Test-ClientLost $false; Test-ClientLost $true; Test-ClientLostIdle; Test-CtrlC }
 if ($Scenario -in "stop", "all") { Test-StopCommand; Test-InputFull }
+if ($Scenario -in "jog", "all") { Test-JogCancel }
 if ($Scenario -eq "long") { Test-Long }     # 6 minutes: not part of "all"
 
 if ($script:failures -eq 0) { "RESULT: PASS"; exit 0 } else { "RESULT: FAIL ($script:failures)"; exit 1 }

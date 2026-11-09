@@ -55,6 +55,7 @@ static atomic_bool reconnected;      // the sink is back after a link loss: slic
 static atomic_bool reset_pending;   // set by the core's on_reset (any thread), handled on the simulator thread
 static on_reset_ptr prev_on_reset = NULL;
 static driver_reset_ptr prev_driver_reset = NULL;
+static on_state_change_ptr prev_on_state_change = NULL;
 static int32_t counted[SLICE_AXES]; // steps counted since start: the machine position if every slice ran
 static int32_t idle_offset[N_AXIS]; // sys.position - counted, sampled at rest (see advance())
 static atomic_bool resync_busy;     // from a reset until its resync is done: idle_offset is frozen
@@ -158,6 +159,27 @@ static void on_driver_reset (void)
 void slicer_set_phase (slice_kind_t kind, int axis)
 {
     atomic_store(&phase, (unsigned int)kind | (unsigned int)(axis & 0xFF) << 8);
+}
+
+// A jog of one axis starts: the machine can run it as a jog, and stop it at once (slicer_jog_poll)
+static void on_state_change (sys_state_t state)
+{
+    if(state == STATE_JOG) {
+        plan_block_t *block = plan_get_current_block();
+        int n = 0, axis = 0;
+
+        for(int i = 0; block && i < SLICE_AXES && i < N_AXIS; i++)
+            if(block->steps.value[i]) {
+                n++;
+                axis = i;
+            }
+        if(n == 1)
+            slicer_set_phase(Slice_Jog, axis);
+    } else if((atomic_load(&phase) & 0xFF) == Slice_Jog)
+        slicer_set_phase(Slice_Program, 0);
+
+    if(prev_on_state_change)
+        prev_on_state_change(state);
 }
 
 // Core thread: waits until the last slice has reached the sink and the machine has run everything.
@@ -306,6 +328,10 @@ void slicer_attach_core (void)
     if(hal.driver_reset != on_driver_reset) {
         prev_driver_reset = hal.driver_reset;
         hal.driver_reset = on_driver_reset;
+    }
+    if(grbl.on_state_change != on_state_change) {
+        prev_on_state_change = grbl.on_state_change;
+        grbl.on_state_change = on_state_change;
     }
 }
 
@@ -542,6 +568,38 @@ void slicer_core_poll (void)
         atomic_store(&reconnected, false);
         sys.homed.mask = 0;
         report_message("Controller reconnected: machine position lost, home the machine", Message_Warning);
+    }
+}
+
+// Core thread (realtime hook). The core is decelerating a jog (cancelled, feed hold, stop): the
+// machine is still running the slices sent ahead of it. As Mach3, drop them so that the
+// deceleration starts now. The core still counts the dropped steps: once at rest, its position is
+// taken from the machine's counters.
+void slicer_jog_poll (void)
+{
+    static bool stopping = false;
+
+    if(!sink || !sink->stop_jog)
+        return;
+
+    sys_state_t state = state_get();
+
+    if(!stopping) {
+        if(state == STATE_JOG && sys.step_control.execute_hold && (atomic_load(&phase) & 0xFF) == Slice_Jog) {
+            stopping = true;
+            atomic_store(&resync_busy, true);   // idle_offset keeps its value from before the jog
+            sink->stop_jog(sink);
+        }
+    } else if(state != STATE_JOG && !timer[STEPPER_TIMER].enable &&
+               !((sys.rt_exec_state & EXEC_RESET) || sys.reset_pending)) {
+        stopping = false;
+        if(state == STATE_IDLE && !atomic_load(&sink_failed) && wait_machine_idle(2000)) {
+            int32_t machine[SLICE_AXES];
+            sink->get_position(sink, machine);
+            resync_position(machine);
+            sync_position();
+        }
+        atomic_store(&resync_busy, false);
     }
 }
 

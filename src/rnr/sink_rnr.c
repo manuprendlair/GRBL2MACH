@@ -76,6 +76,7 @@ typedef struct {
     int qhead, qcount;
     rnr_status_t status;
     bool quit, stop_request, fault, run_open_shared;
+    bool stop_jog_request;      // the jog in progress is being stopped (stop_jog)
     bool link_lost;             // no status any more: the machine position is unknown
     uint32_t generation;        // reconnections so far (link_ok)
     bool blocked;               // between stop() and resume(): pushed slices are dropped
@@ -121,6 +122,7 @@ typedef struct {
     uint8_t run_kind, run_axis; // slice_kind_t and axis of the open run
     uint16_t run_arm_seq;       // sequence number of the frame that opened the run
     bool run_armed;             // the controller has taken that frame (sticky: the 16-bit sequence wraps in a long run)
+    bool run_cut;               // StopJog sent in this run: it dropped slices, steps sent no longer tell where the controller is
     uint32_t slices_sent, estops_seen, dropped_after_cut;
     bool awaiting_halt;         // stop handled, waiting for a status report that covers it
     uint16_t halt_seq;
@@ -291,9 +293,9 @@ static void check_run_position (rnr_sink_t *s, const rnr_status_t *st)
         s->checks_ok++;
     else {
         s->checks_bad++;
-        static const char *kinds[] = { "program", "homing seek", "homing pull-off", "probing" };
+        static const char *kinds[] = { "program", "homing seek", "homing pull-off", "probing", "jog" };
         fprintf(stderr, "[rnr] POSITION MISMATCH after a %s run of %u slices: controller X=%d Y=%d Z=%d A=%d, expected X=%d Y=%d Z=%d A=%d (state %u)\n",
-                 s->check_kind < 4 ? kinds[s->check_kind] : "?", s->check_slices,
+                 s->check_kind < 5 ? kinds[s->check_kind] : "?", s->check_slices,
                  st->live_steps[0], st->live_steps[1], st->live_steps[2], st->live_steps[3],
                  s->check_expected[0], s->check_expected[1], s->check_expected[2], s->check_expected[3], st->state);
     }
@@ -342,7 +344,7 @@ static double controller_done (rnr_sink_t *s, uint64_t now)
 #define TRACK_BACK 400
 static void track_controller (rnr_sink_t *s, const rnr_status_t *st, uint64_t now)
 {
-    if(!s->run_open || !s->run_slices || !s->run_armed)
+    if(!s->run_open || !s->run_slices || !s->run_armed || s->run_cut)
         return;
 
     if(!s->run_done_valid) {     // first report of the run: time since its first slice
@@ -619,8 +621,11 @@ static void io_thread (void *arg)
             set_fault(s, "controller stopped reporting status (watchdog)", true);
 
         rnr_mutex_lock(&s->lock);
-        bool quit = s->quit, fault = s->fault, stop = s->stop_request;
+        bool quit = s->quit, fault = s->fault, stop = s->stop_request, stop_jog = s->stop_jog_request;
         s->stop_request = false;
+        s->stop_jog_request = false;
+        if(stop_jog && !fault && !stop && s->run_open && s->run_kind == Slice_Jog)
+            s->qcount = 0;          // what is queued is the jog at full speed: the ramp comes next
         rnr_mutex_unlock(&s->lock);
 
         if(fault && s->armed) {
@@ -637,6 +642,15 @@ static void io_thread (void *arg)
                 fprintf(stderr, "[rnr] stop requested: cancel sent to the controller\n");
             }
             end_motion(s);
+        } else if(stop_jog && s->armed && s->run_open && s->run_kind == Slice_Jog) {
+            // As Mach3 when a jog key is released: the controller drops what it holds and runs the
+            // deceleration slices sent after this. It has nothing left: the pacing restarts from there.
+            send_short(s, RnrOp_StopJog, 0);
+            s->run_cut = true;
+            s->run_done = s->run_slices;
+            s->run_done_time = now;
+            s->run_done_valid = true;
+            s->busy_until = now;
         }
 
         if(quit)
@@ -772,7 +786,7 @@ static void io_thread (void *arg)
                 s->min_lead = 1e9;
                 s->underruns = 0;
                 rnr_opcode_t op = slice.kind == Slice_HomeSeek ? RnrOp_ArmHome :
-                                  slice.kind == Slice_HomeJog ? RnrOp_StartJog :
+                                  slice.kind == Slice_HomeJog || slice.kind == Slice_Jog ? RnrOp_StartJog :
                                   slice.kind == Slice_Probe ? RnrOp_ArmProbe : 0;
                 if(op && send_short(s, op, slice.kind == Slice_Probe ? 0 : slice.axis) != RNR_IO_OK) {
                     set_fault(s, "write failed", false);
@@ -780,6 +794,7 @@ static void io_thread (void *arg)
                 }
                 s->run_arm_seq = s->seq;
                 s->run_armed = false;
+                s->run_cut = false;
             }
 
             uint8_t buf[RNR_OUT_BYTES];
@@ -790,7 +805,7 @@ static void io_thread (void *arg)
             }
             for(int a = 0; a < RNR_AXES; a++)
                 s->run_sent[a] += slice.steps[a];
-            if(s->run_done_valid) {
+            if(s->run_done_valid && !s->run_cut) {
                 double lead = (double)s->run_slices - controller_done(s, now);
                 if(lead < s->min_lead)
                     s->min_lead = lead;
@@ -817,7 +832,7 @@ static void io_thread (void *arg)
             s->run_open = false;
             s->kind_change = false;
             s->outputs_change = false;
-            s->check_pending = true;
+            s->check_pending = !s->run_cut;     // (a jog stopped short: the slicer takes the controller's position)
             s->check_seq = s->seq;
             for(int a = 0; a < RNR_AXES; a++)
                 s->check_expected[a] = s->run_start[a] + s->run_sent[a];
@@ -1087,6 +1102,15 @@ static void rnr_close (slice_sink_t *sink)
     free(sink);
 }
 
+static void rnr_stop_jog (slice_sink_t *sink)
+{
+    rnr_sink_t *s = sink->ctx;
+
+    rnr_mutex_lock(&s->lock);
+    s->stop_jog_request = true;
+    rnr_mutex_unlock(&s->lock);
+}
+
 static void rnr_disarm (slice_sink_t *sink, uint32_t timeout_ms)
 {
     rnr_sink_t *s = sink->ctx;
@@ -1160,6 +1184,7 @@ slice_sink_t *sink_rnr_open (rnr_transport_t *t, const rnr_options_t *opt)
     sink->get_probe_result = rnr_get_probe_result;
     sink->link_ok = rnr_link_ok;
     sink->disarm = rnr_disarm;
+    sink->stop_jog = rnr_stop_jog;
     sink->ctx = s;
 
     return sink;

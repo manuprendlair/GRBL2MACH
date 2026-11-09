@@ -509,6 +509,7 @@ void sim_process_realtime (uint_fast16_t state)
         irq_lock_core_yield(true);
     slicer_core_poll(); // GRBL2MACH: slicer work on the core thread (reconnection)
     slicer_safe_stop_poll(); // GRBL2MACH: controlled stop (client gone, program closing)
+    slicer_jog_poll(); // GRBL2MACH: jog cancelled: the machine stops at once
     if(sim.greet_client) { // GRBL2MACH: a new TCP client gets the welcome message, as after a controller reset
         sim.greet_client = false;
         grbl.report.init_message(hal.stream.write);
