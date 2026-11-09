@@ -13,10 +13,15 @@ GRBL2MACH replaces the simulated hardware with the USB controller.
 [Mach3 profile editor](https://manuprendlair.github.io/GRBL2MACH/tools/mach3_editor.html)**
 (runs in your browser; the file never leaves your computer).
 
-> **Status: early development.** Tested on one machine, driven by gSender 1.6.4: connection,
-> settings (written back to the Mach3 profile), homing, jogs, probing, a full pocket program with
-> feed hold, resume and stop. Not yet used to cut. Use a hardwired e-stop and try it first without
-> a tool. See [Safety](#safety).
+> **Status: work in progress, tested on the author's setup only.** One machine with one board (the
+> red "USB MACH3 3-AXIS" pictured below), driven by gSender 1.6.4 on Windows 10: connection, settings
+> (written back to the Mach3 profile), homing, jogs, probing, a full pocket program with feed hold,
+> resume and stop, and the failures described in
+> [Failures during a job](#failures-during-a-job-what-to-expect). The spindle of this machine is not
+> driven by the board yet. Other boards, machines, PCs and senders are untested, so feedback from the
+> community is very welcome: please open an
+> [issue](https://github.com/manuprendlair/GRBL2MACH/issues) with what worked and what did not. Use
+> a hardwired e-stop and try it first without a tool. See [Safety](#safety).
 
 ## Goals
 
@@ -127,6 +132,10 @@ bridge drives the board the way Mach3 does.
     closed before an output switches, and the switch goes out once the motion before it has run (not
     75 ms early). During a run, every slice carries the outputs, like Mach3. The PWM duty is
     `S / $30` in 1/1000, like Mach3 (S12000 with `$30=24000` = 500/1000).
+- **Input from the sender**: bytes are read as soon as they arrive. Realtime commands (status,
+  feed hold, resume, stop, reset) go straight to the core, as an interrupt would on a real controller,
+  even when its input buffer is full; the other bytes wait for room, and a reset, a stop or the loss
+  of the sender drops them.
 - **Position resync**: the simulator runs a little ahead of the machine (queued slices). After a
   reset, grblHAL's position is set back to where the board actually stopped (its step counters plus
   the offset between grblHAL and the counted steps, sampled at rest), before any new command runs.
@@ -255,7 +264,10 @@ Tested with gSender 1.6.4 on the reference machine.
 5. Homing (house button), jogging (short click = one step, held = continuous), probing (console:
    `G91 G38.2 Z-10 F50`, then `G90`) and programs work as on any grblHAL board.
 
-Notes from the first session:
+Notes from the first sessions:
+- gSender does not disable its *Disconnect* button during a job, and does not protect closing its
+  window: see [Failures during a job](#failures-during-a-job-what-to-expect) for what the bridge does.
+- On a PC with few cores, enable gSender's lightweight mode (the feather icon of the visualizer).
 - gSender's default jog speed (3000 mm/min) is above most of these machines' maximum rates:
   grblHAL caps it at `$110`-`$112`; set gSender's jog speeds accordingly.
 - grblHAL takes every corner of a toolpath at a reduced speed (junction deviation `$11`) and
@@ -431,9 +443,12 @@ Before a long job:
 - Keep the PC on mains power and set "closing the lid" to do nothing: the bridge cannot prevent a
   lid-close sleep or a shutdown on an empty battery.
 - Plan around Windows Update: it may restart the PC outside your "active hours".
-- On a PC with few cores, enable gSender's lightweight mode (the feather icon of the visualizer). On
-  two cores, it made the difference between a job with audible stalls and a clean one, even before
-  the bridge was optimized. The start of a program is the tightest moment.
+- On a PC with few cores, enable gSender's lightweight mode (the feather icon of the visualizer):
+  the start of a program is the tightest moment. The two-core results so far come from a faster PC
+  limited to two cores; a real low-end PC has not been tried yet.
+- Watch the console during a first job: the bridge prints one `[rnr] run:` line per run of at least
+  a second. `underruns` above 0 means the board ran out of motion and stopped abruptly (you can
+  usually hear it); `lead min` is the margin that was left.
 - Close heavy applications. Use a short shielded USB cable, routed away from the VFD and spindle wires:
   interference is the most likely cause of a USB loss in a workshop.
 - Wire a hardwired e-stop. It is the only protection that works in every case above.
@@ -446,8 +461,8 @@ against the fake controller only, and the crash path has not been exercised.
 ## Known limitations
 
 - With `-u` / `-f`, G4 dwells run 5% short (simulation at 1.05 x real time).
-- The position resync after a reset has only been tested against the fake controller, and not yet
-  with homing (which overwrites the core's position).
+- The position resync after a reset has been exercised on the reference machine after homing, but
+  its accuracy has only been measured against the fake controller.
 - Without the interrupt lock (`--no-irq-lock`), the upstream simulator often misses alarm 3
   (position lost) after a reset during motion: its `mc_reset()` can return early, without stopping
   the steppers or calling `grbl.on_reset`. The bridge stops the board and resyncs the position from
@@ -472,12 +487,14 @@ against the fake controller only, and the crash path has not been exercised.
 
 1. Validate the controller with BreakoutCNC's diagnostic tool (connection, reset, status).
 2. ~~Build the simulator on Windows; slice sink interface with the file implementation.~~ Done.
-3. RNR USB sink: written and tested against the fake controller. Next: first hardware tests (drivers
-   off, then small moves without a tool, far from the limits).
+3. ~~RNR USB sink.~~ Done, tested on the reference machine without a tool.
 4. ~~USB captures of Mach3 driving the same machine; bridge aligned on them.~~ Done.
-5. Homing and probing using the controller's hardware stop and latch: done against the fake
-   controller; next, on the reference machine.
-6. ~~Spindle and outputs.~~ Done (against the fake controller). ~~Mach3 XML profile importer.~~ Done.
+5. ~~Homing and probing using the controller's hardware stop and latch.~~ Done, tested on the
+   reference machine.
+6. ~~Spindle and outputs.~~ Done (against the fake controller; the spindle of the reference machine
+   is not wired to the board yet). ~~Mach3 XML profile importer.~~ Done.
+7. Hardening: behaviour on failures during a job and PC timing margins. In progress.
+8. Next: tests on a low-end dedicated PC, feedback from other boards and machines.
 
 ## Safety
 
