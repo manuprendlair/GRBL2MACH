@@ -145,6 +145,7 @@ typedef struct {
     uint64_t queue_empty_since; // no slice waiting while the run needed one (0: not waiting)
     uint64_t worst_wait;        // longest such wait: the simulator threads were late
     double min_lead;            // fewest slices ahead of the controller, when sending a slice
+    uint32_t min_lead_at;       // slice of the run where that happened
     uint32_t underruns;         // times the controller had run out of slices and got more
 } rnr_sink_t;
 
@@ -245,10 +246,24 @@ static int send_positions (rnr_sink_t *s, const int32_t steps[RNR_AXES])
     return send_frame(s, buf);
 }
 
+static const char *const run_kinds[] = { "program", "homing seek", "homing pull-off", "probing", "jog" };
+
 // One line per run of at least a second: the margin the PC left. The controller stops abruptly
-// when it runs out of slices in the middle of a move.
+// when it runs out of slices in the middle of a move. Homing and probing moves are always
+// reported, however short: a stall there would otherwise leave no trace.
 static void report_run (rnr_sink_t *s)
 {
+    if(s->run_kind != Slice_Program && s->run_kind != Slice_Jog) {
+        fprintf(stderr, "[rnr] %s %c: %u slices, ", run_kinds[s->run_kind], "XYZA"[s->run_axis & 3], s->run_slices);
+        if(s->min_lead > 1e8)
+            fprintf(stderr, "lead not measured");
+        else
+            fprintf(stderr, "lead min %.1f slices (%.0f ms) at %.2f s", s->min_lead, s->min_lead * SLICE_MS, s->min_lead_at * SLICE_MS / 1000.0);
+        fprintf(stderr, ", underruns %u, USB thread worst gap %.1f ms, longest wait for motion %.1f ms\n",
+                 s->underruns, s->worst_gap / 1000.0, s->worst_wait / 1000.0);
+        return;
+    }
+
     if(s->run_slices < 200 || s->min_lead > 1e8)
         return;
 
@@ -299,9 +314,8 @@ static void check_run_position (rnr_sink_t *s, const rnr_status_t *st)
         s->checks_ok++;
     else {
         s->checks_bad++;
-        static const char *kinds[] = { "program", "homing seek", "homing pull-off", "probing", "jog" };
         fprintf(stderr, "[rnr] POSITION MISMATCH after a %s run of %u slices: controller X=%d Y=%d Z=%d A=%d, expected X=%d Y=%d Z=%d A=%d (state %u)\n",
-                 s->check_kind < 5 ? kinds[s->check_kind] : "?", s->check_slices,
+                 s->check_kind < 5 ? run_kinds[s->check_kind] : "?", s->check_slices,
                  st->live_steps[0], st->live_steps[1], st->live_steps[2], st->live_steps[3],
                  s->check_expected[0], s->check_expected[1], s->check_expected[2], s->check_expected[3], st->state);
     }
@@ -466,6 +480,7 @@ static void on_status (rnr_sink_t *s, const rnr_status_t *st, uint64_t now)
         fprintf(stderr, "[rnr] %s%c: controller stopped at X=%d Y=%d Z=%d A=%d\n",
                  probe ? "probe contact" : "home switch ", probe ? ' ' : "XYZA"[s->run_axis & 3],
                  st->live_steps[0], st->live_steps[1], st->live_steps[2], st->live_steps[3]);
+        report_run(s);
         s->run_open = false;
         s->kind_change = false;
         s->busy_until = 0;
@@ -660,6 +675,14 @@ static void io_thread (void *arg)
 
         // Prefill: open a run only once enough motion is queued, or the motion is shorter than that
         rnr_mutex_lock(&s->lock);
+        // The rest of a move the controller has cut short goes first, at once: it must not start the
+        // prefill delay of the next move (homing pull-off), which would then open with nothing queued.
+        while(s->cut_active && s->qcount > 0 && s->queue[s->qhead].kind == s->cut_kind && s->queue[s->qhead].axis == s->cut_axis) {
+            s->qhead = (s->qhead + 1) % RNR_QUEUE;
+            s->qcount--;
+            s->dropped_after_cut++;
+            s->first_queued = 0;
+        }
         int queued = s->qcount;
         int prefill_ms = queued && s->queue[s->qhead].kind == Slice_Jog ? s->prefill_jog_ms : s->prefill_ms;
         rnr_mutex_unlock(&s->lock);
@@ -725,7 +748,8 @@ static void io_thread (void *arg)
             }
             if(dropped) {
                 s->dropped_after_cut++;
-                continue;
+                s->first_queued = 0;
+                break;      // the next pass applies the prefill to what follows
             }
 
             if(!s->run_open && !(slice.steps[0] | slice.steps[1] | slice.steps[2] | slice.steps[3])) {
@@ -823,8 +847,10 @@ static void io_thread (void *arg)
                 s->run_sent[a] += slice.steps[a];
             if(s->run_done_valid && !s->run_cut) {
                 double lead = (double)s->run_slices - controller_done(s, now);
-                if(lead < s->min_lead)
+                if(lead < s->min_lead) {
                     s->min_lead = lead;
+                    s->min_lead_at = s->run_slices;
+                }
                 if(lead <= 0.0)
                     s->underruns++;
             }

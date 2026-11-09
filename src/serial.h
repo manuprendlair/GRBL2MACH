@@ -28,5 +28,6 @@
 #include "grbl/stream.h"
 
 const io_stream_t *serialInit (void);
+uint_fast16_t serialRxReadPosition (void);
 
 #endif

@@ -18,7 +18,7 @@
 #                       [-GCode "G21 G91 G1 X10 F600"] [-Expect "2500,0,0"] [-OutDir folder] [-Immediate]
 
 param(
-    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "home", "probe", "mach3", "pace", "jogs", "unplug", "client", "stop", "jog", "lead", "stall", "dwell", "long", "all")] [string]$Scenario = "all",
+    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "home", "probe", "mach3", "pace", "jogs", "unplug", "client", "stop", "jog", "lead", "stall", "dwell", "sync", "long", "all")] [string]$Scenario = "all",
     [string]$GCode = "G21 G91 G1 X10 F600",
     [string]$Expect = "2500,0,0",
     [string]$OutDir = "$env:TEMP\grbl2mach_fake",
@@ -422,6 +422,38 @@ function Test-Pace {
     Check ($r.Stats.starved -eq 0) "no underrun"
     Check ($r.Final[0] -eq $steps -and [math]::Round($mpos[0] * $spm[0]) -eq $steps) "every step run, grblHAL and controller agree ($($r.Final[0]) steps)"
     Check ($err -match "position checks after runs: [1-9]\d* ok, 0 mismatch") "position check after the run"
+}
+
+function Test-Sync {
+    "=== sync: G4 waits for the end of a 10 s move with the next lines already received; then 300 short lines in one burst"
+    $dir = Join-Path $OutDir "sync"; $log = Join-Path $dir "fake.log"
+    $s = Start-Sim "-f `"$log`"" $dir ($Port + 40)
+    try {
+        $spm = Get-StepsPerMm $s
+        Invoke-Line $s '$X' | Out-Null
+        Invoke-GCode $s "G21 G91 G1 X100 F600"
+        Send-Sim $s "G4 P0.1`nG1 X1`nG1 X1`n"
+        Start-Sleep -Milliseconds 1000
+        $s.Process.Refresh(); $c0 = $s.Process.TotalProcessorTime; $t0 = Get-Date
+        Start-Sleep -Milliseconds 5000
+        $s.Process.Refresh(); $load = ($s.Process.TotalProcessorTime - $c0).TotalSeconds / ((Get-Date) - $t0).TotalSeconds
+        Wait-State $s "Idle" 60000 | Out-Null
+
+        $t0 = Get-Date
+        Send-Sim $s (("G1 X0.01 F6000`n") * 300)
+        $acc = ""
+        for ($i = 0; $i -lt 400 -and ([regex]::Matches($acc, "(?m)^ok")).Count -lt 300; $i++) { $acc += Read-Sim $s }
+        $burst = ((Get-Date) - $t0).TotalSeconds
+        $oks = ([regex]::Matches($acc, "(?m)^ok")).Count
+        $mpos = Get-MPos (Wait-State $s "Idle" 60000)
+    } finally { Stop-Sim $s }
+    $r = Read-FakeLog $log
+    $steps = [math]::Round(105 * $spm[0])
+    "  CPU while G4 waits: {0:P0} of one core; burst of 300 lines answered in {1:N2} s" -f $load, $burst
+    Check ($load -lt 0.6) "the core sleeps while it waits for the end of the motion ($([math]::Round($load * 100)) % of one core)"
+    Check ($oks -eq 300) "the burst of short lines is read to the end: $oks ok"
+    Check ($r.Stats.starved -eq 0) "no underrun"
+    Check ($r.Final[0] -eq $steps -and [math]::Round($mpos[0] * $spm[0]) -eq $steps) "every step run, grblHAL and controller agree ($($r.Final[0]) steps)"
 }
 
 function Test-Long {
@@ -875,6 +907,7 @@ if ($Scenario -in "jog", "all") { Test-JogCancel }
 if ($Scenario -in "lead", "all") { Test-LeadOption }
 if ($Scenario -in "stall", "all") { Test-CoreStall $false; Test-CoreStall $true }
 if ($Scenario -in "dwell", "all") { Test-Dwell }
+if ($Scenario -in "sync", "all") { Test-Sync }
 if ($Scenario -eq "long") { Test-Long }     # 6 minutes: not part of "all"
 
 if ($script:failures -eq 0) { "RESULT: PASS"; exit 0 } else { "RESULT: FAIL ($script:failures)"; exit 1 }

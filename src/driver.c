@@ -69,7 +69,7 @@ static spindle_id_t spindle_id;
 static volatile bool probe_invert;
 static _Atomic uint32_t ticks = 0;
 static volatile delay_t delay = { .ms = 1, .callback = NULL }; // NOTE: initial ms set to 1 for "resetting" systick timer on startup
-static on_execute_realtime_ptr on_execute_realtime;
+static on_execute_realtime_ptr on_execute_realtime, on_execute_delay;
 
 void SysTick_Handler (void);
 void Stepper_IRQHandler (void);
@@ -538,7 +538,19 @@ void sim_process_realtime (uint_fast16_t state)
     // that cannot take it), sleep instead of spinning at full host speed: on a two-core PC, that
     // spinning takes the CPU from the simulator thread and the sender. Each pass fills the whole
     // stepper segment buffer, which holds far more than 1 ms of motion.
-    if(plan_check_full_buffer() || (!hal.stream.get_rx_buffer_count() && !simulate_serial_pending()))
+    // Input the core does not read counts as nothing to do: it is waiting for the end of the motion
+    // (M3, M5, G4...: protocol_buffer_synchronize) with the sender's next lines already received.
+    // A few passes without a read, as a byte may just have come in between two passes.
+    static uint_fast16_t rx_read_position = 0;
+    static uint_fast8_t passes_without_read = 0;
+    uint_fast16_t rx_position = serialRxReadPosition();
+    if(rx_position != rx_read_position || !hal.stream.get_rx_buffer_count() || hal.stream.type != StreamType_Serial)
+        passes_without_read = 0;
+    else if(passes_without_read < 3)
+        passes_without_read++;
+    rx_read_position = rx_position;
+
+    if(plan_check_full_buffer() || passes_without_read == 3 || (!hal.stream.get_rx_buffer_count() && !simulate_serial_pending()))
         irq_lock_core_sleep();
     else
         irq_lock_core_yield(true);
@@ -550,6 +562,19 @@ void sim_process_realtime (uint_fast16_t state)
         grbl.report.init_message(hal.stream.write);
     }
     on_execute_realtime(state);
+}
+
+// GRBL2MACH: the core's homing loop (limits_go_home) never goes through the realtime hook: it comes
+// here on every pass, and without this sleep it spins at full host speed for the whole cycle. On a
+// two-core PC that takes a core from the simulator thread and the sender, the slices come late and
+// the controller, starved, stops dead in the middle of the move. Each pass of that loop refills the
+// stepper segment buffer, which holds far more than 1 ms of motion.
+static void sim_process_delay (uint_fast16_t state)
+{
+    if(state == STATE_HOMING)
+        irq_lock_core_sleep();
+
+    on_execute_delay(state);
 }
 
 uint32_t millis (void)
@@ -592,6 +617,8 @@ bool driver_init ()
 
     on_execute_realtime = grbl.on_execute_realtime;
     grbl.on_execute_realtime = sim_process_realtime;
+    on_execute_delay = grbl.on_execute_delay;
+    grbl.on_execute_delay = sim_process_delay;
 
     hal.stepper.wake_up = stepperWakeUp;
     hal.stepper.go_idle = stepperGoIdle;

@@ -63,6 +63,12 @@ static inline uint16_t serialRxCount (void)
     return BUFCOUNT(head, tail, RX_BUFFER_SIZE);
 }
 
+// GRBL2MACH: changes only when the core reads the input (see sim_process_realtime)
+uint_fast16_t serialRxReadPosition (void)
+{
+    return rxbuffer.tail;
+}
+
 static uint16_t serialRxFree (void)
 {
     return (RX_BUFFER_SIZE - 1) - serialRxCount();
