@@ -18,7 +18,7 @@
 #                       [-GCode "G21 G91 G1 X10 F600"] [-Expect "2500,0,0"] [-OutDir folder] [-Immediate]
 
 param(
-    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "home", "probe", "mach3", "pace", "jogs", "unplug", "client", "stop", "jog", "long", "all")] [string]$Scenario = "all",
+    [ValidateSet("motion", "watchdog", "reset", "estop", "outputs", "pins", "home", "probe", "mach3", "pace", "jogs", "unplug", "client", "stop", "jog", "lead", "long", "all")] [string]$Scenario = "all",
     [string]$GCode = "G21 G91 G1 X10 F600",
     [string]$Expect = "2500,0,0",
     [string]$OutDir = "$env:TEMP\grbl2mach_fake",
@@ -83,8 +83,9 @@ function Test-Motion {
         Check ($sum[$a] -eq $exp[$a] -and $sum[$a] -eq $fromMpos[$a]) "axis $a total $($sum[$a]) = expected $($exp[$a]) = MPos $($fromMpos[$a])"
     }
     Check ($r.Final[0] -eq $exp[0] -and $r.Final[1] -eq $exp[1] -and $r.Final[2] -eq $exp[2]) "controller executed every step (final position $($r.Final[0..3] -join ','))"
-    Check ($r.Stats.max_depth -le 20) "real-time pacing: controller buffer depth $($r.Stats.max_depth) <= 20 slices (100 ms)"
-    Check ([math]::Abs($span - $expectedSpan) -le [math]::Max(50, 0.05 * $expectedSpan)) "slices spread in real time ($([math]::Round($span)) ms for $expectedSpan ms)"
+    Check ($r.Stats.max_depth -le 35) "real-time pacing: controller buffer depth $($r.Stats.max_depth) <= 35 slices (175 ms)"
+    # the last slice goes out one lead (150 ms) before the end of the motion
+    Check ([math]::Abs($span - $expectedSpan) -le [math]::Max(200, 0.05 * $expectedSpan)) "slices spread in real time ($([math]::Round($span)) ms for $expectedSpan ms)"
     Check ($r.Stats.starved -eq 0) "no underrun during the run"
     Check ($r.Stats.seq_errors -eq 0 -and $r.Stats.rejected -eq 0 -and $r.Stats.overflows -eq 0) "no sequence error, no slice rejected"
     $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
@@ -417,7 +418,7 @@ function Test-Pace {
     $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
     $steps = [math]::Round(100 * $spm[0])
     "  stats: " + (($r.Stats.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join " ")
-    Check ($r.Stats.max_depth -le 20) "controller buffer kept at the bridge's lead: at most $($r.Stats.max_depth) slices (open loop: ~35 after 10 s)"
+    Check ($r.Stats.max_depth -le 35) "controller buffer kept at the bridge's lead: at most $($r.Stats.max_depth) slices"
     Check ($r.Stats.starved -eq 0) "no underrun"
     Check ($r.Final[0] -eq $steps -and [math]::Round($mpos[0] * $spm[0]) -eq $steps) "every step run, grblHAL and controller agree ($($r.Final[0]) steps)"
     Check ($err -match "position checks after runs: [1-9]\d* ok, 0 mismatch") "position check after the run"
@@ -441,7 +442,7 @@ function Test-Long {
     $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
     "  stats: " + (($r.Stats.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join " ")
     Check ($r.Stats.frames -gt 66000) "the run went past a sequence wrap ($($r.Stats.frames) frames)"
-    Check ($r.Stats.max_depth -le 20) "controller buffer kept at the bridge's lead all along: at most $($r.Stats.max_depth) slices"
+    Check ($r.Stats.max_depth -le 35) "controller buffer kept at the bridge's lead all along: at most $($r.Stats.max_depth) slices"
     Check ($r.Stats.starved -eq 0) "no underrun"
     Check ($r.Final[0] -eq 0 -and [math]::Round($mpos[0] * $spm[0]) -eq 0) "back to the start, grblHAL and controller agree ($($r.Final[0]) steps)"
     Check ($err -match "position checks after runs: [1-9]\d* ok, 0 mismatch") "position check after the run"
@@ -738,6 +739,30 @@ function Test-JogCancel {
     Check ($r.Stats.seq_errors -eq 0 -and $r.Stats.rejected -eq 0) "no sequence error, no rejected slice"
 }
 
+function Test-LeadOption {
+    "=== --rnr-lead: how far ahead the controller is kept"
+    foreach ($case in @(@(75, 20), @(300, 65))) {
+        $dir = Join-Path $OutDir "lead$($case[0])"; $log = Join-Path $dir "fake.log"
+        $s = Start-Sim "-f `"$log`" --rnr-lead $($case[0])" $dir ($Port + 24)
+        try {
+            Invoke-Line $s '$X' | Out-Null
+            Invoke-GCode $s "G21 G91 G1 X30 F600"
+            Wait-State $s "Run" 5000 | Out-Null
+            Wait-State $s "Idle" 15000 | Out-Null
+        } finally { Stop-Sim $s }
+        $r = Read-FakeLog $log
+        $wanted = [math]::Round($case[0] / 5)
+        Check ($r.Stats.max_depth -ge $wanted - 2 -and $r.Stats.max_depth -le $case[1]) "--rnr-lead $($case[0]): controller buffer reaches $($r.Stats.max_depth) slices (lead $wanted)"
+        Check ($r.Stats.starved -eq 0 -and $r.Stats.rejected -eq 0) "--rnr-lead $($case[0]): no underrun, no rejected slice"
+    }
+    foreach ($bad in "30", "500", "abc") {
+        $dir = Join-Path $OutDir "lead_bad"; New-Item -ItemType Directory -Force $dir | Out-Null
+        $p = Start-Process $script:SimExe -ArgumentList "-n -e `"$dir\t.eep`" -b NUL -s NUL -p 23999 -f `"$dir\fake.log`" --rnr-lead $bad" -PassThru -Wait -WindowStyle Hidden `
+                -RedirectStandardOutput (Join-Path $dir "o.txt") -RedirectStandardError (Join-Path $dir "e.txt")
+        Check ($p.ExitCode -ne 0 -and (Get-Content (Join-Path $dir "o.txt") -Raw) -match "--rnr-lead") "--rnr-lead $bad refused with a message"
+    }
+}
+
 function Test-Jogs {
     "=== jogs: short Z moves one after the other (step jogs), each new run starting while the last one ends"
     $dir = Join-Path $OutDir "jogs"; $log = Join-Path $dir "fake.log"
@@ -777,6 +802,7 @@ if ($Scenario -in "unplug", "all") { Test-Unplug $false; Test-Unplug $true; Test
 if ($Scenario -in "client", "all") { Test-ClientLost $false; Test-ClientLost $true; Test-ClientLostIdle; Test-CtrlC }
 if ($Scenario -in "stop", "all") { Test-StopCommand; Test-InputFull }
 if ($Scenario -in "jog", "all") { Test-JogCancel }
+if ($Scenario -in "lead", "all") { Test-LeadOption }
 if ($Scenario -eq "long") { Test-Long }     # 6 minutes: not part of "all"
 
 if ($script:failures -eq 0) { "RESULT: PASS"; exit 0 } else { "RESULT: FAIL ($script:failures)"; exit 1 }

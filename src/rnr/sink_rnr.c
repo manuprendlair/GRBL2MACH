@@ -9,7 +9,7 @@
   not when it has executed it, and it buffers at least 100 slices (Mach3 keeps
   about 0.5 s ahead). Sending on acknowledgements alone lets the controller run
   far behind, so feed holds would act late. Slices are therefore sent in real
-  time, at most RNR_LEAD_MS ahead of the PC clock; the acknowledgement count
+  time, at most the lead ahead of the PC clock; the acknowledgement count
   is only a safety limit.
 
   The controller runs a slice in slightly more than its nominal period (about
@@ -17,7 +17,7 @@
   lets its buffer grow during long moves (seen: +7 ms of lag per second of
   jog). Each status report gives the controller's step counters: the bridge
   finds which slice of the run they correspond to and keeps the number of
-  slices ahead of it at RNR_LEAD, whatever the controller's real pace.
+  slices ahead of it at the lead, whatever the controller's real pace.
 
   Frame sequence, as Mach3 drives the controller (USB captures):
     connect : Configure, EStop, SpindlePwm(0), SetOutputs(0), SetPositions(0)
@@ -28,7 +28,7 @@
     outputs : at rest, SpindlePwm(duty) then SetOutputs(OUT1..OUT4); during a run every
               slice carries the outputs (byte 25). The core changes outputs between
               moves only: a run is closed before an output switches, so that it switches
-              once the motion before it has run, not RNR_LEAD_MS early
+              once the motion before it has run, not ahead of it
     reset   : Cancel: stops at once, drops the buffer, stays armed
     fault   : EStop (watchdog, USB, write failure): disarms
     homing  : one axis per move: ArmHome(axis) + JogSlices; the controller stops by itself
@@ -50,12 +50,8 @@
 #include "sink_rnr.h"
 #include "rnr_os.h"
 
-#define RNR_LEAD_MS      75     // slices sent ahead of real time
-#define RNR_LEAD         (RNR_LEAD_MS / SLICE_MS)
-#define RNR_PREFILL_MS   40     // a run starts with that much motion queued (the simulator produces slices in ~20 ms bursts)
-#define RNR_PREFILL      (RNR_PREFILL_MS / SLICE_MS)
-#define RNR_QUEUE        (2 * RNR_LEAD)     // slices queued in the bridge
-#define RNR_MAX_UNACKED  (RNR_LEAD + 25)    // status reports come every ~50 ms: acks lag up to 10 slices
+#define RNR_QUEUE        30     // slices queued in the bridge: more would only delay a feed hold
+#define RNR_MAX_UNACKED_EXTRA 25    // beyond the lead: status reports come every ~50 ms, acks lag up to 10 slices
 #define WATCHDOG_MS      500    // no status report for that long = controller lost
 #define REST_MS          50     // margin after the last slice has run before EndOfMotion
 #define ESTOP_HOLD_MS    300    // an e-stop seen only as a disarm (press shorter than a status period) is held that long
@@ -95,6 +91,10 @@ typedef struct {
     uint64_t estop_until;       // e-stop seen as a disarm only: reported until then
     char fault_msg[160];
     atomic_bool disarm_request, disarm_done;    // the program is ending (no lock: may come from a crash handler)
+
+    // set at start
+    int lead;                   // slices kept ahead of the controller (--rnr-lead)
+    int prefill_ms, prefill_jog_ms;
 
     // I/O thread only
     uint16_t seq;
@@ -661,12 +661,13 @@ static void io_thread (void *arg)
         // Prefill: open a run only once enough motion is queued, or the motion is shorter than that
         rnr_mutex_lock(&s->lock);
         int queued = s->qcount;
+        int prefill_ms = queued && s->queue[s->qhead].kind == Slice_Jog ? s->prefill_jog_ms : s->prefill_ms;
         rnr_mutex_unlock(&s->lock);
         bool may_send = s->run_open;
         if(!s->run_open && queued) {
             if(!s->first_queued)
                 s->first_queued = now;
-            may_send = queued >= RNR_PREFILL || now - s->first_queued >= (uint64_t)RNR_PREFILL_MS * 1000u;
+            may_send = queued >= prefill_ms / SLICE_MS || now - s->first_queued >= (uint64_t)prefill_ms * 1000u;
         }
 
         // Send the slices that are due
@@ -676,11 +677,11 @@ static void io_thread (void *arg)
             if(s->run_open && s->run_done_valid) {
                 // closed loop: slices ahead of where the controller is now (estimated)
                 double done = controller_done(s, now);
-                if((double)s->run_slices - done >= RNR_LEAD)
+                if((double)s->run_slices - done >= s->lead)
                     break;
-            } else if(s->busy_until > now + RNR_LEAD * SLICE_US - SLICE_US / 2)
+            } else if(s->busy_until > now + (uint64_t)s->lead * SLICE_US - SLICE_US / 2)
                 break;  // far enough ahead of real time (start of a run: no status yet)
-            if((int16_t)(s->seq - st.ack_seq) > RNR_MAX_UNACKED)
+            if((int16_t)(s->seq - st.ack_seq) > s->lead + RNR_MAX_UNACKED_EXTRA)
                 break;  // safety limit on unacknowledged frames
 
             slice_t slice;
@@ -736,7 +737,7 @@ static void io_thread (void *arg)
             if(s->run_open && outputs != s->outputs) {
                 // An output switches between two moves (M3, M5, M8...: the core waits for the end of
                 // motion before it changes them). Close the run and switch once every slice before
-                // has run, so that the spindle does not start or stop RNR_LEAD_MS early.
+                // has run, so that the spindle does not start or stop early.
                 s->outputs_change = true;
                 break;
             }
@@ -1139,6 +1140,13 @@ slice_sink_t *sink_rnr_open (rnr_transport_t *t, const rnr_options_t *opt)
     s->t = t;
     if(opt)
         s->opt = *opt;
+    int lead_ms = s->opt.lead_ms ? s->opt.lead_ms : RNR_LEAD_DEFAULT_MS;
+    s->lead = lead_ms / SLICE_MS;
+    // A run starts with that much motion queued. The simulator only runs 5% faster than the machine,
+    // so the lead builds up slowly (2 s for 100 ms): what the run starts with is its margin at first.
+    s->prefill_ms = lead_ms * 2 / 3 < 100 ? lead_ms * 2 / 3 : 100;
+    // A jog must start at once (the simulator produces slices in ~20 ms bursts)
+    s->prefill_jog_ms = s->prefill_ms < 40 ? s->prefill_ms : 40;
     rnr_mutex_init(&s->lock);
 
     // Connect: configure, stay in e-stop until the first motion, outputs off, step counters = 0

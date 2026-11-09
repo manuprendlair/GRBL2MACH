@@ -86,7 +86,8 @@ bridge drives the board the way Mach3 does.
   Implementations: **file** (`src/sink_file.c`, CSV) and **RNR controller** (`src/rnr/sink_rnr.c`), which
   talks either to the real board over USB HID or to a **fake controller** used by the tests.
 - **RNR sink**: a dedicated I/O thread reads status reports continuously and keeps the board about
-  85 ms ahead (Mach3 keeps about 0.5 s ahead). A run starts once 40 ms of motion is queued. The
+  160 ms ahead (Mach3 keeps about 0.5 s ahead). A run starts once 100 ms of motion is queued (40 ms
+  for a jog of one axis, so that it starts at once). The
   board acknowledges a slice as soon as it has buffered it, so pacing on acknowledgements alone
   would let the machine run far behind; pacing on the PC clock alone does not work either: the
   board runs a slice in about 5.02 ms, and its buffer (so the lag of a jog stop) grew by 4-7 ms
@@ -120,7 +121,7 @@ bridge drives the board the way Mach3 does.
     cycle is more precise, and required anyway when switches share an input. `G38.4`/`G38.5`
     (probing away) are handled by grblHAL alone, with the same latency. At the end of a pull-off,
     grblHAL checks that the switch has released: the bridge makes that check wait until the board
-    has actually run the pull-off (it is up to about 0.1 s behind), else a switch with some
+    has actually run the pull-off (it is up to about 0.2 s behind), else a switch with some
     hysteresis still reads engaged (ALARM:8, seen on the reference machine). Set `$27` (pull-off)
     above the switch hysteresis.
   - A 500 ms status watchdog or USB loss is reported as a motor fault (ALARM:17) and disarms the
@@ -133,7 +134,7 @@ bridge drives the board the way Mach3 does.
   - Spindle and coolant: grblHAL's spindle (M3/M4, S) and coolant (M7/M8) drive the board's PWM
     frame and outputs OUT1..OUT4 (`--rnr-out`). As grblHAL changes them between moves only, a run is
     closed before an output switches, and the switch goes out once the motion before it has run (not
-    75 ms early). During a run, every slice carries the outputs, like Mach3. The PWM duty is
+    ahead of it). During a run, every slice carries the outputs, like Mach3. The PWM duty is
     `S / $30` in 1/1000, like Mach3 (S12000 with `$30=24000` = 500/1000).
 - **Input from the sender**: bytes are read as soon as they arrive. Realtime commands (status,
   feed hold, resume, stop, reset) go straight to the core, as an interrupt would on a real controller,
@@ -189,6 +190,7 @@ grbl2mach -f <log file>      drive a fake RNR controller (tests), logging every 
 grbl2mach -l <address>       address to listen on with -p (default 127.0.0.1)
 grbl2mach --no-irq-lock      let simulated interrupts run concurrently with the core (upstream)
 grbl2mach --mach3 <file>     the machine's Mach3 profile (default: MACH3.xml next to the program)
+grbl2mach --rnr-lead <ms>    how far ahead of the board the bridge keeps it, 40 to 400 (default 150)
 
 options overriding what the Mach3 profile describes (trials, tests):
 grbl2mach --rnr-invert <hex> step/direction inversion sent to the controller (default 0)
@@ -197,6 +199,12 @@ grbl2mach --rnr-in xhome=3low,...,probe=2            controller inputs (as Mach3
 grbl2mach --rnr-estop-in <n>[low]                    e-stop input (default 1: IN1 active high)
 grbl2mach --rnr-pins <20 hex digits>                 input bytes copied from a Mach3 capture instead
 ```
+
+`--rnr-lead` is the margin against a PC that falls behind. A larger value suits a slow or busy PC
+(watch `lead min` and `underruns` in the console, see
+[Failures during a job](#failures-during-a-job-what-to-expect)); a smaller one makes feed hold and
+stop react sooner, and leaves less motion to run if the PC stops. Reset, e-stop and the stop of a
+jog of one axis act at once whatever the value.
 
 `--rnr-invert` takes the same values as Mach3's *Ports & Pins > Motor Outputs* page: bits 0-3 make
 the step pulse active low on X, Y, Z, A ("Step Low Active"), bits 4-7 invert the direction of X, Y,
@@ -413,6 +421,7 @@ The fake controller behaves like the real board as seen in the Mach3 captures (s
   buffer full: status reports still answered at once, and the lines waiting are dropped by a reset.
 - `jog`: a continuous jog of one axis released twice: opened as a jog, buffer dropped, ramp, grblHAL
   and the board agreeing on the position; a jog of two axes runs as before.
+- `lead`: `--rnr-lead` sets how far ahead the board is kept; values out of range are refused.
 - `long` (6 minutes, not part of `all`): a run of more than 65536 frames, where the 16-bit sequence
   numbers wrap: pacing and checks must hold all along.
 
@@ -436,12 +445,12 @@ failures are specific to this design. The bridge follows three rules:
 | Stop command from the sender (`0x19`), during motion | The core ramps down, spindle and coolant off, program dropped, back to Idle with position and homing kept | Restart the job from your sender |
 | The sender goes away at rest | Nothing changes, except a spindle or coolant still on: switched off | Reconnect |
 | The sender freezes but stays connected | As on a physical controller: the buffered moves run and decelerate to a stop, the spindle stays on | Restart the sender |
-| USB unplugged, interference, board silent for 500 ms | ALARM:17. No ramp is possible: the board runs the ~100 ms it holds, then stops abruptly (steps may be lost). Reconnects by itself once the board is back | Check the machine, home, restart the job |
+| USB unplugged, interference, board silent for 500 ms | ALARM:17. No ramp is possible: the board runs the ~175 ms it holds, then stops abruptly (steps may be lost). Reconnects by itself once the board is back | Check the machine, home, restart the job |
 | The bridge's window is closed, Ctrl-C, session ending | Ramp (3 s at most), spindle and coolant off, board disarmed | Start the bridge again |
 | The bridge crashes | Board disarmed and outputs off if the USB thread still runs, no ramp | Check the machine, home |
 | The bridge is killed, the PC hangs or loses power | The board runs what it holds, then stops abruptly. **Its outputs stay as they were: the spindle keeps running.** The board has no watchdog of its own | Hardwired e-stop |
 | The PC goes to sleep by itself | Prevented while motion is running or the spindle is on | See below for what cannot be prevented |
-| The PC is overloaded | The bridge runs above normal priority, its USB thread higher still. If it falls about 85 ms behind, the board runs out of motion and stops abruptly (steps may be lost) | Keep the PC free of heavy work during a job, see below |
+| The PC is overloaded | The bridge runs above normal priority, its USB thread higher still. If it falls about 160 ms behind, the board runs out of motion and stops abruptly (steps may be lost) | Keep the PC free of heavy work during a job, see below |
 
 Before a long job:
 
@@ -507,7 +516,7 @@ against the fake controller only, and the crash path has not been exercised.
 - This software is a **second layer** only. Use a hardwired emergency stop that cuts power to the
   stepper drivers.
 - On USB link loss or 500 ms without a status report, the bridge sends an e-stop and grblHAL
-  raises ALARM:17. Thanks to closed-loop pacing the board never holds more than about 100 ms of
+  raises ALARM:17. Thanks to closed-loop pacing the board never holds more than about 175 ms of
   motion. The board has no watchdog of its own: if the PC freezes, it runs what it holds.
 - The board's e-stop input (IN1 by default) stops it by itself, without the PC, because the bridge
   declares it in the board's configuration; the bridge also stops it (in about 30 ms) as a second

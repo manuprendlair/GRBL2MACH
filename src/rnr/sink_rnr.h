@@ -10,7 +10,15 @@
 #include "../slice_sink.h"
 #include "rnr_transport.h"
 
+// How far ahead of the controller the bridge keeps it, in ms (--rnr-lead): the margin against a PC
+// that falls behind, at the cost of a feed hold or a stop reacting that much later. The controller
+// is known to buffer at least 100 slices (500 ms).
+#define RNR_LEAD_DEFAULT_MS 150
+#define RNR_LEAD_MIN_MS     40
+#define RNR_LEAD_MAX_MS     400
+
 typedef struct {
+    uint16_t lead_ms;   // 0 = RNR_LEAD_DEFAULT_MS
     // Configure frame byte 15: bits 0-3 = step pulse active low X..A, bits 4-7 = direction
     // inverted X..A (Mach3: "Step Low Active" / "Dir LowActive" in Ports & Pins > Motor Outputs)
     uint8_t step_dir_invert;

@@ -191,6 +191,8 @@ void print_usage(const char* badarg)
       "    --no-irq-lock      : GRBL2MACH: let simulated interrupts run concurrently with the core (upstream behaviour).\n"
       "    --mach3 <file>     : GRBL2MACH: the machine's Mach3 profile. Default: MACH3.xml next to this program,\n"
       "                         required with -u. The --rnr-* options below override what it describes.\n"
+      "    --rnr-lead <ms>    : GRBL2MACH: how far ahead of the controller the bridge keeps it, 40 to 400 ms. Default 150.\n"
+      "                         More: more margin on a slow or busy PC. Less: feed hold and stop react sooner.\n"
       "    --rnr-invert <hex> : GRBL2MACH: controller step/dir inversion byte (bits 0-3: step active low X..A,\n"
       "                         bits 4-7: direction inverted X..A; Mach3 example 0x8F). Default 0.\n"
       "    --rnr-out <function>=<n>[,...] : GRBL2MACH: controller output OUT<n> (1-4, 0 = none) driven by\n"
@@ -517,6 +519,18 @@ int main(int argc, char *argv[])
                     exit(-1);
                 }
                 cli_out = true;
+                continue;
+            }
+
+            if (!strcmp(argv[0], "--rnr-lead") && argc > 1) {
+                argv++; argc--;
+                char *end;
+                unsigned long ms = strtoul(*argv, &end, 10);
+                if (end == *argv || *end || ms < RNR_LEAD_MIN_MS || ms > RNR_LEAD_MAX_MS) {
+                    printf("--rnr-lead: %s is not a value between %d and %d (ms).\n", *argv, RNR_LEAD_MIN_MS, RNR_LEAD_MAX_MS);
+                    exit(-1);
+                }
+                rnr_opt.lead_ms = (uint16_t)ms;
                 continue;
             }
 
