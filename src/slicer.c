@@ -393,6 +393,38 @@ bool slicer_estop (void)
     return s && s->estop_active && s->estop_active(s);
 }
 
+bool slicer_link_ok (void)
+{
+    slice_sink_t *s = sink;
+    uint32_t g;
+
+    return !s || !s->link_ok || s->link_ok(s, &g);
+}
+
+uint32_t slicer_core_state (void)
+{
+    return (uint32_t)state_get();
+}
+
+uint32_t slicer_core_alarm (void)
+{
+    return (uint32_t)sys.alarm;
+}
+
+bool slicer_can_reconnect (void)
+{
+    slice_sink_t *s = sink;
+
+    return s && s->reconnect;
+}
+
+bool slicer_reconnect (void)
+{
+    slice_sink_t *s = sink;
+
+    return s && s->reconnect && s->reconnect(s);
+}
+
 bool slicer_get_inputs (sink_inputs_t *in)
 {
     slice_sink_t *s = sink;

@@ -101,9 +101,11 @@ if (WIN32)
     # GRBL2MACH: icon and version shown by Windows
     enable_language(RC)
     configure_file(${CMAKE_CURRENT_LIST_DIR}/src/grbl2mach.rc.in ${CMAKE_CURRENT_BINARY_DIR}/grbl2mach.rc @ONLY)
-    target_sources(grbl2mach PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/grbl2mach.rc)
+    target_sources(grbl2mach PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/grbl2mach.rc src/gui_win.c)
+    # GRBL2MACH: status window
+    target_link_libraries(grbl2mach PRIVATE comctl32 comdlg32 uxtheme)
     set_source_files_properties(${CMAKE_CURRENT_BINARY_DIR}/grbl2mach.rc PROPERTIES
-        OBJECT_DEPENDS ${CMAKE_CURRENT_LIST_DIR}/packaging/grbl2mach.ico)
+        OBJECT_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/packaging/grbl2mach.ico;${CMAKE_CURRENT_LIST_DIR}/src/grbl2mach.manifest")
 endif(WIN32)
 
 target_link_libraries(grbl2mach PRIVATE

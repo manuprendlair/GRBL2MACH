@@ -38,13 +38,40 @@ GRBL-compatible sender.
 2. Choose your Mach3 profile when asked. A copy is made; your Mach3 profile is not modified. An update
    keeps the copy already installed, with the settings you changed since.
 3. Close Mach3 (it holds the controller), plug in the board, and double-click **GRBL2MACH** on the
-   desktop. A window opens and must stay open: closing it stops the bridge.
+   desktop. The status window opens and must stay open: closing it stops the bridge. See
+   [Status window](#status-window).
 4. In gSender: *Config* > *Connection*: Ethernet IP `127.0.0.1`; then in the connection panel choose
    *Ethernet* and *Connect*. See [Using gSender](#using-gsender).
 
 Wire a hardwired e-stop and start without a tool: see [Safety](#safety) and
 [Failures during a job](#failures-during-a-job-what-to-expect). To remove the program: *Settings* >
 *Apps* in Windows; your profile and settings stay in its folder.
+
+### Status window
+
+Started from its icon or by a double-click, the bridge shows a small window instead of a console:
+
+- **Status light**: green when ready or running, orange for an alarm, a feed hold or while it waits
+  for the board, red when the board is out of reach, after a fault, on e-stop, or when a problem was
+  reported (an underrun, a position mismatch...). A problem keeps the light red until you press
+  *Clear*. The same light shows in the notification area, with a notification when a problem comes up.
+- **Controller, Sender, Machine, Profile, Last run**: the board's link, whether gSender is connected,
+  the grblHAL state, the Mach3 profile in use, and the numbers of the last run (`lead min`, underruns,
+  USB worst gap).
+- **Messages**: problems and warnings, newest first; *All messages* shows everything the bridge prints.
+- **Reconnect controller** (at rest only): closes the link to the board and opens it again, as after
+  an unplug. It also clears a controller fault. The machine position is lost: home afterwards.
+- **Load profile...**: checks the chosen Mach3 profile, copies it next to the program as `MACH3.xml`
+  (the previous one is kept as `MACH3.xml.bak`) and restarts the bridge with it. gSender must
+  connect again.
+- **Edit profile** opens the profile editor, **Open log** the log of this session. Each start writes
+  `logs\grbl2mach-<date>-<time>.log` next to the program; the last 10 are kept.
+- Theme: as Windows, light or dark, from the window menu (right-click the title bar). **About** gives
+  the version and the link to this repository.
+
+If the board is not plugged in at start, the window waits for it. Only one bridge window can be open.
+To use the console as before, start the *GRBL2MACH (console)* shortcut, start `grbl2mach.exe` from a
+terminal, or add `--no-gui`.
 
 ## Goals
 
@@ -218,6 +245,10 @@ grbl2mach -l <address>       address to listen on with -p (default 127.0.0.1)
 grbl2mach --no-irq-lock      let simulated interrupts run concurrently with the core (upstream)
 grbl2mach --mach3 <file>     the machine's Mach3 profile (default: MACH3.xml next to the program)
 grbl2mach --rnr-lead <ms>    how far ahead of the board the bridge keeps it, 40 to 400 (default 150)
+grbl2mach --gui              show the status window (default when started from a shortcut or a double-click,
+                             without arguments or with -u; without arguments it means -u -p 23 -n)
+grbl2mach --no-gui           run in the console, without the status window
+grbl2mach --check-mach3 <file>  say whether a Mach3 profile can be used, then exit
 
 options overriding what the Mach3 profile describes (trials, tests):
 grbl2mach --rnr-invert <hex> step/direction inversion sent to the controller (default 0)
@@ -492,7 +523,7 @@ Before a long job:
 - On a PC with few cores, enable gSender's lightweight mode (the feather icon of the visualizer):
   the start of a program is the tightest moment. A full pocket and repeated homing cycles have run
   without an underrun on a Pentium G3240 (two cores, Windows 10).
-- Watch the console during a first job: the bridge prints one `[rnr] run:` line per run of at least
+- Watch the status window (*All messages*) or the console during a first job: the bridge prints one `[rnr] run:` line per run of at least
   a second, and one line per homing or probing move. `underruns` above 0 means the board ran out of motion and stopped abruptly (you can
   usually hear it); `lead min` is the margin that was left. `NO RAMP` after a jog, or `STARVED`, means
   a motion stopped without its deceleration: please report it.

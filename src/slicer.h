@@ -21,6 +21,11 @@ void slicer_attach_core (void);                   // hooks the core's reset even
 bool slicer_motor_fault (void);                   // true while the sink has failed (reported as the motor fault signal)
 bool slicer_estop (void);                         // true while the machine reports an e-stop (reported as the e-stop signal); any thread
 bool slicer_get_inputs (sink_inputs_t *in);       // machine home/limit/probe inputs; false: use the simulated ones; any thread
+bool slicer_link_ok (void);                       // false while the link to the machine is lost; any thread
+uint32_t slicer_core_state (void);                // the core's state (STATE_* bits), for display; any thread
+uint32_t slicer_core_alarm (void);                // the core's alarm code, valid in STATE_ALARM, for display; any thread
+bool slicer_can_reconnect (void);                 // the sink can be asked to reconnect; any thread
+bool slicer_reconnect (void);                     // user request: link closed and opened again; false if refused (motion); any thread
 void slicer_set_phase (slice_kind_t kind, int axis); // kind of motion the next slices belong to; any thread
 void slicer_probe_end (void);                     // end of a probing cycle: position and probe position from the machine; core thread
 void slicer_core_poll (void);                     // realtime hook; core thread

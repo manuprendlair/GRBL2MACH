@@ -43,6 +43,9 @@ node tests\mach3_editor_test.js
 - The simulation runs only 5 % faster than the machine, so a run's initial lead (prefill) is most of its margin. Timing
   margins measured on a fast PC do not transfer to the target PC.
 - Each run logs a `[rnr]` line (lead, underruns, USB worst gap). Use those numbers to judge a timing change.
+- The status window (`src/gui_win.c`) runs at the lowest priority. In window mode stdout and stderr are a pipe drained
+  by a reader thread that must never wait for the window: a full pipe would block the core on its next message.
+  Messages are classified by the marks in `problem_marks` and `warning_marks`; keep them in step with new messages.
 - Settings from `MACH3.xml` are reapplied at every launch (`put_setting` in `mach3.c`). A value sent with `$nnn=` from the
   sender does not survive the next launch.
 

@@ -1157,6 +1157,29 @@ static void rnr_stop_jog (slice_sink_t *sink)
     rnr_mutex_unlock(&s->lock);
 }
 
+// The I/O thread sees a lost link: it disarms the controller if needed, then reconnects as after
+// an unplug (reconnect_link), which also clears a fault.
+static bool rnr_reconnect (slice_sink_t *sink)
+{
+    rnr_sink_t *s = sink->ctx;
+
+    rnr_mutex_lock(&s->lock);
+    bool busy = s->qcount != 0 || s->run_open_shared;
+    if(!busy) {
+        s->link_lost = true;
+        if(!s->fault) {
+            s->fault = true;
+            snprintf(s->fault_msg, sizeof(s->fault_msg), "reconnection requested");
+        }
+    }
+    rnr_mutex_unlock(&s->lock);
+
+    if(!busy)
+        fprintf(stderr, "[rnr] reconnection requested: link to the controller closed, opening it again\n");
+
+    return !busy;
+}
+
 static void rnr_disarm (slice_sink_t *sink, uint32_t timeout_ms)
 {
     rnr_sink_t *s = sink->ctx;
@@ -1238,6 +1261,7 @@ slice_sink_t *sink_rnr_open (rnr_transport_t *t, const rnr_options_t *opt)
     sink->link_ok = rnr_link_ok;
     sink->disarm = rnr_disarm;
     sink->stop_jog = rnr_stop_jog;
+    sink->reconnect = s->opt.reconnect ? rnr_reconnect : NULL;
     sink->ctx = s;
 
     return sink;

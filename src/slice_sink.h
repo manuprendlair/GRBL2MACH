@@ -113,6 +113,9 @@ struct slice_sink {
     // Waits up to timeout_ms for that to be done. Does not take any lock: callable from a crash
     // handler. Optional. Thread-safe.
     void (*disarm)(slice_sink_t *sink, uint32_t timeout_ms);
+    // Asked by the user: drops the link to the machine and opens it again, as after a loss (also
+    // clears a fault). Refused (false) while motion is queued or running. Optional. Thread-safe.
+    bool (*reconnect)(slice_sink_t *sink);
     void *ctx;
 };
 

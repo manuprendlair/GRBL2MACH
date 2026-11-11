@@ -50,6 +50,7 @@
 #include "mach3.h"
 #include "rnr/sink_rnr.h"
 #include "irq_lock.h"
+#include "gui.h"
 
 #include "grbl/grbllib.h"
 
@@ -206,6 +207,10 @@ void print_usage(const char* badarg)
       "                         high, as Mach3's EStop on port 3 pin 1); 0 = none.\n"
       "    --rnr-pins <20 hex digits> : GRBL2MACH: configuration frame bytes 5-14 copied as is from a Mach3\n"
       "                         capture (replaces the bytes computed from --rnr-in), e.g. 00730073007300701200.\n"
+      "    --gui              : GRBL2MACH: show the status window (default when started from a shortcut or\n"
+      "                         by a double-click, without arguments or with -u; no arguments then means -u -p 23 -n).\n"
+      "    --no-gui           : GRBL2MACH: run in the console as before, without the status window.\n"
+      "    --check-mach3 <file> : GRBL2MACH: say whether a Mach3 profile can be used, then exit.\n"
 	  "    -d <directory>     : directory to mount as local filing system.\n"
       "    -c<comment_char>   : character to print before each line from grbl.  default = '#'\n"
       "    -n                 : no comments before grbl response lines.\n"
@@ -426,6 +431,16 @@ static void signal_stop (int signum)
 
 #endif
 
+// GRBL2MACH: status window (gui_win.c)
+static bool client_connected (void)
+{
+#ifdef WIN32
+    return sim.socket_fd != INVALID_SOCKET;
+#else
+    return sim.socket_fd > 0;
+#endif
+}
+
 void board_init (void)
 {
 	if(fsdir) {
@@ -435,7 +450,7 @@ void board_init (void)
 	}
 }
 
-int main(int argc, char *argv[])
+static int bridge_main(int argc, char *argv[])
 {
     int positional_args = 0;
 
@@ -469,6 +484,18 @@ int main(int argc, char *argv[])
                 continue;
             }
 
+            // Reads a Mach3 profile and says whether it can be used (status window: Load profile)
+            if (!strcmp(argv[0], "--check-mach3") && argc > 1) {
+                char err[600];
+                argv++; argc--;
+                if (mach3_load(*argv, err, sizeof(err))) {
+                    printf("Profile OK\n");
+                    return EXIT_SUCCESS;
+                }
+                printf("%s\n", err);
+                return EXIT_FAILURE;
+            }
+
             if (!strcmp(argv[0], "--mach3") && argc > 1) {
                 argv++; argc--;
                 mach3_path = *argv;
@@ -486,7 +513,7 @@ int main(int argc, char *argv[])
                 }
                 if (!ok) {
                     print_usage(*argv);
-                    exit(-1);
+                    return EXIT_FAILURE;
                 }
                 rnr_opt.pins_raw = true;
                 continue;
@@ -496,7 +523,7 @@ int main(int argc, char *argv[])
                 argv++; argc--;
                 if (!parse_rnr_inputs(*argv)) {
                     print_usage(*argv);
-                    exit(-1);
+                    return EXIT_FAILURE;
                 }
                 cli_in = true;
                 continue;
@@ -506,7 +533,7 @@ int main(int argc, char *argv[])
                 argv++; argc--;
                 if (!parse_rnr_input(*argv, &rnr_opt.inputs.estop)) {
                     print_usage(*argv);
-                    exit(-1);
+                    return EXIT_FAILURE;
                 }
                 cli_estop = true;
                 continue;
@@ -516,7 +543,7 @@ int main(int argc, char *argv[])
                 argv++; argc--;
                 if (!parse_rnr_outputs(*argv)) {
                     print_usage(*argv);
-                    exit(-1);
+                    return EXIT_FAILURE;
                 }
                 cli_out = true;
                 continue;
@@ -528,7 +555,7 @@ int main(int argc, char *argv[])
                 unsigned long ms = strtoul(*argv, &end, 10);
                 if (end == *argv || *end || ms < RNR_LEAD_MIN_MS || ms > RNR_LEAD_MAX_MS) {
                     printf("--rnr-lead: %s is not a value between %d and %d (ms).\n", *argv, RNR_LEAD_MIN_MS, RNR_LEAD_MAX_MS);
-                    exit(-1);
+                    return EXIT_FAILURE;
                 }
                 rnr_opt.lead_ms = (uint16_t)ms;
                 continue;
@@ -687,6 +714,7 @@ int main(int argc, char *argv[])
             snprintf(profile, sizeof(profile), "%s", mach3_path);
         else
             mach3_default_path(profile, sizeof(profile), progname);
+        gui_set_profile(profile, mach3_path != NULL);
         if (!mach3_load(profile, err, sizeof(err))) {
             printf("Mach3 profile: %s\n", err);
             return EXIT_FAILURE;
@@ -712,20 +740,33 @@ int main(int argc, char *argv[])
 
     if (fake_log || use_usb) {
         char info[256] = "";
-        rnr_transport_t *t = use_usb ? rnr_hid_open(info, sizeof(info)) : rnr_fake_open(fake_log);
-        if (!t) {
-            printf(use_usb ? "No RNR Eco Motion controller found (VID 0x%04X, PID 0x%04X).\n" : "Cannot open fake controller log.\n", RNR_VID, RNR_PID);
-            return EXIT_FAILURE;
+        slice_sink_t *sink = NULL;
+        bool waiting = false;
+        rnr_opt.reconnect = use_usb ? reconnect_usb : reconnect_fake;
+        // With the status window, a controller not plugged in yet is waited for
+        while (true) {
+            rnr_transport_t *t = use_usb ? rnr_hid_open(info, sizeof(info)) : rnr_fake_open(fake_log);
+            if (t && (sink = sink_rnr_open(t, &rnr_opt)))
+                break;
+            if (!gui_active() || !use_usb) {
+                if (!t)
+                    printf(use_usb ? "No RNR Eco Motion controller found (VID 0x%04X, PID 0x%04X).\n" : "Cannot open fake controller log.\n", RNR_VID, RNR_PID);
+                else
+                    printf("The RNR controller does not answer.\n");
+                return EXIT_FAILURE;
+            }
+            if (!waiting) {
+                waiting = true;
+                printf("Waiting for the RNR controller (%s): plug it in and power it on.\n", t ? "it does not answer" : "not found");
+                gui_set_phase(Gui_Waiting);
+            }
+            platform_sleep(1000000);
         }
+        gui_set_phase(Gui_Starting);
         if (use_usb) {
             printf("GRBL2MACH " GRBL2MACH_VERSION "\nRNR controller: %s\n", info);
             fflush(stdout);
-        }
-        rnr_opt.reconnect = use_usb ? reconnect_usb : reconnect_fake;
-        slice_sink_t *sink = sink_rnr_open(t, &rnr_opt);
-        if (!sink) {
-            printf("The RNR controller does not answer.\n");
-            return EXIT_FAILURE;
+            gui_set_controller(info);
         }
         slicer_init(sink);
         // Run the simulation slightly faster than real time: slice back-pressure then locks it to
@@ -775,28 +816,28 @@ int main(int argc, char *argv[])
 
         if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) {
             printf("Fatal: Unable to create socket.\n");
-            exit(-5);
+            return -5;
         }
 
         if (getaddrinfo(listen_addr, itoa(args.port, port, 10), &hints, &result) != 0) {
             WSACleanup();
             printf("Fatal: Unable to create socket.\n");
-            exit(-5);
+            return -5;
         }
 
         if ((socket_fd = socket(result->ai_family, result->ai_socktype, result->ai_protocol)) == INVALID_SOCKET) {
             WSACleanup();
             freeaddrinfo(result);
             printf("Fatal: Unable to create socket.\n");
-            exit(-5);
+            return -5;
         }
 
         if (bind(socket_fd, result->ai_addr, (int)result->ai_addrlen) == SOCKET_ERROR) {
             freeaddrinfo(result);
             closesocket(socket_fd);
             WSACleanup();
-            printf("Fatal: Unable to bind socket.\n");
-            exit(-5);
+            printf("Fatal: Unable to bind socket: port %u is already in use (another GRBL2MACH running?).\n", args.port);
+            return -5;
         }
 
         freeaddrinfo(result);
@@ -804,7 +845,7 @@ int main(int argc, char *argv[])
         if (listen(socket_fd, SOMAXCONN ) == SOCKET_ERROR ) {
             closesocket(socket_fd);
             WSACleanup();
-            exit(-5);
+            return -5;
         }
 
         u_long listen_nonblocking = 1;      // see sim_socket_in()
@@ -818,7 +859,7 @@ int main(int argc, char *argv[])
 
         if ((socket_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
             printf("Fatal: Unable to create socket.\n");
-            exit(-5);
+            return -5;
         }
 
         server_addr.sin_family = AF_INET;
@@ -827,7 +868,7 @@ int main(int argc, char *argv[])
 
         if (bind(socket_fd, (struct sockaddr *) &server_addr, addrlen) < 0) {
             printf("Fatal: Unable to bind socket.\n");
-            exit(-5);
+            return -5;
         }
 
         FD_ZERO(&rfds);
@@ -853,6 +894,7 @@ int main(int argc, char *argv[])
 */
 #endif
         printf("Listening on %s:%u\n", listen_addr, args.port);
+        gui_set_listen(listen_addr, args.port);
         if (strcmp(listen_addr, "127.0.0.1") && strcmp(listen_addr, "localhost"))
             printf("WARNING: this port is reachable from the network. GRBL has no authentication:\n"
                    "         anyone who can reach it can move the machine.\n");
@@ -872,8 +914,9 @@ int main(int argc, char *argv[])
     plat_thread_t *th = platform_start_thread(grbl_main_thread);
     if (!th){
         printf("Fatal: Unable to start hardware thread.\n");
-        exit(-5);
+        return -5;
     }
+    gui_set_phase(Gui_Running);
 
     // Do not leave EEPROM file in an inconsistent state on ^C.
     atexit(eeprom_close);
@@ -913,5 +956,19 @@ int main(int argc, char *argv[])
 
     platform_terminate();
 
-    exit(EXIT_SUCCESS);
+    return EXIT_SUCCESS;
+}
+
+int main(int argc, char *argv[])
+{
+    // GRBL2MACH: started from a shortcut, the bridge shows its status window instead of a console
+    if (gui_wanted(&argc, &argv)) {
+        static const gui_hooks_t hooks = { client_connected, stop_before_exit };
+        if (!gui_start(&hooks))
+            return EXIT_SUCCESS;    // already open: brought to the front
+    }
+
+    int rc = bridge_main(argc, argv);
+
+    return gui_finish(rc);
 }

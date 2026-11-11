@@ -29,3 +29,6 @@ BEGIN
         VALUE "Translation", 0x0409, 1200
     END
 END
+
+// Common controls 6 (status window), DPI awareness
+1 24 "@CMAKE_CURRENT_LIST_DIR@/src/grbl2mach.manifest"

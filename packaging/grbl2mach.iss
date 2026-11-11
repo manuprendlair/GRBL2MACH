@@ -68,10 +68,11 @@ Source: "..\COPYING"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\tools\mach3_editor.html"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\GRBL2MACH"; Filename: "{app}\grbl2mach-start.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\grbl2mach.exe"
+Name: "{group}\GRBL2MACH"; Filename: "{app}\grbl2mach.exe"; WorkingDir: "{app}"
+Name: "{group}\GRBL2MACH (console)"; Filename: "{app}\grbl2mach-start.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\grbl2mach.exe"
 Name: "{group}\Mach3 profile editor"; Filename: "{app}\mach3_editor.html"
 Name: "{group}\{cm:UninstallProgram,GRBL2MACH}"; Filename: "{uninstallexe}"
-Name: "{userdesktop}\GRBL2MACH"; Filename: "{app}\grbl2mach-start.cmd"; WorkingDir: "{app}"; IconFilename: "{app}\grbl2mach.exe"; Tasks: desktopicon
+Name: "{userdesktop}\GRBL2MACH"; Filename: "{app}\grbl2mach.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Code]
 var
