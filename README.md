@@ -9,6 +9,8 @@ side it speaks the controller's USB HID protocol. Its core is the
 (G-code parser, look-ahead planner, homing, probing, `$` settings) as a desktop program.
 GRBL2MACH replaces the simulated hardware with the USB controller.
 
+![gSender running a pocket program through GRBL2MACH, with the bridge status window in front](docs/images/gsender_grbl2mach.png)
+
 **Edit your Mach3 profile online, without Mach3:
 [Mach3 profile editor](https://manuprendlair.github.io/GRBL2MACH/tools/mach3_editor.html)**
 (runs in your browser; the file never leaves your computer).
@@ -25,7 +27,7 @@ GRBL2MACH replaces the simulated hardware with the USB controller.
 
 ## Install on Windows (nothing to compile)
 
-**[Download the installer: GRBL2MACH-0.1.3-setup.exe](https://github.com/manuprendlair/GRBL2MACH/raw/master/release/GRBL2MACH-0.1.3-setup.exe)**
+**[Download the installer: GRBL2MACH-0.1.4-setup.exe](https://github.com/manuprendlair/GRBL2MACH/raw/master/release/GRBL2MACH-0.1.4-setup.exe)**
 (the [release](release) folder holds it).
 
 You need: Windows 10 or 11 (64-bit), a board with the USB IDs given under
@@ -527,7 +529,7 @@ Before a long job:
   a second, and one line per homing or probing move. `underruns` above 0 means the board ran out of motion and stopped abruptly (you can
   usually hear it); `lead min` is the margin that was left. `NO RAMP` after a jog, or `STARVED`, means
   a motion stopped without its deceleration: please report it.
-- Close heavy applications. Use a short shielded USB cable, routed away from the VFD and spindle wires:
+- Close heavy applications, web browser included: with two cores, browsing during a job has caused an underrun. Use a short shielded USB cable, routed away from the VFD and spindle wires:
   interference is the most likely cause of a USB loss in a workshop.
 - Wire a hardwired e-stop. It is the only protection that works in every case above.
 
