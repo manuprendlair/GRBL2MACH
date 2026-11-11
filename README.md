@@ -527,8 +527,10 @@ Before a long job:
   without an underrun on a Pentium G3240 (two cores, Windows 10).
 - Watch the status window (*All messages*) or the console during a first job: the bridge prints one `[rnr] run:` line per run of at least
   a second, and one line per homing or probing move. `underruns` above 0 means the board ran out of motion and stopped abruptly (you can
-  usually hear it); `lead min` is the margin that was left. `NO RAMP` after a jog, or `STARVED`, means
-  a motion stopped without its deceleration: please report it.
+  usually hear it); `lead min` is the margin that was left. `NO RAMP` after a jog means
+  a motion stopped without its deceleration. `STARVED` means the PC was too busy to prepare the next
+  moves in time: the machine paused abruptly, then went on with the program, which loses nothing
+  (an abrupt stop at high feed can still lose steps at the motors). Please report either.
 - Close heavy applications, web browser included: with two cores, browsing during a job has caused an underrun. Use a short shielded USB cable, routed away from the VFD and spindle wires:
   interference is the most likely cause of a USB loss in a workshop.
 - Wire a hardwired e-stop. It is the only protection that works in every case above.

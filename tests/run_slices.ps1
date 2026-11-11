@@ -51,6 +51,11 @@ try {
         if ($r -match "error:\d+") { throw "grblHAL rejected '$line': $r" }
     }
 
+    # G4 P0 answers only once the planner is empty. A status report alone is not enough: at -t 0
+    # the simulator outruns the core, the step segment buffer runs dry (STARVED) and the core shows
+    # Idle for a moment before it resumes the rest of the motion.
+    Wait-Ok "G4 P0" | Out-Null
+
     # wait until idle (the simulator runs as fast as possible: -t 0)
     $status = ""
     for ($i = 0; $i -lt 600; $i++) {

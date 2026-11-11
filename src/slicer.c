@@ -690,7 +690,7 @@ void slicer_report_starved (void)
 {
     static unsigned int count = 0;
 
-    fprintf(stderr, "[slicer] STARVED: the step segment buffer ran empty with motion still planned (%u so far)\n", ++count);
+    fprintf(stderr, "[slicer] STARVED: the core was late with the next step segments, motion paused until they came (%u so far)\n", ++count);
 }
 
 void slicer_safe_stop_request (void)

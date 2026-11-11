@@ -43,6 +43,11 @@ node tests\mach3_editor_test.js
 - The simulation runs only 5 % faster than the machine, so a run's initial lead (prefill) is most of its margin. Timing
   margins measured on a fast PC do not transfer to the target PC.
 - Each run logs a `[rnr]` line (lead, underruns, USB worst gap). Use those numbers to judge a timing change.
+- grblHAL takes an empty step segment buffer for the end of the motion. On a PC the core thread can be late with the
+  next segments (famine): `Stepper_IRQHandler` in `src/driver.c` then skips the stepper interrupt until they come
+  (`STARVED` in the log), so that the cycle does not end with motion still planned. At `-t 0` the simulator outruns
+  the core and starves it about twenty times per move: a test must wait for `G4 P0` (sent after the motion) before
+  it reads the final position.
 - The status window (`src/gui_win.c`) runs at the lowest priority. In window mode stdout and stderr are a pipe drained
   by a reader thread that must never wait for the window: a full pipe would block the core on its next message.
   Messages are classified by the marks in `problem_marks` and `warning_marks`; keep them in step with new messages.

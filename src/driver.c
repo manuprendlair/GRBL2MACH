@@ -171,15 +171,9 @@ static void stepperWakeUp (void)
 //    hal.stepper_interrupt_callback();   // start the show
 }
 
-static volatile bool in_stepper_isr = false;
-
 // Disables stepper driver interrupts
 static void stepperGoIdle (bool clear_signals)
 {
-    // GRBL2MACH: the core takes an empty segment buffer for the end of the motion. If motion is still
-    // planned, it is in fact a famine: the machine stops dead and the core drops the rest without an alarm.
-    if(in_stepper_isr && !sys.step_control.end_motion && !sys.step_control.execute_sys_motion && plan_get_current_block())
-        slicer_report_starved();
 
     timer[STEPPER_TIMER].value = 0;
     timer[STEPPER_TIMER].load = 0;
@@ -689,12 +683,32 @@ bool driver_init ()
     return hal.version == 10;
 }
 
+// True while motion is still to come from the core: a planned block, or a homing/probing system
+// motion whose last segment is not prepared yet.
+static bool motion_planned (void)
+{
+    return !sys.step_control.end_motion && (sys.step_control.execute_sys_motion || plan_get_current_block());
+}
+
 // Main stepper driver
 void Stepper_IRQHandler (void)
 {
-    in_stepper_isr = true;
+    // GRBL2MACH: the core takes an empty segment buffer for the end of the motion. On a busy host the
+    // core thread may simply be late with the next segments (famine): going idle then would end the
+    // cycle with motion still planned, and the segments prepared afterwards would never run. Wait for
+    // them instead: the stepper timer keeps running, the machine pauses, the motion resumes intact.
+    static bool starving = false;
+
+    if(st_segment_buffer_empty() && motion_planned()) {
+        if(!starving) {
+            starving = true;
+            slicer_report_starved();
+        }
+        return;
+    }
+    starving = false;
+
     hal.stepper.interrupt_callback();
-    in_stepper_isr = false;
 }
 
 void Control_IRQHandler (void)
