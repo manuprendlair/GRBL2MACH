@@ -159,9 +159,38 @@ static void on_driver_reset (void)
         prev_driver_reset();
 }
 
+// Result of the probing cycle as the machine reports it, fetched once per cycle (core thread):
+// at the end of the core's motion when it saw no contact, else at the end of the cycle
+static struct {
+    bool fetched, known, contact;
+    int32_t machine[SLICE_AXES], latched[SLICE_AXES];
+} probe_result;
+
 void slicer_set_phase (slice_kind_t kind, int axis)
 {
+    if(kind == Slice_Probe)
+        probe_result.fetched = false;
     atomic_store(&phase, (unsigned int)kind | (unsigned int)(axis & 0xFF) << 8);
+}
+
+// Core thread: waits until the machine has run the whole probing move, then takes its result.
+// idle_offset stays frozen (resync_busy) until slicer_probe_end has applied it.
+static void fetch_probe_result (void)
+{
+    if(probe_result.fetched)
+        return;
+
+    probe_result.fetched = true;
+    probe_result.known = probe_result.contact = false;
+    if(!sink || !sink->get_probe_result)
+        return;
+
+    atomic_store(&resync_busy, true);
+    for(int waited = 0; waited < 1000 && !probe_result.known; waited += 2) {     // (lock given up: see wait_machine_idle)
+        probe_result.known = sink->get_probe_result(sink, probe_result.machine, probe_result.latched, &probe_result.contact, 2);
+        if(!probe_result.known)
+            irq_lock_core_yield(true);
+    }
 }
 
 // Simulator thread, waiting for the interrupt lock: the core has held it far too long. At rest
@@ -202,9 +231,15 @@ static void test_core_stall (void)
     }
 }
 
-// A jog of one axis starts: the machine can run it as a jog, and stop it at once (slicer_jog_poll)
+// A jog of one axis starts: the machine can run it as a jog, and stop it at once (slicer_jog_poll).
+// The core ends a probing move without contact: see probe_contact_at_end.
+static void probe_contact_at_end (void);
+
 static void on_state_change (sys_state_t state)
 {
+    if(state == STATE_IDLE && (atomic_load(&phase) & 0xFF) == Slice_Probe && sys.probing_state == Probing_Active)
+        probe_contact_at_end();
+
     if(state == STATE_JOG) {
         plan_block_t *block = plan_get_current_block();
         int n = 0, axis = 0;
@@ -320,9 +355,6 @@ static void on_homing_completed (axes_signals_t cycle, bool success)
 // about every 50 ms). Put sys.position where the machine is and the probe position where it touched.
 void slicer_probe_end (void)
 {
-    int32_t machine[SLICE_AXES], latched[SLICE_AXES];
-    bool contact = false;
-
     if((atomic_load(&phase) & 0xFF) != Slice_Probe)
         return;
     slicer_set_phase(Slice_Program, 0);
@@ -330,26 +362,39 @@ void slicer_probe_end (void)
     if(!sink || !sink->get_probe_result)
         return;
 
-    atomic_store(&resync_busy, true);
-    bool known = false;
-    for(int waited = 0; waited < 1000 && !known; waited += 2) {     // (lock given up: see wait_machine_idle)
-        known = sink->get_probe_result(sink, machine, latched, &contact, 2);
-        if(!known)
-            irq_lock_core_yield(true);
-    }
-    if(known) {
+    fetch_probe_result();   // usually not fetched yet: the cycle ended on contact
+    probe_result.fetched = false;
+
+    if(probe_result.known) {
         for(int i = 0; i < SLICE_AXES && i < N_AXIS; i++) {
-            sys.position[i] = machine[i] + idle_offset[i];
-            counted[i] = machine[i];
-            if(contact)
-                sys.probe_position[i] = latched[i] + idle_offset[i];
+            sys.position[i] = probe_result.machine[i] + idle_offset[i];
+            counted[i] = probe_result.machine[i];
+            if(probe_result.contact)
+                sys.probe_position[i] = probe_result.latched[i] + idle_offset[i];
         }
-        if(contact)
+        if(probe_result.contact)
             fprintf(stderr, "[slicer] probe position from the machine: X%d Y%d Z%d steps\n",
                      sys.probe_position[0], sys.probe_position[1], sys.probe_position[2]);
     } else
         fprintf(stderr, "[slicer] machine position unknown after probing: not resynced\n");
     atomic_store(&resync_busy, false);
+}
+
+// The core has run the whole probing move without seeing a contact. It runs ahead of the machine
+// (the lead, about 150 ms) and sees the probe input only through status reports (about 50 ms): a
+// contact in the last tenths of a millimetre of the move, as when a sender backs off and probes
+// again over the same distance, comes after that. Wait until the machine has run the move: if it
+// touched, the probe succeeded (the cycle then ends as on contact, slicer_probe_end).
+static void probe_contact_at_end (void)
+{
+    if(!sink || !sink->get_probe_result)
+        return;
+
+    fetch_probe_result();
+    if(probe_result.known && probe_result.contact) {
+        sys.probing_state = Probing_Off;
+        fprintf(stderr, "[slicer] probe contact at the end of the move, after the core had run it: probe succeeded\n");
+    }
 }
 
 void slicer_attach_core (void)

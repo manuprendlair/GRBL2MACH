@@ -376,6 +376,13 @@ function Test-Probe {
         $atContact = Get-MPos (Wait-State $s "Idle")
         Invoke-GCode $s "G91 G0 Z5"
         $up = Get-MPos (Wait-State $s "Idle")
+        # gSender's tool length probe: up by some distance, then a slow probe down by the same
+        # distance. The contact comes at the very end of the move, after the core (ahead of the
+        # machine) has finished it
+        $prbEnd = Invoke-Line $s "G91 G38.2 Z-5 F60"
+        try { Wait-State $s "Idle" 5000 | Out-Null } catch { Invoke-Line $s "$X" | Out-Null }   # old behaviour: ALARM:5
+        Invoke-GCode $s "G91 G0 Z5"
+        Wait-State $s "Idle" | Out-Null
         Send-Sim $s "G91 G38.2 Z-1 F100`n"
         $out = ""; for ($i = 0; $i -lt 50 -and $out -notmatch "ALARM:"; $i++) { Start-Sleep -Milliseconds 100; $out += Read-Sim $s }
         $noContact = Get-MPos (Wait-State $s "Alarm" 5000)
@@ -385,8 +392,10 @@ function Test-Probe {
     $zc = [regex]::Match($prb, "\[PRB:[-0-9.]+,[-0-9.]+,([-0-9.]+)(,[-0-9.]+)*:(\d)\]")
     $contacts = @(Select-String -Path $log -Pattern "PROBE CONTACT").Count
     "  G38.2 answered: $(($prb -replace '\s+', ' ').Trim()); stats: " + (($r.Stats.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join " ")
-    Check (@($r.Frames | Where-Object { $_.op -eq 12 }).Count -eq 2) "ArmProbe (0x0C) sent for each G38.2"
-    Check ($contacts -eq 1) "controller stopped by itself on contact"
+    $ze = [regex]::Match($prbEnd, "\[PRB:[-0-9.]+,[-0-9.]+,([-0-9.]+)(,[-0-9.]+)*:(\d)\]")
+    Check (@($r.Frames | Where-Object { $_.op -eq 12 }).Count -eq 3) "ArmProbe (0x0C) sent for each G38.2"
+    Check ($contacts -eq 2) "controller stopped by itself on contact"
+    Check ($prbEnd -notmatch "ALARM" -and $ze.Success -and $ze.Groups[3].Value -eq "1" -and [math]::Round([double]$ze.Groups[1].Value * $spm[2]) -eq -500) "contact on the last step of the move: probe succeeded (answer: $(($prbEnd -replace '\s+', ' ').Trim()))"
     Check ($zc.Success -and $zc.Groups[3].Value -eq "1" -and [math]::Round([double]$zc.Groups[1].Value * $spm[2]) -eq -500) "probe position from the controller's latch, to the step (PRB Z=$($zc.Groups[1].Value))"
     Check ([math]::Round($atContact[2] * $spm[2]) -eq -500) "grblHAL position after probing = where the controller stopped (Z=$($atContact[2]))"
     Check ([math]::Round(($up[2] - $atContact[2]) * $spm[2]) -eq [math]::Round(5 * $spm[2])) "move after probing starts from there"

@@ -27,7 +27,7 @@ GRBL2MACH replaces the simulated hardware with the USB controller.
 
 ## Install on Windows (nothing to compile)
 
-**[Download the installer: GRBL2MACH-0.1.6-setup.exe](https://github.com/manuprendlair/GRBL2MACH/raw/master/release/GRBL2MACH-0.1.6-setup.exe)**
+**[Download the installer: GRBL2MACH-0.1.7-setup.exe](https://github.com/manuprendlair/GRBL2MACH/raw/master/release/GRBL2MACH-0.1.7-setup.exe)**
 (the [release](release) folder holds it).
 
 You need: Windows 10 or 11 (64-bit), a board with the USB IDs given under
@@ -168,7 +168,10 @@ bridge drives the board the way Mach3 does.
     (frame `0x0D`), which stops by itself exactly on the switch; pull-offs are jogs (`0x0A`); a
     probing move is armed with `0x0C`, the board stops by itself on contact and latches the position,
     which replaces grblHAL's own (late by up to a status period). The slices grblHAL still sends
-    after the stop are dropped. A homing cycle with several axes at once works too, but each switch
+    after the stop are dropped. grblHAL runs about 0.2 s ahead of the board: when it ends a probing
+    move without a contact, the bridge waits until the board has run it, so that a contact in the
+    last tenths of a millimetre counts (gSender's tool length probe backs off and probes again over
+    the same distance). A homing cycle with several axes at once works too, but each switch
     is then seen through status reports (about 50 ms late, plus the bridge's lead): one axis per
     cycle is more precise, and required anyway when switches share an input. `G38.4`/`G38.5`
     (probing away) are handled by grblHAL alone, with the same latency. At the end of a pull-off,
@@ -464,7 +467,8 @@ The fake controller behaves like the real board as seen in the Mach3 captures (s
   the reference machine, with 0.48 mm switch hysteresis for a 0.5 mm pull-off: `0x0D` per seek and locate, pull-offs as jogs, the board stopping on each
   switch, ending exactly at switch minus pull-off; grblHAL and board agree afterwards;
 - `probe`: `G38.2` with contact (probe position = the board's latch, to the step; grblHAL resynced
-  to where the board stopped) and without contact (ALARM:5, whole move run).
+  to where the board stopped), with the contact on the last step of the move (gSender's tool
+  length probe), and without contact (ALARM:5, whole move run).
 - `mach3`: start from a synthetic profile (`tests/mach3_test.xml`, the reference machine's values):
   grblHAL settings and configuration frame as expected; settings changed by the sender written
   back in one batch, every other byte unchanged, one backup, 10 kept; restart reads them back; a
