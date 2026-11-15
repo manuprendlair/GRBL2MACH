@@ -19,15 +19,15 @@ GRBL2MACH replaces the simulated hardware with the USB controller.
 > red "USB MACH3 3-AXIS" pictured below), driven by gSender 1.6.4 on Windows 10: connection, settings
 > (written back to the Mach3 profile), homing, jogs, probing, a full pocket program with feed hold,
 > resume and stop, and the failures described in
-> [Failures during a job](#failures-during-a-job-what-to-expect). The spindle of this machine is not
-> driven by the board yet. Other boards, machines, PCs and senders are untested, so feedback from the
+> [Failures during a job](#failures-during-a-job-what-to-expect), and the spindle (run on OUT4, speed
+> on the board's 0-10 V output to a VFD), without a tool. Other boards, machines, PCs and senders are untested, so feedback from the
 > community is very welcome: please open an
 > [issue](https://github.com/manuprendlair/GRBL2MACH/issues) with what worked and what did not. Use
 > a hardwired e-stop and try it first without a tool. See [Safety](#safety).
 
 ## Install on Windows (nothing to compile)
 
-**[Download the installer: GRBL2MACH-0.1.5-setup.exe](https://github.com/manuprendlair/GRBL2MACH/raw/master/release/GRBL2MACH-0.1.5-setup.exe)**
+**[Download the installer: GRBL2MACH-0.1.6-setup.exe](https://github.com/manuprendlair/GRBL2MACH/raw/master/release/GRBL2MACH-0.1.6-setup.exe)**
 (the [release](release) folder holds it).
 
 You need: Windows 10 or 11 (64-bit), a board with the USB IDs given under
@@ -187,7 +187,10 @@ bridge drives the board the way Mach3 does.
     frame and outputs OUT1..OUT4 (`--rnr-out`). As grblHAL changes them between moves only, a run is
     closed before an output switches, and the switch goes out once the motion before it has run (not
     ahead of it). During a run, every slice carries the outputs, like Mach3. The PWM duty is
-    `S / $30` in 1/1000, like Mach3 (S12000 with `$30=24000` = 500/1000).
+    `S / $30` in 1/1000 by default, like Mach3 (S12000 with `$30=24000` = 500/1000). It goes in a
+    straight line from `$35` % at `$31` (minimum speed) to `$36` % at `$30` (maximum speed), as in
+    grblHAL: see [Calibrating the spindle speed](#calibrating-the-spindle-speed). Laser mode (`$32=1`)
+    is refused: it would stop a milling spindle on every G0 move.
 - **Input from the sender**: bytes are read as soon as they arrive. Realtime commands (status,
   feed hold, resume, stop, reset) go straight to the core, as an interrupt would on a real controller,
   even when its input buffer is full; the other bytes wait for room, and a reset, a stop or the loss
@@ -455,7 +458,8 @@ The fake controller behaves like the real board as seen in the Mach3 captures (s
   once released and reset.
 - `outputs`: M3 S12000, a move, M8, a move, M5 M9: spindle PWM and outputs must switch before the
   first slice, between the two runs once the first move has run, and after the last one; every
-  slice must carry the outputs.
+  slice must carry the outputs. Then the PWM range: duties for `$35`/`$36`, laser mode refused,
+  spindle named `Spindle`.
 - `home`: `$H` with one axis per cycle (Z, X, Y) and the three home switches on one input, as on
   the reference machine, with 0.48 mm switch hysteresis for a 0.5 mm pull-off: `0x0D` per seek and locate, pull-offs as jogs, the board stopping on each
   switch, ending exactly at switch minus pull-off; grblHAL and board agree afterwards;
@@ -540,6 +544,24 @@ been tested on the reference machine, with no tool and the spindle not wired, as
 buttons and Pause / Resume during a program, with the input buffer full. Ctrl-C has been tested
 against the fake controller only, and the crash path has not been exercised.
 
+## Calibrating the spindle speed
+
+The board's analog output (AVI) is not exact: on the reference board it is above 0 V at duty 0, and
+in 0-5 V mode it flattened out at 4.5 V. Powered for 0-10 V (here from the VFD's 12 V supply), it was
+a straight line with an offset. To make the VFD follow S:
+
+1. With `$31=0`, `$35=0` and `$36=100`, run the spindle (no tool) at three speeds or more and note
+   what the VFD shows. It should be close to a straight line.
+2. Set `$31` to the speed the VFD runs at with duty 0 (where that line meets duty 0), and `$36` to the
+   duty, in %, that makes the VFD run at `$30`. Reference machine: `$30=24000`, `$31=974`, `$35=0`,
+   `$36=94.7`, within 1 % from 3000 to 20000 rpm. Measure with the spindle running: on the reference
+   machine the VFD showed about 750 rpm more while stopped.
+3. Write these settings with the spindle stopped: a spindle setting written while it turns stops it.
+
+`$30` and `$31` are written back to the Mach3 profile (`SPEEDn`, `LSPEEDn`); `$35` and `$36` are kept
+in the bridge's `EEPROM.DAT`. gSender keeps its own spindle minimum and maximum and sends them as `$30`
+and `$31` when its Spindle/Laser switch is used: set them to the same values in gSender.
+
 ## Known limitations
 
 - The position resync after a reset has been exercised on the reference machine after homing, but
@@ -557,7 +579,8 @@ against the fake controller only, and the crash path has not been exercised.
 - The frame sequence follows USB captures of Mach3; the bridge itself has not been captured on the
   real board yet (to compare frame by frame, including the 9-byte short reports).
 - Spindle and outputs follow the Mach3 captures (PWM frame, outputs frame, outputs byte in every
-  slice) but have only been tested against the fake controller. No spindle ramp or spin-down delay
+  slice). The spindle run output and speed have been tested on the reference machine (OUT4, VFD on
+  the 0-10 V output, no tool); flood and mist only against the fake controller. No spindle ramp or spin-down delay
   is added by the bridge (Mach3 waits 1 s before switching OUT1 off after M5); use grblHAL's own
   spindle delay settings if needed. Changing `$30` now takes effect at once (the upstream simulator
   only applied it after a restart).
@@ -573,8 +596,8 @@ against the fake controller only, and the crash path has not been exercised.
 4. ~~USB captures of Mach3 driving the same machine; bridge aligned on them.~~ Done.
 5. ~~Homing and probing using the controller's hardware stop and latch.~~ Done, tested on the
    reference machine.
-6. ~~Spindle and outputs.~~ Done (against the fake controller; the spindle of the reference machine
-   is not wired to the board yet). ~~Mach3 XML profile importer.~~ Done.
+6. ~~Spindle and outputs.~~ Done, spindle tested on the reference machine (flood and mist against the
+   fake controller only). ~~Mach3 XML profile importer.~~ Done.
 7. Hardening: behaviour on failures during a job and PC timing margins. In progress.
 8. Next: tests on a low-end dedicated PC, feedback from other boards and machines.
 

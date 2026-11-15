@@ -366,16 +366,27 @@ static void spindle_set_speed (spindle_ptrs_t *spindle, uint_fast16_t pwm_value)
 
 static uint_fast16_t spindleGetPWM (spindle_ptrs_t *spindle, float rpm)
 {
-    // GRBL2MACH: duty cycle in 1/SLICE_PWM_PERIOD of the maximum speed ($30), like Mach3 (S12000
-    // with a 24000 rpm spindle = 500/1000)
-    float max = settings.pwm_spindle.rpm_max;
+    // GRBL2MACH: duty cycle in 1/SLICE_PWM_PERIOD, linear from $35 (percent) at the minimum speed ($31)
+    // to $36 (percent) at the maximum speed ($30), as grblHAL does. With the defaults ($31=0, $35=0,
+    // $36=100) it is proportional to the speed, like Mach3 (S12000 with a 24000 rpm spindle = 500/1000).
+    // $36 below 100 caps the analog output, e.g. a 0-10 V input fed by a converter that reaches 12 V.
+    float min = settings.pwm_spindle.rpm_min, max = settings.pwm_spindle.rpm_max;
+    float duty_min = settings.pwm_spindle.pwm_min_value, duty_max = settings.pwm_spindle.pwm_max_value, duty;
 
     if(rpm <= 0.0f || max <= 0.0f)
         return 0;
-    if(rpm < settings.pwm_spindle.rpm_min)
-        rpm = settings.pwm_spindle.rpm_min;
 
-    return rpm >= max ? SLICE_PWM_PERIOD : (uint_fast16_t)(rpm * SLICE_PWM_PERIOD / max);
+    duty_min = duty_min < 0.0f ? 0.0f : (duty_min > 100.0f ? 100.0f : duty_min);
+    duty_max = duty_max < duty_min ? duty_min : (duty_max > 100.0f ? 100.0f : duty_max);
+
+    if(rpm >= max || max <= min)
+        duty = duty_max;
+    else if(rpm <= min)
+        duty = duty_min;
+    else
+        duty = duty_min + (rpm - min) * (duty_max - duty_min) / (max - min);
+
+    return (uint_fast16_t)(duty * SLICE_PWM_PERIOD / 100.0f + 0.5f);
 }
 
 // Start or stop spindle
@@ -636,7 +647,6 @@ bool driver_init ()
     static const spindle_ptrs_t spindle = {
         .type = SpindleType_PWM,
         .cap.variable = On,
-        .cap.laser = On,
         .cap.direction = On,
         .config = spindleConfig,
         .get_pwm = spindleGetPWM,
@@ -645,7 +655,7 @@ bool driver_init ()
         .get_state = spindleGetState
     };
 
-    spindle_register(&spindle, "simulated PWM spindle");
+    spindle_register(&spindle, "Spindle");   // GRBL2MACH: name shown by senders (gSender's spindle list)
 
     hal.control.get_state = systemGetState;
 /*

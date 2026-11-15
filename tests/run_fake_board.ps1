@@ -272,6 +272,30 @@ function Test-Outputs {
     Check ($err -match "position checks after runs: 2 ok, 0 mismatch") "position check after each of the two runs"
 }
 
+function Test-PwmRange {
+    "=== outputs: spindle PWM range `$35/`$36 (`$30=24000, spindle on OUT1)"
+    $dir = Join-Path $OutDir "pwm_range"; $log = Join-Path $dir "fake.log"
+    $s = Start-Sim "-f `"$log`" --rnr-out spindle=1" $dir ($Port + 42)
+    try {
+        # A spindle setting written while the spindle turns stops it (the core selects the spindle
+        # again): M5 before each setting, as an operator would
+        foreach ($line in '$30=24000', '$31=0', '$35=0', '$36=100', '$X', 'M3 S12000', 'M5', '$36=80', 'M3 S24000', 'S12000', 'M5',
+                          '$35=10', 'M3 S12000', 'M5', '$35=0', '$36=100') {
+            Invoke-Line $s $line | Out-Null
+            Start-Sleep -Milliseconds 300   # outputs at rest are switched after a short pause
+        }
+        $laser = Invoke-Line $s '$32=1'
+        $mode = Invoke-Line $s '$32'
+        $spindles = Invoke-Line $s '$spindles'
+    } finally { Stop-Sim $s }
+    $r = Read-FakeLog $log
+    $duties = @($r.Frames | Where-Object { $_.op -eq 14 } | ForEach-Object { if ($_.rest -match "pwm=(\d+)/1000") { [int]$Matches[1] } })
+    $seq = ($duties | Select-Object -Skip 1) -join ","     # the first one is the connect sequence's SpindlePwm(0)
+    Check ($seq -eq "500,0,800,400,0,450,0") "S12000 = 500; `$36=80: S24000 = 800, S12000 = 400; `$35=10: S12000 = 450; M5 = 0 (got $seq)"
+    Check ($laser -match "error:" -and $mode -match "\`$32=0") "laser mode refused: a milling spindle must not stop on G0 moves (`$32=1 -> $(($laser -split "`n")[0].Trim()))"
+    Check ($spindles -match "0 - Spindle\b") "spindle listed as 'Spindle' ($(($spindles -split "`n")[0].Trim()))"
+}
+
 function Test-Pins {
     "=== pins: configuration frame input bytes computed from --rnr-in = Mach3's frames (USB captures 80, 81, 82)"
     # Reference machine as Mach3 declares it: limits not used but ticked active low, homes X/Y/Z on
@@ -917,7 +941,7 @@ if ($Scenario -in "motion", "all") { Test-Motion }
 if ($Scenario -in "watchdog", "all") { Test-Watchdog }
 if ($Scenario -in "reset", "all") { Test-Reset }
 if ($Scenario -in "estop", "all") { Test-EStop $false; Test-EStop $true; Test-EStopAtStart }
-if ($Scenario -in "outputs", "all") { Test-Outputs }
+if ($Scenario -in "outputs", "all") { Test-Outputs; Test-PwmRange }
 if ($Scenario -in "pins", "all") { Test-Pins }
 if ($Scenario -in "home", "all") { Test-Home }
 if ($Scenario -in "probe", "all") { Test-Probe }
