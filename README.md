@@ -27,7 +27,7 @@ GRBL2MACH replaces the simulated hardware with the USB controller.
 
 ## Install on Windows (nothing to compile)
 
-**[Download the installer: GRBL2MACH-0.1.4-setup.exe](https://github.com/manuprendlair/GRBL2MACH/raw/master/release/GRBL2MACH-0.1.4-setup.exe)**
+**[Download the installer: GRBL2MACH-0.1.5-setup.exe](https://github.com/manuprendlair/GRBL2MACH/raw/master/release/GRBL2MACH-0.1.5-setup.exe)**
 (the [release](release) folder holds it).
 
 You need: Windows 10 or 11 (64-bit), a board with the USB IDs given under
