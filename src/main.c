@@ -242,6 +242,11 @@ void print_version(void)
 //wrapper for thread interface
 PLAT_THREAD_FUNC(grbl_main_thread, exit)
 {
+    // Tests only: a slow PC, where the simulator thread runs well before the core is set up
+    const char *delay = getenv("GRBL2MACH_FAKE_CORE_START_MS");
+    if(delay)
+        platform_sleep((long)atoi(delay) * 1000);
+
     irq_lock_core_start();  // GRBL2MACH: the core thread holds the interrupt lock while it runs
     grbl_enter();
 

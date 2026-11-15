@@ -10,6 +10,7 @@
 #              must not execute the slices that were still queued and must stay armed.
 #   estop    : the controller's own e-stop input during a move: grblHAL must raise ALARM:10, resync
 #              to where the controller stopped and re-arm it for the next move after a reset.
+#              Also pressed before the bridge starts, with a core that starts late: no crash.
 #   outputs  : M3 / M8 / M5 M9 around two moves: spindle PWM and outputs switched in step with the
 #              motion (before the first slice, between the runs, after the last one), slices carry them.
 #   pins     : configuration frame input bytes computed from --rnr-in, compared with Mach3's frames.
@@ -205,6 +206,29 @@ function Test-EStop([bool]$Self) {
     Check ($r.Final[0] -eq $haltedX + $one) "controller ran exactly the extra 1 mm from where it stopped (final X=$($r.Final[0]))"
     Check ([math]::Round($final[0] * $spm[0]) -eq $r.Final[0]) "grblHAL and controller agree at the end ($([math]::Round($final[0] * $spm[0])) / $($r.Final[0]) steps)"
     Check ($err -match "position checks after runs: [1-9]\d* ok, 0 mismatch") "position check after the extra move"
+}
+
+function Test-EStopAtStart {
+    "=== estop at start: the e-stop input is pressed before the bridge starts, the core starts late (slow PC), released 3 s later"
+    $dir = Join-Path $OutDir "estop_start"; $log = Join-Path $dir "fake.log"
+    $s = Start-Sim "-f `"$log`"" $dir ($Port + 41) @{ GRBL2MACH_FAKE_ESTOP_MS = "0,3000,open"; GRBL2MACH_FAKE_CORE_START_MS = "1500" }
+    try {
+        $pressed = Wait-State $s "Alarm" 5000
+        $alive = -not $s.Process.HasExited
+        Start-Sleep -Milliseconds 2000                     # input released meanwhile
+        $unlockFirst = Invoke-Line $s '$X'
+        Send-Sim $s ([string][char]0x18); Start-Sleep -Milliseconds 500; Read-Sim $s | Out-Null
+        $unlock = Invoke-Line $s '$X'
+        Invoke-GCode $s "G21 G91 G1 X1 F600"
+        $final = Get-MPos (Wait-State $s "Idle")
+    } finally { if (-not $s.Process.HasExited) { Stop-Sim $s } }
+    $err = Get-Content (Join-Path $dir "sim_stderr.txt") -Raw
+    Check $alive "bridge still running with the e-stop pressed at start"
+    Check ($pressed -match "<Alarm") "grblHAL in Alarm while the input is pressed"
+    Check ($err -match "machine e-stop: signalled to the core") "e-stop signalled once the core was ready"
+    Check ($unlockFirst -match "error:79") "unlock refused until a reset after the release (error:79)"
+    Check ($unlock -match "(?m)^ok") "unlocked after the reset"
+    Check ([math]::Abs($final[0] - 1) -lt 0.01) "1 mm move after the e-stop (X=$($final[0]))"
 }
 
 function Test-Outputs {
@@ -892,7 +916,7 @@ function Test-Jogs {
 if ($Scenario -in "motion", "all") { Test-Motion }
 if ($Scenario -in "watchdog", "all") { Test-Watchdog }
 if ($Scenario -in "reset", "all") { Test-Reset }
-if ($Scenario -in "estop", "all") { Test-EStop $false; Test-EStop $true }
+if ($Scenario -in "estop", "all") { Test-EStop $false; Test-EStop $true; Test-EStopAtStart }
 if ($Scenario -in "outputs", "all") { Test-Outputs }
 if ($Scenario -in "pins", "all") { Test-Pins }
 if ($Scenario -in "home", "all") { Test-Home }

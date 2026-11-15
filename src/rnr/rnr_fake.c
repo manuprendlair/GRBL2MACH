@@ -76,6 +76,7 @@ typedef struct {
     uint64_t first_slice_us;
     int64_t silent_ms, estop_on_ms, estop_off_ms;
     bool estop_self;    // e-stop input declared in Configure: stops by itself on it (else only reports it)
+    bool estop_from_open;   // GRBL2MACH_FAKE_ESTOP_MS times counted from the opening, not from the first slice
     // inputs declared in Configure (pin 0 = none) and switch positions (steps)
     uint8_t home_pin[RNR_AXES], probe_pin;
     bool home_low[RNR_AXES], probe_low;
@@ -205,10 +206,12 @@ static void run_until (fake_t *f, uint64_t now)
 // Hardware e-stop input, driven by GRBL2MACH_FAKE_ESTOP_MS
 static void update_estop_input (fake_t *f, uint64_t now)
 {
-    if(f->estop_on_ms < 0 || !f->first_slice_us)
+    uint64_t from = f->estop_from_open ? f->t0 : f->first_slice_us;
+
+    if(f->estop_on_ms < 0 || !from)
         return;
 
-    int64_t t = (int64_t)(now - f->first_slice_us) / 1000;
+    int64_t t = (int64_t)(now - from) / 1000;
     bool active = t >= f->estop_on_ms && t < f->estop_off_ms;
 
     if(active && !f->estop_input && f->estop_self) {
@@ -504,6 +507,7 @@ static void parse_estop_env (fake_t *f)
     if(e && sscanf(e, "%lld,%lld", &on, &off) == 2 && on >= 0 && off > on) {
         f->estop_on_ms = on;
         f->estop_off_ms = off;
+        f->estop_from_open = strstr(e, ",open") != NULL;    // "on,off,open": pressed before the bridge starts
     }
 }
 

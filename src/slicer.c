@@ -54,6 +54,7 @@ static slice_t cur;
 static volatile bool open = false;  // a slice is in progress (also read by the core thread: homing_get_state)
 static atomic_bool sink_failed;      // the sink reported an error: slices are dropped, motor fault signalled
 static atomic_bool reconnected;      // the sink is back after a link loss: slicer_core_poll resyncs and clears the fault
+static atomic_bool core_ready;       // the core has reached its main loop: its HAL callbacks can be called
 static atomic_bool reset_pending;   // set by the core's on_reset (any thread), handled on the simulator thread
 static on_reset_ptr prev_on_reset = NULL;
 static driver_reset_ptr prev_driver_reset = NULL;
@@ -607,6 +608,8 @@ void slicer_core_poll (void)
 {
     static bool resetting = false;
 
+    atomic_store(&core_ready, true);
+
     test_core_stall();
 
     if(atomic_exchange(&core_stalled, false)) {
@@ -622,8 +625,9 @@ void slicer_core_poll (void)
     // the machine was away) stays pending until this function has cleared the fault.
     bool reset_under_way = ((sys.rt_exec_state & EXEC_RESET) || sys.reset_pending) && !sys.blocking_event;
 
+    // (E-stop: the core stays in STATE_ESTOP, not in ALARM, until a reset with the input released.)
     if(!atomic_load(&reconnected) || reset_under_way ||
-        state_get() != STATE_ALARM || timer[STEPPER_TIMER].enable)
+        !(state_get() & (STATE_ALARM|STATE_ESTOP)) || timer[STEPPER_TIMER].enable)
         return;
 
     if(!resetting) {
@@ -776,8 +780,13 @@ void slicer_poll (void)
     atomic_fetch_add(&sim_heartbeat, 1);
 
     if(sink) {
-        check_estop();
-        check_link();
+        // Until the core reaches its main loop, its HAL is being set up (cleared, then filled by
+        // driver_init): calling into it would crash. An e-stop pressed before the start is
+        // signalled once the core is ready, and the core reads the input itself meanwhile.
+        if(atomic_load(&core_ready)) {
+            check_estop();
+            check_link();
+        }
         advance();
     }
 }
